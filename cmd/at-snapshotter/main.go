@@ -13,7 +13,6 @@ import (
 	"github.com/pboueri/atproto-db-snapshot/internal/build"
 	"github.com/pboueri/atproto-db-snapshot/internal/config"
 	"github.com/pboueri/atproto-db-snapshot/internal/labels"
-	"github.com/pboueri/atproto-db-snapshot/internal/objstore"
 	"github.com/pboueri/atproto-db-snapshot/internal/run"
 	"github.com/pboueri/atproto-db-snapshot/internal/serve"
 )
@@ -70,6 +69,7 @@ func runBuild(ctx context.Context, args []string, logger *slog.Logger) {
 		date                 string
 		retainN              int
 		fileStore            string
+		configPath           string
 		takedowns            string
 		skipLabelerTakedowns bool
 	)
@@ -79,6 +79,7 @@ func runBuild(ctx context.Context, args []string, logger *slog.Logger) {
 	fs.StringVar(&date, "date", "", "build target date in YYYY-MM-DD; defaults to today UTC")
 	fs.IntVar(&retainN, "retain", 7, "delete ./data/daily/* directories older than N days from build date")
 	fs.StringVar(&fileStore, "file-store", "", "directory to use as a local file-backed object store (default: none)")
+	fs.StringVar(&configPath, "config", "", "path to config.yaml (currently consumed only for object_store.*)")
 	fs.StringVar(&takedowns, "takedowns", "", "path to a takedowns.yaml; rows referenced are nullified/deleted in current_all.duckdb (incremental mode)")
 	fs.BoolVar(&skipLabelerTakedowns, "skip-labeler-takedowns", false, "ignore <data-dir>/labels.db produced by the `labels` subcommand (incremental mode)")
 
@@ -103,12 +104,11 @@ Flags:`)
 		os.Exit(2)
 	}
 
-	// Wire in a file-backed object store if requested. -no-upload disables
-	// upload regardless. With neither flag set we run with no store.
-	var store objstore.ObjectStore
-	if !noUpload && fileStore != "" {
-		store = objstore.NewFileStore(fileStore, "")
-		logger.Info("file-backed object store enabled", "root", fileStore)
+	// Resolve the object store: -no-upload > -file-store > -config (R2).
+	store, err := resolveStore(ctx, configPath, fileStore, noUpload, logger)
+	if err != nil {
+		logger.Error("resolve object store", "err", err)
+		os.Exit(1)
 	}
 
 	// -takedowns asks for a specific file. If set but missing, fail loudly.
@@ -143,9 +143,10 @@ func runRun(ctx context.Context, args []string, logger *slog.Logger) {
 	cfg := config.Default()
 
 	var (
-		endpoint  string
-		noUpload  bool
-		fileStore string
+		endpoint   string
+		noUpload   bool
+		fileStore  string
+		configPath string
 	)
 
 	fs.StringVar(&cfg.DataDir, "data-dir", cfg.DataDir, "local working directory")
@@ -155,6 +156,8 @@ func runRun(ctx context.Context, args []string, logger *slog.Logger) {
 		"do not upload sealed-day parquet files to the object store")
 	fs.StringVar(&fileStore, "file-store", "",
 		"directory to use as a local file-backed object store (defaults to off; -no-upload overrides this)")
+	fs.StringVar(&configPath, "config", "",
+		"path to config.yaml (currently consumed only for object_store.*)")
 
 	fs.Usage = func() {
 		fmt.Fprintln(fs.Output(), `at-snapshotter run — Jetstream consumer
@@ -190,10 +193,10 @@ Behavior:
 		cfg.Jetstream.NoUpload = true
 	}
 
-	var store objstore.ObjectStore
-	if !noUpload && fileStore != "" {
-		store = objstore.NewFileStore(fileStore, "")
-		logger.Info("file-backed object store enabled", "root", fileStore)
+	store, err := resolveStore(ctx, configPath, fileStore, noUpload, logger)
+	if err != nil {
+		logger.Error("resolve object store", "err", err)
+		os.Exit(1)
 	}
 
 	if err := run.Run(ctx, cfg, store, logger); err != nil {
@@ -210,12 +213,16 @@ func runServe(ctx context.Context, args []string, logger *slog.Logger) {
 		RefreshSeconds: 5,
 		LogTailLines:   20000,
 	}
-	var fileStore string
+	var (
+		fileStore  string
+		configPath string
+	)
 	fs.StringVar(&opts.Listen, "listen", opts.Listen, "bind address for the HTTP dashboard")
 	fs.StringVar(&opts.DataDir, "data-dir", opts.DataDir, "local working directory to read from")
 	fs.IntVar(&opts.RefreshSeconds, "refresh", opts.RefreshSeconds, "dashboard auto-refresh interval in seconds")
 	fs.IntVar(&opts.LogTailLines, "log-tail", opts.LogTailLines, "trailing log lines scanned for rates + errors")
 	fs.StringVar(&fileStore, "file-store", "", "optional file-backed object store root to list daily/ + bootstrap/")
+	fs.StringVar(&configPath, "config", "", "path to config.yaml (currently consumed only for object_store.*)")
 
 	fs.Usage = func() {
 		fmt.Fprintln(fs.Output(), `at-snapshotter serve — read-only health dashboard
@@ -234,9 +241,12 @@ Flags:`)
 	if err := fs.Parse(args); err != nil {
 		os.Exit(2)
 	}
-	if fileStore != "" {
-		opts.Store = objstore.NewFileStore(fileStore, "")
+	store, err := resolveStore(ctx, configPath, fileStore, false, logger)
+	if err != nil {
+		logger.Error("resolve object store", "err", err)
+		os.Exit(1)
 	}
+	opts.Store = store
 	if err := serve.Run(ctx, opts, logger); err != nil {
 		logger.Error("serve failed", "err", err)
 		os.Exit(1)
