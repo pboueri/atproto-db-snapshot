@@ -14,12 +14,13 @@ The final output will be the following files in object storage, with R2 being th
 
 data/
 - bootstrap/YYYY-MM-DD/
-  - social_graph.duckdb # Written once for bootstrap
- - raw/YYYY-MM-DD/{likes, follows, profiles, posts}.parquet
- - snapshot/
-   - current_all.duckdb 
-   - current_graph.duckdb
-   - snapshot_metadata.json  
+  - social_graph.duckdb # Written once for bootstrap; never overwritten
+- raw/YYYY-MM-DD/{posts, post_media, likes, reposts, follows, blocks, profiles}.parquet
+  # post_media is derived from post record embeds, not a separate firehose collection
+- snapshot/
+  - current_all.duckdb
+  - current_graph.duckdb
+  - snapshot_metadata.json  
 
 ## Technologies to use:
 
@@ -37,15 +38,21 @@ data/
 ## Workflow + CLI commands
 
 ### at-snapshot bootstrap
-This command boostraps the follower graph from historicals -- it writes it to current_graph.duckdb. If interrupted it will resume from current_graph.duckdb and assume that any DIDs in there are complete. It generates the following tables:
+This command bootstraps the social graph from historicals and writes it once to `bootstrap/YYYY-MM-DD/social_graph.duckdb`. The file is never overwritten after a successful bootstrap; subsequent `snapshot` runs read it as the baseline and apply deltas from `raw/`. If interrupted it resumes from the in-progress `social_graph.duckdb` and assumes any DIDs already present are complete. It generates the following tables:
   - Actors / Follows / Blocks
-Importantly it does not backfill posts, likes, or quotes. Doing so would 10x the requirements. The aggregates will be only for the window of data in the snapshot.
+Profile, follow, and block records are pulled from constellation per DID. It does not backfill posts, likes, or reposts -- doing so would 10x the requirements. Post engagement aggregates exist only for the window of data in the snapshot.
 
 ### at-snapshot run
 This command is a long running process to read from the jetstream and write out the parquet files and upload them to the object storage. It's meant to be fault tolerant and persistent. It keeps RAM requirements low by flushing to disk and cleaning up old parquet files beyond a buffer once they have been written to object storage. Data is written to the data of the UTC of the timestamp, which means there may be multiple active at once based on the firehose. Those that are > 2 days in the future or past are ignored.
 
+The jetstream cursor is checkpointed to local sqlite and mirrored to object storage. Only one jetstream connection is active at a time, with failover across the configured endpoints. On resume, if the persisted cursor is too old for jetstream to replay, the process logs a warning and reconnects at "now," accepting the gap.
+
 ### at-snapshot snapshot
-This command reads from object storage the past N days of data in duckdb to compute aggregates to materialize the duckdb schema required for current_all.duckdb and current_graph.duckdb. It is typically scheduled as a cron on the host machine. It's important to constrain the duckdb's working memory so as not to overwhelm the machine with a configurable limit. It should not rely on local files, instead only rely on reading from object storage
+This command reads from object storage the past N days of data in duckdb to compute aggregates to materialize the duckdb schema required for current_all.duckdb and current_graph.duckdb. It is typically scheduled as a cron on the host machine. It's important to constrain the duckdb's working memory so as not to overwhelm the machine with a configurable limit. It should not rely on local files, instead only rely on reading from object storage.
+
+Semantics:
+- The social graph (Actors / Follows / Blocks in `current_graph.duckdb`) is *current state*: the bootstrap baseline plus all follow/block creates and deletes observed in `raw/` since bootstrap. It is not bounded by the lookback window.
+- Post-related entities (Posts / Likes / Reposts / post_media / post_aggs) and per-actor engagement aggregates *are* bounded by the N-day window. Window-bounded fields are named with an `_in_window` suffix (e.g. `total_posts_in_window`, `likes_in_window`) so consumers don't confuse them with all-time totals.
 
 ### at-snapshot monitor
 This is a lightweight http server that reads the logs from the jobs and outputs the current status and if the process is healhty for remote monitoring. It is pointed at the output directory where all the logs and files are and outputs useful views that someone would want to know to confirm that the following commands are working well:
@@ -65,22 +72,23 @@ This is a lightweight http server that reads the logs from the jobs and outputs 
 - The object storage bucket, url, and access keys (env var) -- assume s3 compatible API with R2 as default and a local filesystem for testing
 - The output data directory where everything writes to
 - The snapshot lookback window (default 30 days)
-- The filters for raw records (default lang: en and bsky moderation)
+- The filters for raw records (default lang: en and bsky moderation). Filters apply only to record types that carry the relevant metadata (posts). Engagement records (likes, follows, reposts, blocks) are kept regardless, since they don't carry language or moderation metadata themselves.
 
 ## Sources of data:
 
 It is critical to use the right sources of data in order to work efficiently. The wrong endpoint can mean that things take 100x as long as they should.
-- getting all dids: plc.directory/export using the goat tool
-- getting all follow graphs: https://constellation.microcosm.blue/ -- using listRecords for follows for a given DID or batch of DIDs
-- getting live ATProto records: wss://jetstream{1,2}.{us-east,us-west}.bsky.network/subscribe 
-  - it should be configurable to filter to ONLY the record types we want and we can subset based on language (default: en) and labelers (default bsky moderation)
+- getting all dids: plc.directory/export -- prefer reimplementing the export pull in pure Go, or importing `goat` as a library if its packages are clean. Avoid shelling out to a binary.
+- getting follow / block / profile records during bootstrap: https://constellation.microcosm.blue/ -- using listRecords for the relevant collection for a given DID or batch of DIDs
+- getting live ATProto records: wss://jetstream{1,2}.{us-east,us-west}.bsky.network/subscribe
+  - one active connection at a time with failover across endpoints
+  - it should be configurable to filter to ONLY the record types we want and we can subset based on language (default: en) and labelers (default bsky moderation) on records that carry those fields
 
 ## Data model
 
 The entities we are interested in are the following. 
 Social Graph:
 - Actor: app.bsky.actor.profile (we want a current snapshot of the actors, with their bios, create time)
-  - actor_aggs: we want to know current followers and follows, total posts, likes, quotes, replies, and blocks
+  - actor_aggs: current followers / follows / blocks (all-time, derived from the current-state graph) plus posts / likes / quotes / replies *within the snapshot window*. Window-scoped fields use the `_in_window` suffix to keep the scope explicit.
 - Follows: app.bsky.graph.follow
   - we care about src_id and dest_id of the interned DIDs and timestamp
 - Blocks: app.bsky.graph.block
@@ -94,9 +102,10 @@ Posts:
 - Reposts: app.bsky.feed.repost
 
 Additionally to keep the tables memory efficient we will intern the following fields to reduce their footprint small:
-- URI: post URIs are long and will have an id that can be referenced for likes,aggs, and media
-- DIDs: Profiles will have their DIDs interned 
+- URI: post URIs are long and will have an id that can be referenced for likes, aggs, and media
+- DIDs: Profiles will have their DIDs interned
 - We will use bigints for all of these to ensure we can reach sufficient scale
+- Interning is done by deterministic 64-bit hash (e.g. xxhash64) of the source string, so no central ID allocator or shared state is needed across `bootstrap` / `run` / `snapshot`. The original strings are preserved alongside the id in the `actors` and `posts` tables, so collisions can be detected and reported at snapshot time.
 
 ## Operational Considerations
 
