@@ -1,0 +1,18 @@
+# Build artifacts
+/bin/
+/at-snapshot
+
+# Local working data (configurable via -data-dir)
+/data/
+
+# Test outputs
+*.duckdb
+*.parquet
+*.sqlite
+*.sqlite-journal
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
