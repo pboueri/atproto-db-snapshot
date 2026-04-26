@@ -39,6 +39,7 @@ import (
 
 	"github.com/pboueri/atproto-db-snapshot/internal/atrecord"
 	"github.com/pboueri/atproto-db-snapshot/internal/config"
+	"github.com/pboueri/atproto-db-snapshot/internal/intern"
 	"github.com/pboueri/atproto-db-snapshot/internal/jetstream"
 	"github.com/pboueri/atproto-db-snapshot/internal/model"
 	"github.com/pboueri/atproto-db-snapshot/internal/objstore"
@@ -289,7 +290,8 @@ func dispatch(sink rawio.Sink, flt filter, e jetstream.Event) error {
 	case model.CollectionLike:
 		if c.Operation == jetstream.OpDelete {
 			return sink.AppendLikes([]model.Like{{
-				ActorDID: e.DID, RKey: c.RKey, IndexedAt: indexedAt, Op: model.OpDelete, Source: model.SourceFirehose,
+				ActorDID: e.DID, ActorDIDID: intern.DIDID(e.DID),
+				RKey: c.RKey, IndexedAt: indexedAt, Op: model.OpDelete, Source: model.SourceFirehose,
 			}})
 		}
 		like, err := atrecord.DecodeLike(c.Record, e.DID, c.RKey, indexedAt, model.SourceFirehose)
@@ -300,7 +302,8 @@ func dispatch(sink rawio.Sink, flt filter, e jetstream.Event) error {
 	case model.CollectionRepost:
 		if c.Operation == jetstream.OpDelete {
 			return sink.AppendReposts([]model.Repost{{
-				ActorDID: e.DID, RKey: c.RKey, IndexedAt: indexedAt, Op: model.OpDelete, Source: model.SourceFirehose,
+				ActorDID: e.DID, ActorDIDID: intern.DIDID(e.DID),
+				RKey: c.RKey, IndexedAt: indexedAt, Op: model.OpDelete, Source: model.SourceFirehose,
 			}})
 		}
 		rp, err := atrecord.DecodeRepost(c.Record, e.DID, c.RKey, indexedAt, model.SourceFirehose)
@@ -311,7 +314,8 @@ func dispatch(sink rawio.Sink, flt filter, e jetstream.Event) error {
 	case model.CollectionFollow:
 		if c.Operation == jetstream.OpDelete {
 			return sink.AppendFollows([]model.Follow{{
-				SrcDID: e.DID, RKey: c.RKey, IndexedAt: indexedAt, Op: model.OpDelete, Source: model.SourceFirehose,
+				SrcDID: e.DID, SrcDIDID: intern.DIDID(e.DID),
+				RKey: c.RKey, IndexedAt: indexedAt, Op: model.OpDelete, Source: model.SourceFirehose,
 			}})
 		}
 		f, err := atrecord.DecodeFollow(c.Record, e.DID, c.RKey, indexedAt, model.SourceFirehose)
@@ -322,7 +326,8 @@ func dispatch(sink rawio.Sink, flt filter, e jetstream.Event) error {
 	case model.CollectionBlock:
 		if c.Operation == jetstream.OpDelete {
 			return sink.AppendBlocks([]model.Block{{
-				SrcDID: e.DID, RKey: c.RKey, IndexedAt: indexedAt, Op: model.OpDelete, Source: model.SourceFirehose,
+				SrcDID: e.DID, SrcDIDID: intern.DIDID(e.DID),
+				RKey: c.RKey, IndexedAt: indexedAt, Op: model.OpDelete, Source: model.SourceFirehose,
 			}})
 		}
 		b, err := atrecord.DecodeBlock(c.Record, e.DID, c.RKey, indexedAt, model.SourceFirehose)
@@ -333,7 +338,8 @@ func dispatch(sink rawio.Sink, flt filter, e jetstream.Event) error {
 	case model.CollectionProfile:
 		if c.Operation == jetstream.OpDelete {
 			return sink.AppendProfiles([]model.Profile{{
-				DID: e.DID, IndexedAt: indexedAt, Op: model.OpDelete, Source: model.SourceFirehose,
+				DID: e.DID, DIDID: intern.DIDID(e.DID),
+				IndexedAt: indexedAt, Op: model.OpDelete, Source: model.SourceFirehose,
 			}})
 		}
 		p, err := atrecord.DecodeProfile(c.Record, e.DID, indexedAt, model.SourceFirehose)
@@ -349,7 +355,9 @@ func tombstonePost(e jetstream.Event) model.Post {
 	uri := fmt.Sprintf("at://%s/%s/%s", e.DID, model.CollectionPost, e.Commit.RKey)
 	return model.Post{
 		URI:       uri,
+		URIID:     intern.URIID(uri),
 		DID:       e.DID,
+		DIDID:     intern.DIDID(e.DID),
 		RKey:      e.Commit.RKey,
 		IndexedAt: jetstream.EventTime(e),
 		Op:        model.OpDelete,

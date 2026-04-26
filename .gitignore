@@ -16,3 +16,6 @@
 .idea/
 .vscode/
 *.swp
+
+# Agent transcripts (Claude Code background-agent output)
+.claude/

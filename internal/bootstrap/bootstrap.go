@@ -83,7 +83,20 @@ func RunWith(ctx context.Context, cfg config.Config, deps Deps) error {
 	if err != nil {
 		return err
 	}
-	defer st.Close()
+	// We deliberately don't `defer st.Close()` here. DuckDB writes a WAL
+	// alongside the .duckdb file and only checkpoints into the main file on
+	// a clean Close — so we must close before the upload below or the
+	// uploaded file is missing every row. The Close is invoked explicitly
+	// just before uploadFile, with deferred safety nets along error paths.
+	closed := false
+	closeOnce := func() error {
+		if closed {
+			return nil
+		}
+		closed = true
+		return st.Close()
+	}
+	defer closeOnce()
 
 	if err := st.MarkStarted(ctx, cfg.PLCEndpoint, cfg.ConstellationEndpoint); err != nil {
 		return err
@@ -169,6 +182,12 @@ func RunWith(ctx context.Context, cfg config.Config, deps Deps) error {
 		"written", written.Load(),
 		"fetch_errors", fetchErrs.Load(),
 	)
+
+	// Close the duckdb before uploading so DuckDB checkpoints the WAL into
+	// the main file. Otherwise the uploaded file is missing every row.
+	if err := closeOnce(); err != nil {
+		return fmt.Errorf("bootstrap: close staging: %w", err)
+	}
 
 	// Upload the final duckdb to objstore. The remote path is fixed for
 	// today's date; the spec says it's never overwritten — if a prior
