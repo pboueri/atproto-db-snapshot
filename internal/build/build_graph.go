@@ -169,7 +169,7 @@ func phase1PLC(ctx context.Context, cfg config.Config, store *duckdbstore.Store,
 		opCount     int64
 		flushedRows int64
 	)
-	const flushEvery = 100_000
+	const flushEvery = 50_000
 
 	flush := func(force bool) error {
 		if !force && len(endpoints)+len(tombstones) < flushEvery {
