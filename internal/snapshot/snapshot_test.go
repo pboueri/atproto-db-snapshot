@@ -299,10 +299,10 @@ func TestSnapshotProducesGraphAndAll(t *testing.T) {
 		t.Errorf("posts = %d, want 2 (postOut filtered)", posts)
 	}
 
-	// post_aggs: alice's in-window post should have likes_count=1 reposts_count=1 replies_count=1.
+	// post_aggs: alice's in-window post should have likes_in_window=1 reposts_in_window=1 replies_in_window=1.
 	var lc, rc, rep int64
 	if err := adb.QueryRow(`
-        SELECT likes_count, reposts_count, replies_count
+        SELECT likes_in_window, reposts_in_window, replies_in_window
         FROM post_aggs
         WHERE uri_id = ?`, intern.URIID("at://did:plc:alice/app.bsky.feed.post/p-in")).Scan(&lc, &rc, &rep); err != nil {
 		t.Fatal(err)
@@ -377,14 +377,14 @@ func TestSnapshotAnalyticQueries(t *testing.T) {
 	}
 
 	// 3. "How many people who posted got 1 like" — JOIN posts → post_aggs
-	// where likes_count >= 1, count distinct authors. Expected 1 (alice
+	// where likes_in_window >= 1, count distinct authors. Expected 1 (alice
 	// posted p-in which received 1 like).
 	var posters int64
 	if err := db.QueryRow(`
         SELECT count(DISTINCT p.did_id)
         FROM posts p
         JOIN post_aggs a USING (uri_id)
-        WHERE a.likes_count >= 1
+        WHERE a.likes_in_window >= 1
     `).Scan(&posters); err != nil {
 		t.Fatal(err)
 	}
@@ -397,7 +397,7 @@ func TestSnapshotAnalyticQueries(t *testing.T) {
 	if err := db.QueryRow(`
         SELECT count(*)
         FROM post_aggs
-        WHERE likes_count >= 1
+        WHERE likes_in_window >= 1
     `).Scan(&likedPosts); err != nil {
 		t.Fatal(err)
 	}

@@ -236,29 +236,29 @@ func windowSQL(files rawFiles, windowStart, windowEnd time.Time) []string {
 		`
             CREATE TABLE post_aggs AS
             WITH likes_c AS (
-                SELECT subject_uri_id AS uri_id, count(*) AS likes_count
+                SELECT subject_uri_id AS uri_id, count(*) AS likes_in_window
                 FROM likes GROUP BY 1
             ),
             reposts_c AS (
-                SELECT subject_uri_id AS uri_id, count(*) AS reposts_count
+                SELECT subject_uri_id AS uri_id, count(*) AS reposts_in_window
                 FROM reposts GROUP BY 1
             ),
             quotes_c AS (
-                SELECT quote_parent_uri_id AS uri_id, count(*) AS quotes_count
+                SELECT quote_parent_uri_id AS uri_id, count(*) AS quotes_in_window
                 FROM posts WHERE quote_parent_uri_id IS NOT NULL AND quote_parent_uri_id != 0
                 GROUP BY 1
             ),
             replies_c AS (
-                SELECT reply_parent_uri_id AS uri_id, count(*) AS replies_count
+                SELECT reply_parent_uri_id AS uri_id, count(*) AS replies_in_window
                 FROM posts WHERE reply_parent_uri_id IS NOT NULL AND reply_parent_uri_id != 0
                 GROUP BY 1
             )
             SELECT
                 p.uri_id,
-                coalesce(l.likes_count, 0)   AS likes_count,
-                coalesce(r.reposts_count, 0) AS reposts_count,
-                coalesce(q.quotes_count, 0)  AS quotes_count,
-                coalesce(rp.replies_count, 0) AS replies_count
+                coalesce(l.likes_in_window, 0)   AS likes_in_window,
+                coalesce(r.reposts_in_window, 0) AS reposts_in_window,
+                coalesce(q.quotes_in_window, 0)  AS quotes_in_window,
+                coalesce(rp.replies_in_window, 0) AS replies_in_window
             FROM posts p
             LEFT JOIN likes_c    l  USING (uri_id)
             LEFT JOIN reposts_c  r  USING (uri_id)
