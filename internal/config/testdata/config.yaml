@@ -9,6 +9,22 @@ relay:
   listrepos_workers: 150
   rate_limit_rps: 80
 
+plc:
+  endpoint: https://plc.directory
+  rps: 5
+  refresh_days: 7
+
+pds:
+  per_host_workers: 16
+  per_host_rps: 12
+  http_timeout: 8s
+  max_retries: 4
+
+constellation:
+  enabled: true
+  endpoint: https://constellation.microcosm.blue
+  rps: 5
+
 jetstream:
   endpoints:
     - wss://jetstream2.us-east.bsky.network/subscribe

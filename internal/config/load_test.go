@@ -38,15 +38,21 @@ func TestLoad_GoldenSpecConfig(t *testing.T) {
 		t.Errorf("Relay.RateLimitRPS = %v", cfg.Relay.RateLimitRPS)
 	}
 
-	// reconciled flat Config fields
-	if cfg.Config.RelayHost != "bsky.network" {
-		t.Errorf("Config.RelayHost = %q", cfg.Config.RelayHost)
+	// PLC / PDS / Constellation reconcile from YAML.
+	if cfg.Config.PLC.Endpoint != "https://plc.directory" {
+		t.Errorf("Config.PLC.Endpoint = %q", cfg.Config.PLC.Endpoint)
 	}
-	if cfg.Config.Workers != 150 {
-		t.Errorf("Config.Workers = %d", cfg.Config.Workers)
+	if cfg.Config.PDS.PerHostWorkers != 16 {
+		t.Errorf("Config.PDS.PerHostWorkers = %d, want 16", cfg.Config.PDS.PerHostWorkers)
 	}
-	if cfg.Config.RateLimitRPS != 80 {
-		t.Errorf("Config.RateLimitRPS = %v", cfg.Config.RateLimitRPS)
+	if cfg.Config.PDS.PerHostRPS != 12 {
+		t.Errorf("Config.PDS.PerHostRPS = %v, want 12", cfg.Config.PDS.PerHostRPS)
+	}
+	if cfg.Config.PDS.HTTPTimeout != 8*time.Second {
+		t.Errorf("Config.PDS.HTTPTimeout = %v, want 8s", cfg.Config.PDS.HTTPTimeout)
+	}
+	if !cfg.Config.Constellation.Enabled {
+		t.Errorf("Config.Constellation.Enabled = false, want true")
 	}
 
 	// jetstream YAML overlay → Config.Jetstream
@@ -155,12 +161,15 @@ func TestLoad_EmptyYAMLReturnsDefaults(t *testing.T) {
 	if cfg.ObjectStore.Type != "file" {
 		t.Errorf("ObjectStore.Type = %q, want file", cfg.ObjectStore.Type)
 	}
-	// Reconciled flat fields:
-	if cfg.Config.RelayHost != "bsky.network" {
-		t.Errorf("Config.RelayHost = %q, want bsky.network", cfg.Config.RelayHost)
+	// Reconciled defaults for new sections.
+	if cfg.Config.PLC.Endpoint != "https://plc.directory" {
+		t.Errorf("Config.PLC.Endpoint = %q, want https://plc.directory", cfg.Config.PLC.Endpoint)
 	}
-	if cfg.Config.Workers != 150 {
-		t.Errorf("Config.Workers = %d, want 150", cfg.Config.Workers)
+	if cfg.Config.PDS.PerHostWorkers != 8 {
+		t.Errorf("Config.PDS.PerHostWorkers = %d, want 8", cfg.Config.PDS.PerHostWorkers)
+	}
+	if cfg.Config.PDS.HTTPTimeout != 10*time.Second {
+		t.Errorf("Config.PDS.HTTPTimeout = %v, want 10s", cfg.Config.PDS.HTTPTimeout)
 	}
 }
 
@@ -173,9 +182,6 @@ func TestLoad_PartialYAMLPreservesDefaults(t *testing.T) {
 	// Overridden:
 	if cfg.Relay.Host != "foo" {
 		t.Errorf("Relay.Host = %q, want %q", cfg.Relay.Host, "foo")
-	}
-	if cfg.Config.RelayHost != "foo" {
-		t.Errorf("Config.RelayHost = %q (reconcile failed)", cfg.Config.RelayHost)
 	}
 
 	// Other fields keep defaults:

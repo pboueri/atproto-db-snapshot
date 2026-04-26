@@ -13,22 +13,53 @@ import (
 // while exposing the additional spec sections that don't yet have a home
 // on Config (object_store, paths, duckdb, serve).
 //
-// Merge rule: the structured sections (Relay, Paths, …) are the source
-// of truth when populated from YAML. After Load() they are reconciled
-// into the embedded Config so legacy code paths (which only read flat
-// fields like Config.RelayHost / Config.DataDir / Config.Filters /
-// Config.Retention) still see fresh values.
+// Merge rule: the structured sections (Paths, …) are the source of
+// truth when populated from YAML. After Load() they are reconciled into
+// the embedded Config so legacy code paths (Config.DataDir,
+// Config.Filters, Config.Retention) see fresh values.
+//
+// The Relay block is kept as a tolerated, vestigial YAML section so
+// pre-existing config.yamls don't fail to parse; it is no longer
+// reconciled into Config (spec 003 removed RelayHost/Workers/RateLimitRPS).
 type ExtendedConfig struct {
 	Config `yaml:"-"`
 
-	ObjectStore ObjectStoreConfig   `yaml:"object_store"`
-	Relay       RelayConfig         `yaml:"relay"`
-	Jetstream   JetstreamYAMLConfig `yaml:"jetstream"`
-	Retention   RetentionYAMLConfig `yaml:"retention"`
-	Filters     FiltersYAMLConfig   `yaml:"filters"`
-	Paths       PathsConfig         `yaml:"paths"`
-	DuckDB      DuckDBConfig        `yaml:"duckdb"`
-	Serve       ServeConfig         `yaml:"serve"`
+	ObjectStore   ObjectStoreConfig       `yaml:"object_store"`
+	Relay         RelayConfig             `yaml:"relay"`
+	PLC           PLCYAMLConfig           `yaml:"plc"`
+	PDS           PDSYAMLConfig           `yaml:"pds"`
+	Constellation ConstellationYAMLConfig `yaml:"constellation"`
+	Jetstream     JetstreamYAMLConfig     `yaml:"jetstream"`
+	Retention     RetentionYAMLConfig     `yaml:"retention"`
+	Filters       FiltersYAMLConfig       `yaml:"filters"`
+	Paths         PathsConfig             `yaml:"paths"`
+	DuckDB        DuckDBConfig            `yaml:"duckdb"`
+	Serve         ServeConfig             `yaml:"serve"`
+}
+
+// PLCYAMLConfig mirrors the `plc:` block.
+type PLCYAMLConfig struct {
+	Endpoint    string  `yaml:"endpoint"`
+	PageSize    int     `yaml:"page_size"`
+	RPS         float64 `yaml:"rps"`
+	RefreshDays int     `yaml:"refresh_days"`
+}
+
+// PDSYAMLConfig mirrors the `pds:` block.
+type PDSYAMLConfig struct {
+	PerHostWorkers   int     `yaml:"per_host_workers"`
+	PerHostRPS       float64 `yaml:"per_host_rps"`
+	HTTPTimeout      string  `yaml:"http_timeout"`
+	MaxRetries       int     `yaml:"max_retries"`
+	BreakerThreshold int     `yaml:"breaker_threshold"`
+	BreakerCooldown  string  `yaml:"breaker_cooldown"`
+}
+
+// ConstellationYAMLConfig mirrors the `constellation:` block.
+type ConstellationYAMLConfig struct {
+	Enabled  *bool   `yaml:"enabled"`
+	Endpoint string  `yaml:"endpoint"`
+	RPS      float64 `yaml:"rps"`
 }
 
 // ObjectStoreConfig is the `object_store:` block. Credentials are sourced
@@ -113,10 +144,31 @@ func DefaultExtended() ExtendedConfig {
 		ObjectStore: ObjectStoreConfig{
 			Type: "file",
 		},
+		// Relay is a vestigial YAML section retained only so legacy
+		// config files don't fail to parse. Not reconciled into Config.
 		Relay: RelayConfig{
 			Host:             "bsky.network",
 			ListReposWorkers: 150,
 			RateLimitRPS:     80,
+		},
+		PLC: PLCYAMLConfig{
+			Endpoint:    base.PLC.Endpoint,
+			PageSize:    base.PLC.PageSize,
+			RPS:         base.PLC.RPS,
+			RefreshDays: base.PLC.RefreshDays,
+		},
+		PDS: PDSYAMLConfig{
+			PerHostWorkers:   base.PDS.PerHostWorkers,
+			PerHostRPS:       base.PDS.PerHostRPS,
+			HTTPTimeout:      base.PDS.HTTPTimeout.String(),
+			MaxRetries:       base.PDS.MaxRetries,
+			BreakerThreshold: base.PDS.BreakerThreshold,
+			BreakerCooldown:  base.PDS.BreakerCooldown.String(),
+		},
+		Constellation: ConstellationYAMLConfig{
+			Enabled:  ptrBool(base.Constellation.Enabled),
+			Endpoint: base.Constellation.Endpoint,
+			RPS:      base.Constellation.RPS,
 		},
 		Retention: RetentionYAMLConfig{
 			ParquetDays: base.Retention.ParquetDays,
@@ -143,6 +195,8 @@ func DefaultExtended() ExtendedConfig {
 		},
 	}
 }
+
+func ptrBool(b bool) *bool { return &b }
 
 // Load reads a YAML file at path, overlays it on top of DefaultExtended,
 // and reconciles structured sections back onto the embedded Config so
@@ -195,7 +249,7 @@ func mergeExtended(dst, src *ExtendedConfig) {
 		dst.ObjectStore.PublicURLBase = src.ObjectStore.PublicURLBase
 	}
 
-	// relay
+	// relay (vestigial — accept overrides for forward-compat parsing only)
 	if src.Relay.Host != "" {
 		dst.Relay.Host = src.Relay.Host
 	}
@@ -204,6 +258,51 @@ func mergeExtended(dst, src *ExtendedConfig) {
 	}
 	if src.Relay.RateLimitRPS != 0 {
 		dst.Relay.RateLimitRPS = src.Relay.RateLimitRPS
+	}
+
+	// plc
+	if src.PLC.Endpoint != "" {
+		dst.PLC.Endpoint = src.PLC.Endpoint
+	}
+	if src.PLC.PageSize != 0 {
+		dst.PLC.PageSize = src.PLC.PageSize
+	}
+	if src.PLC.RPS != 0 {
+		dst.PLC.RPS = src.PLC.RPS
+	}
+	if src.PLC.RefreshDays != 0 {
+		dst.PLC.RefreshDays = src.PLC.RefreshDays
+	}
+
+	// pds
+	if src.PDS.PerHostWorkers != 0 {
+		dst.PDS.PerHostWorkers = src.PDS.PerHostWorkers
+	}
+	if src.PDS.PerHostRPS != 0 {
+		dst.PDS.PerHostRPS = src.PDS.PerHostRPS
+	}
+	if src.PDS.HTTPTimeout != "" {
+		dst.PDS.HTTPTimeout = src.PDS.HTTPTimeout
+	}
+	if src.PDS.MaxRetries != 0 {
+		dst.PDS.MaxRetries = src.PDS.MaxRetries
+	}
+	if src.PDS.BreakerThreshold != 0 {
+		dst.PDS.BreakerThreshold = src.PDS.BreakerThreshold
+	}
+	if src.PDS.BreakerCooldown != "" {
+		dst.PDS.BreakerCooldown = src.PDS.BreakerCooldown
+	}
+
+	// constellation
+	if src.Constellation.Enabled != nil {
+		dst.Constellation.Enabled = src.Constellation.Enabled
+	}
+	if src.Constellation.Endpoint != "" {
+		dst.Constellation.Endpoint = src.Constellation.Endpoint
+	}
+	if src.Constellation.RPS != 0 {
+		dst.Constellation.RPS = src.Constellation.RPS
 	}
 
 	// jetstream — merge into the YAML view, then push into Config.Jetstream
@@ -296,15 +395,57 @@ func mergeExtended(dst, src *ExtendedConfig) {
 // Only non-zero structured values overwrite the flat field; zero values
 // preserve whatever Default() seeded.
 func reconcileFlatConfig(cfg *ExtendedConfig) error {
-	// Relay → Config flat fields
-	if cfg.Relay.Host != "" {
-		cfg.Config.RelayHost = cfg.Relay.Host
+	// PLC → Config.PLC
+	if cfg.PLC.Endpoint != "" {
+		cfg.Config.PLC.Endpoint = cfg.PLC.Endpoint
 	}
-	if cfg.Relay.ListReposWorkers != 0 {
-		cfg.Config.Workers = cfg.Relay.ListReposWorkers
+	if cfg.PLC.PageSize != 0 {
+		cfg.Config.PLC.PageSize = cfg.PLC.PageSize
 	}
-	if cfg.Relay.RateLimitRPS != 0 {
-		cfg.Config.RateLimitRPS = cfg.Relay.RateLimitRPS
+	if cfg.PLC.RPS != 0 {
+		cfg.Config.PLC.RPS = cfg.PLC.RPS
+	}
+	if cfg.PLC.RefreshDays != 0 {
+		cfg.Config.PLC.RefreshDays = cfg.PLC.RefreshDays
+	}
+
+	// PDS → Config.PDS
+	if cfg.PDS.PerHostWorkers != 0 {
+		cfg.Config.PDS.PerHostWorkers = cfg.PDS.PerHostWorkers
+	}
+	if cfg.PDS.PerHostRPS != 0 {
+		cfg.Config.PDS.PerHostRPS = cfg.PDS.PerHostRPS
+	}
+	if cfg.PDS.HTTPTimeout != "" {
+		d, err := time.ParseDuration(cfg.PDS.HTTPTimeout)
+		if err != nil {
+			return fmt.Errorf("pds.http_timeout: %w", err)
+		}
+		cfg.Config.PDS.HTTPTimeout = d
+	}
+	if cfg.PDS.MaxRetries != 0 {
+		cfg.Config.PDS.MaxRetries = cfg.PDS.MaxRetries
+	}
+	if cfg.PDS.BreakerThreshold != 0 {
+		cfg.Config.PDS.BreakerThreshold = cfg.PDS.BreakerThreshold
+	}
+	if cfg.PDS.BreakerCooldown != "" {
+		d, err := time.ParseDuration(cfg.PDS.BreakerCooldown)
+		if err != nil {
+			return fmt.Errorf("pds.breaker_cooldown: %w", err)
+		}
+		cfg.Config.PDS.BreakerCooldown = d
+	}
+
+	// Constellation → Config.Constellation
+	if cfg.Constellation.Enabled != nil {
+		cfg.Config.Constellation.Enabled = *cfg.Constellation.Enabled
+	}
+	if cfg.Constellation.Endpoint != "" {
+		cfg.Config.Constellation.Endpoint = cfg.Constellation.Endpoint
+	}
+	if cfg.Constellation.RPS != 0 {
+		cfg.Config.Constellation.RPS = cfg.Constellation.RPS
 	}
 
 	// Paths → Config.DataDir

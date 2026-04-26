@@ -68,6 +68,12 @@ CREATE TABLE IF NOT EXISTS _meta (
   did_limit        BIGINT,
   source_did_count BIGINT
 );
+
+CREATE TABLE IF NOT EXISTS pds_endpoints (
+  did         VARCHAR PRIMARY KEY,
+  endpoint    VARCHAR NOT NULL,
+  resolved_at TIMESTAMP NOT NULL
+);
 `
 
 // Store wraps a DuckDB connection.
@@ -204,6 +210,121 @@ func (s *Store) WriteMeta(mode string, didLimit, sourceDIDs int64) error {
 		"v1", time.Now().UTC(), mode, didLimit, sourceDIDs,
 	)
 	return err
+}
+
+// UpsertPDSEndpoint inserts or updates a single (did, endpoint, ts) row in
+// the pds_endpoints table. For bulk loads prefer BulkUpsertPDSEndpoints.
+func (s *Store) UpsertPDSEndpoint(did, endpoint string, ts time.Time) error {
+	_, err := s.DB.Exec(`
+		INSERT INTO pds_endpoints (did, endpoint, resolved_at) VALUES (?, ?, ?)
+		ON CONFLICT (did) DO UPDATE SET endpoint = EXCLUDED.endpoint, resolved_at = EXCLUDED.resolved_at
+	`, did, endpoint, ts)
+	return err
+}
+
+// BulkUpsertPDSEndpoints upserts a map of did→endpoint with the same
+// resolved_at across all rows. Uses a single transaction.
+func (s *Store) BulkUpsertPDSEndpoints(endpoints map[string]string, ts time.Time) error {
+	if len(endpoints) == 0 {
+		return nil
+	}
+	tx, err := s.DB.Begin()
+	if err != nil {
+		return err
+	}
+	stmt, err := tx.Prepare(`
+		INSERT INTO pds_endpoints (did, endpoint, resolved_at) VALUES (?, ?, ?)
+		ON CONFLICT (did) DO UPDATE SET endpoint = EXCLUDED.endpoint, resolved_at = EXCLUDED.resolved_at
+	`)
+	if err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	for did, ep := range endpoints {
+		if _, err := stmt.Exec(did, ep, ts); err != nil {
+			_ = stmt.Close()
+			_ = tx.Rollback()
+			return fmt.Errorf("upsert %s: %w", did, err)
+		}
+	}
+	if err := stmt.Close(); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	return tx.Commit()
+}
+
+// DeletePDSEndpoints removes the given DIDs from pds_endpoints. Used to
+// drop tombstoned DIDs after PLC enumeration.
+func (s *Store) DeletePDSEndpoints(dids []string) error {
+	if len(dids) == 0 {
+		return nil
+	}
+	tx, err := s.DB.Begin()
+	if err != nil {
+		return err
+	}
+	stmt, err := tx.Prepare(`DELETE FROM pds_endpoints WHERE did = ?`)
+	if err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	for _, d := range dids {
+		if _, err := stmt.Exec(d); err != nil {
+			_ = stmt.Close()
+			_ = tx.Rollback()
+			return err
+		}
+	}
+	if err := stmt.Close(); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	return tx.Commit()
+}
+
+// LoadPDSEndpoints returns the persisted (did → endpoint) map. Empty if
+// no PLC enumeration has run yet.
+func (s *Store) LoadPDSEndpoints() (map[string]string, error) {
+	rows, err := s.DB.Query(`SELECT did, endpoint FROM pds_endpoints`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make(map[string]string)
+	for rows.Next() {
+		var did, ep string
+		if err := rows.Scan(&did, &ep); err != nil {
+			return nil, err
+		}
+		out[did] = ep
+	}
+	return out, rows.Err()
+}
+
+// UpdateActorReceivedCounts overwrites likes_received_count and
+// reposts_received_count for the given DID. Used by the optional
+// Constellation enrichment pass. Re-running is idempotent (overwrites).
+func (s *Store) UpdateActorReceivedCounts(did string, likes, reposts int64) error {
+	_, err := s.DB.Exec(
+		`UPDATE actors SET likes_received_count = ?, reposts_received_count = ? WHERE did = ?`,
+		likes, reposts, did,
+	)
+	return err
+}
+
+// MostRecentPDSResolveAt returns the most recent resolved_at across all
+// pds_endpoints rows, or zero time if the table is empty.
+func (s *Store) MostRecentPDSResolveAt() (time.Time, error) {
+	row := s.DB.QueryRow(`SELECT MAX(resolved_at) FROM pds_endpoints`)
+	var t sql.NullTime
+	if err := row.Scan(&t); err != nil {
+		return time.Time{}, err
+	}
+	if !t.Valid {
+		return time.Time{}, nil
+	}
+	return t.Time.UTC(), nil
 }
 
 // RecomputeCounts fills denormalized counts on actors. Graph-only columns

@@ -33,8 +33,15 @@ Bluesky's published zstd dictionary, embedded in the binary.
 ### `build` — produce the queryable DuckDB snapshots
 
 ```bash
-# First-time graph seed: CAR-crawl N DIDs from the relay
+# First-time graph seed: PLC enumeration + per-PDS listRecords backfill
+# (spec 003). Defaults: 8 workers/host, 9 req/sec/host, ~50 hosts → ~50× more
+# parallelism than the legacy single-relay path. Set -limit 0 for the full
+# network, or e.g. -limit 10000 for a quick smoke test.
 ./at-snapshotter build -mode graph-backfill -limit 10000 -data-dir ./data
+
+# Tunables: -plc-rps, -plc-refresh-days, -pds-workers-per-host,
+# -pds-rps-per-host, -pds-timeout, and -use-constellation (optional
+# follower/likes-received enrichment via constellation.microcosm.blue).
 
 # Nightly: replay yesterday's parquet shards into current_all.duckdb
 ./at-snapshotter build -mode incremental -data-dir ./data -file-store ./store

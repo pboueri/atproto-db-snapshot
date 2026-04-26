@@ -53,13 +53,34 @@ func runBuild(ctx context.Context, args []string, logger *slog.Logger) {
 	fs := flag.NewFlagSet("build", flag.ExitOnError)
 	cfg := config.Default()
 
-	// Knobs that apply to the legacy graph-backfill path.
-	fs.StringVar(&cfg.RelayHost, "relay", cfg.RelayHost, "relay host, e.g. https://bsky.network (graph-backfill / force-rebuild only)")
-	fs.IntVar(&cfg.Workers, "workers", cfg.Workers, "parallel getRepo workers (graph-backfill / force-rebuild only)")
-	fs.Float64Var(&cfg.RateLimitRPS, "rps", cfg.RateLimitRPS, "global rate limit in requests per second (graph-backfill / force-rebuild only)")
+	// Peek for -config so YAML overlay applies before CLI flags so that
+	// CLI flags take precedence over YAML values.
+	if cp := peekFlag(args, "config"); cp != "" {
+		if ext, err := config.Load(cp); err == nil {
+			cfg = ext.Config
+		} else {
+			fmt.Fprintf(os.Stderr, "warning: could not pre-load config %s: %v\n", cp, err)
+		}
+	}
+
+	// Knobs for the listRecords graph-backfill path (spec 003).
 	fs.IntVar(&cfg.DIDLimit, "limit", cfg.DIDLimit, "cap backfill at this many DIDs (0 = no cap)")
 	fs.StringVar(&cfg.DataDir, "data-dir", cfg.DataDir, "local working directory")
-	fs.DurationVar(&cfg.HTTPTimeout, "http-timeout", cfg.HTTPTimeout, "per-request HTTP timeout")
+	fs.DurationVar(&cfg.HTTPTimeout, "http-timeout", cfg.HTTPTimeout, "per-request HTTP timeout for the PLC client")
+
+	// PLC enumeration.
+	fs.StringVar(&cfg.PLC.Endpoint, "plc-endpoint", cfg.PLC.Endpoint, "PLC directory base URL")
+	fs.Float64Var(&cfg.PLC.RPS, "plc-rps", cfg.PLC.RPS, "PLC export rate (req/sec)")
+	fs.IntVar(&cfg.PLC.RefreshDays, "plc-refresh-days", cfg.PLC.RefreshDays, "skip PLC enumeration if pds_endpoints is younger than this")
+
+	// Per-PDS dispatch.
+	fs.IntVar(&cfg.PDS.PerHostWorkers, "pds-workers-per-host", cfg.PDS.PerHostWorkers, "concurrent listRecords workers per PDS host (replaces -workers)")
+	fs.Float64Var(&cfg.PDS.PerHostRPS, "pds-rps-per-host", cfg.PDS.PerHostRPS, "per-host listRecords rate (req/sec) (replaces -rps)")
+	fs.DurationVar(&cfg.PDS.HTTPTimeout, "pds-timeout", cfg.PDS.HTTPTimeout, "per-request HTTP timeout for listRecords calls")
+
+	// Constellation enrichment.
+	fs.BoolVar(&cfg.Constellation.Enabled, "use-constellation", cfg.Constellation.Enabled, "after the listRecords pass, enrich actors.*_received_count via Constellation")
+	fs.StringVar(&cfg.Constellation.Endpoint, "constellation-endpoint", cfg.Constellation.Endpoint, "Constellation backlinks service base URL")
 
 	// New mode-driven flags (§9 / spec).
 	var (
@@ -93,7 +114,8 @@ Modes:
   -mode=incremental    Replay ./data/daily/YYYY-MM-DD/*.parquet into an
                        existing current_all.duckdb (downloaded from the
                        object store if missing locally). Default.
-  -mode=graph-backfill CAR-crawl path; produces current_graph.duckdb only.
+  -mode=graph-backfill PLC enumeration + per-PDS listRecords backfill;
+                       produces current_graph.duckdb only (spec 003).
   -mode=force-rebuild  Same as graph-backfill, plus auto-emits a bootstrap.
 
 Flags:`)
@@ -297,6 +319,30 @@ Flags:`)
 		logger.Error("labels failed", "err", err)
 		os.Exit(1)
 	}
+}
+
+// peekFlag scans args for `-name=value` or `-name value` (and `--name`
+// equivalents) without committing to a flag.FlagSet definition. Returns
+// the value or "". Used to preload YAML before binding flags so CLI
+// values take precedence over YAML overrides.
+func peekFlag(args []string, name string) string {
+	long := "--" + name
+	short := "-" + name
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if a == short || a == long {
+			if i+1 < len(args) {
+				return args[i+1]
+			}
+			return ""
+		}
+		for _, p := range []string{long + "=", short + "="} {
+			if len(a) > len(p) && a[:len(p)] == p {
+				return a[len(p):]
+			}
+		}
+	}
+	return ""
 }
 
 func usage() {

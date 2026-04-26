@@ -3,12 +3,15 @@ package config
 import "time"
 
 type Config struct {
-	RelayHost    string        // e.g. "https://bsky.network"
-	Workers      int           // parallel getRepo workers
-	RateLimitRPS float64       // global rate limit (req/s)
-	HTTPTimeout  time.Duration // per-request timeout
-	DataDir      string        // local working directory
-	DIDLimit     int           // cap backfill at this many DIDs (0 = no cap)
+	HTTPTimeout time.Duration // per-request timeout for the PLC client
+	DataDir     string        // local working directory
+	DIDLimit    int           // cap backfill at this many DIDs (0 = no cap)
+
+	// ----- listRecords graph backfill (spec 003) -----
+
+	PLC           PLCConfig
+	PDS           PDSConfig
+	Constellation ConstellationConfig
 
 	// ----- run-mode (Jetstream consumer) settings -----
 
@@ -22,6 +25,31 @@ type Config struct {
 	Filters FilterConfig
 }
 
+// PLCConfig configures the plc.directory enumeration phase.
+type PLCConfig struct {
+	Endpoint    string  // default "https://plc.directory"
+	PageSize    int     // default 1000
+	RPS         float64 // default 5
+	RefreshDays int     // default 7 — re-dump PLC if older
+}
+
+// PDSConfig configures the per-PDS listRecords dispatcher.
+type PDSConfig struct {
+	PerHostWorkers   int           // default 8
+	PerHostRPS       float64       // default 9
+	HTTPTimeout      time.Duration // default 10s
+	MaxRetries       int           // default 4
+	BreakerThreshold int           // default 5 consecutive failures
+	BreakerCooldown  time.Duration // default 5m
+}
+
+// ConstellationConfig configures the optional /links/all enrichment pass.
+type ConstellationConfig struct {
+	Enabled  bool    // default false (must be explicitly enabled)
+	Endpoint string  // default "https://constellation.microcosm.blue"
+	RPS      float64 // default 5
+}
+
 // RetentionConfig controls how long archive artifacts live in the object
 // store. See specs/001_bootstrap.md §9 / §11.
 type RetentionConfig struct {
@@ -33,8 +61,8 @@ type RetentionConfig struct {
 // FilterConfig captures build-time filters per spec §11. The parquet
 // archive is unaffected — filters apply only when assembling the snapshot.
 type FilterConfig struct {
-	Posts               PostFilter
-	ExcludeCollections  []string
+	Posts              PostFilter
+	ExcludeCollections []string
 }
 
 // PostFilter selects which post rows survive into current_all.duckdb.
@@ -118,16 +146,47 @@ func DefaultJetstream() JetstreamConfig {
 	}
 }
 
+// DefaultPLC returns the spec defaults for the PLC enumerator.
+func DefaultPLC() PLCConfig {
+	return PLCConfig{
+		Endpoint:    "https://plc.directory",
+		PageSize:    1000,
+		RPS:         5,
+		RefreshDays: 7,
+	}
+}
+
+// DefaultPDS returns the spec defaults for the per-host listRecords pool.
+func DefaultPDS() PDSConfig {
+	return PDSConfig{
+		PerHostWorkers:   8,
+		PerHostRPS:       9,
+		HTTPTimeout:      10 * time.Second,
+		MaxRetries:       4,
+		BreakerThreshold: 5,
+		BreakerCooldown:  5 * time.Minute,
+	}
+}
+
+// DefaultConstellation returns the spec defaults for the enrichment pass.
+func DefaultConstellation() ConstellationConfig {
+	return ConstellationConfig{
+		Enabled:  false,
+		Endpoint: "https://constellation.microcosm.blue",
+		RPS:      5,
+	}
+}
+
 func Default() Config {
 	return Config{
-		RelayHost:    "https://bsky.network",
-		Workers:      64,
-		RateLimitRPS: 40,
-		HTTPTimeout:  15 * time.Second,
-		DataDir:      "./data",
-		DIDLimit:     10_000,
-		Jetstream:    DefaultJetstream(),
-		Retention:    RetentionConfig{ParquetDays: 90},
-		Filters:      FilterConfig{},
+		HTTPTimeout:   30 * time.Second,
+		DataDir:       "./data",
+		DIDLimit:      10_000,
+		PLC:           DefaultPLC(),
+		PDS:           DefaultPDS(),
+		Constellation: DefaultConstellation(),
+		Jetstream:     DefaultJetstream(),
+		Retention:     RetentionConfig{ParquetDays: 90},
+		Filters:       FilterConfig{},
 	}
 }
