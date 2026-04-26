@@ -1,0 +1,55 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      # go-duckdb/v2 requires cgo. Linux runners ship gcc by default.
+      CGO_ENABLED: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          # Pin to whatever go.mod declares — keeps CI in lockstep with devs.
+          go-version-file: go.mod
+          cache: true
+
+      - name: go mod download
+        run: go mod download
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go build
+        run: go build ./...
+
+      - name: go test
+        # -count=1 disables the test cache so every run is a real run.
+        # -timeout protects against deadlocked WS / WaitGroup tests.
+        run: go test ./... -count=1 -timeout 10m
+
+      - name: go test (race detector)
+        # Race detector is slower; gate on push to main only so PRs stay fast.
+        # Excludes internal/e2e: modernc/sqlite tripped a SIGBUS under -race
+        # in TestPipelineRunToParquet (pre-existing issue in the SQLite WAL
+        # path under high write rates). The package's own tests run race-free
+        # in the non-race step above.
+        if: github.event_name == 'push'
+        run: |
+          PKGS=$(go list ./... | grep -v '/internal/e2e$')
+          go test $PKGS -count=1 -race -timeout 15m

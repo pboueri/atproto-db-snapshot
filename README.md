@@ -1,5 +1,9 @@
 # atproto-db-snapshot
 
+```warning
+This is all AI generated in a couple short sessions -- it will be refined over time. 
+```
+
 A snapshotter for ATProto that produces queryable DuckDB files and a
 parquet event archive. Full design in [`specs/001_bootstrap.md`](specs/001_bootstrap.md).
 
@@ -81,15 +85,19 @@ See `queries.sql` for more examples.
 High-level relationships. Column detail below.
 
 ```mermaid
+---
+config:
+  layout: elk
+---
 erDiagram
-    actors          ||--o{ posts           : authors
-    actors          ||--o{ likes_current   : gives
-    actors          ||--o{ reposts_current : gives
-    actors          ||--o{ follows_current : "src / dst"
-    actors          ||--o{ blocks_current  : "src / dst"
-    posts           ||--o{ likes_current   : receives
-    posts           ||--o{ reposts_current : receives
-    posts           ||--o{ posts           : "replies / quotes"
+    actors          ||--o{ posts           :
+    actors          ||--o{ likes_current   :
+    actors          ||--o{ reposts_current :
+    actors          ||--o{ follows_current : 
+    actors          ||--o{ blocks_current  : 
+    posts           ||--o{ likes_current   : 
+    posts           ||--o{ reposts_current : 
+    posts           ||--o{ posts           :
 ```
 
 Entity detail:
