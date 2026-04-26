@@ -198,14 +198,14 @@ func runGraphBackfill(ctx context.Context, cfg config.Config, logger *slog.Logge
 					return nil
 				}
 				atomic.AddInt64(&fetchErr, 1)
-				logger.Debug("getRepo failed", "did", did, "err", err)
+				logger.Warn("getRepo failed", "did", did, "err", err)
 				return nil
 			}
 			atomic.AddInt64(&fetched, 1)
 			recs, err := parse.Parse(wctx, did, car)
 			if err != nil {
 				atomic.AddInt64(&fetchErr, 1)
-				logger.Debug("parse failed", "did", did, "err", err)
+				logger.Warn("parse failed", "did", did, "err", err)
 				return nil
 			}
 			atomic.AddInt64(&parsed, 1)

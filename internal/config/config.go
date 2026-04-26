@@ -123,7 +123,7 @@ func Default() Config {
 		RelayHost:    "https://bsky.network",
 		Workers:      64,
 		RateLimitRPS: 40,
-		HTTPTimeout:  60 * time.Second,
+		HTTPTimeout:  15 * time.Second,
 		DataDir:      "./data",
 		DIDLimit:     10_000,
 		Jetstream:    DefaultJetstream(),
