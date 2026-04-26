@@ -8,9 +8,6 @@ import (
 // graphSQL returns the ordered CREATE TABLE AS SELECT statements that
 // materialize the current-state social graph in the working database.
 //
-// rawRoot is the absolute path returned by objstore.URL("raw") — used as the
-// base for read_parquet globs.
-//
 // The current-state semantics are:
 //   - actors: bootstrap baseline UNION any new profiles seen in raw, with
 //     latest-indexed-at winning per DID.
@@ -20,26 +17,25 @@ import (
 //     creates with their bootstrap indexed_at.
 //   - blocks: same shape as follows.
 //   - actor_aggs: derived from the now-current state, all-time scope.
-func graphSQL(rawRoot string) []string {
-	profilesGlob := rawGlob(rawRoot, "profiles")
-	followsGlob := rawGlob(rawRoot, "follows")
-	blocksGlob := rawGlob(rawRoot, "blocks")
+//
+// We render an explicit empty SELECT when a collection has no parquet shards
+// in raw/ — read_parquet on an empty file list errors out, and the rest of
+// the pipeline references the temp tables unconditionally.
+func graphSQL(files rawFiles) []string {
+	rawProfiles := rawProfilesSelect(files.profiles)
+	rawFollows := rawFollowsSelect(files.follows)
+	rawBlocks := rawBlocksSelect(files.blocks)
 
 	return []string{
 		// Stage raw profile deltas (only creates carry meaningful payload;
 		// profile deletes for atproto are rare and we do not propagate them
 		// as actor removals — actors keep representing observed identities).
-		fmt.Sprintf(`
-            CREATE TEMP TABLE _raw_profiles AS
-            SELECT * FROM read_parquet('%s', union_by_name=true, filename=true)
-            WHERE op = 'create'
-        `, escapeSQLLiteral(profilesGlob)),
+		fmt.Sprintf(`CREATE TEMP TABLE _raw_profiles AS %s`, rawProfiles),
 
 		// Pick the most recent profile observation per DID.
 		`
             CREATE TEMP TABLE _latest_profile AS
-            SELECT *
-            FROM (
+            SELECT * EXCLUDE (rn) FROM (
                 SELECT *, row_number() OVER (PARTITION BY did_id ORDER BY indexed_at DESC) AS rn
                 FROM _raw_profiles
             )
@@ -82,15 +78,11 @@ func graphSQL(rawRoot string) []string {
 
 		// Stage follow deltas with a row number per natural key so we can
 		// find the latest event for each (src_did_id, rkey).
-		fmt.Sprintf(`
-            CREATE TEMP TABLE _raw_follows AS
-            SELECT * FROM read_parquet('%s', union_by_name=true, filename=true)
-        `, escapeSQLLiteral(followsGlob)),
+		fmt.Sprintf(`CREATE TEMP TABLE _raw_follows AS %s`, rawFollows),
 
 		`
             CREATE TEMP TABLE _follow_state AS
-            SELECT *
-            FROM (
+            SELECT * EXCLUDE (rn) FROM (
                 SELECT *, row_number() OVER (PARTITION BY src_did_id, rkey ORDER BY indexed_at DESC) AS rn
                 FROM _raw_follows
             )
@@ -98,9 +90,8 @@ func graphSQL(rawRoot string) []string {
         `,
 
 		// follows: bootstrap baseline minus any (src,rkey) whose latest delta
-		// is a delete, plus any (src,rkey) whose latest delta is a create
-		// and which is not already in the baseline (LEFT JOIN ... NULL).
-		// The two halves are unioned and de-duplicated by primary key.
+		// is a delete, plus any (src,rkey) whose latest delta is a create.
+		// New creates win when both sides hold the same key (raw replays).
 		`
             CREATE TABLE follows AS
             WITH baseline AS (
@@ -117,13 +108,11 @@ func graphSQL(rawRoot string) []string {
                 WHERE t.src_did_id IS NULL
             ),
             new_creates AS (
-                SELECT s.src_did_id, s.rkey, s.dst_did_id, s.src_did, s.dst_did,
-                       s.created_at, s.indexed_at, s.source
-                FROM _follow_state s
-                WHERE s.op = 'create'
+                SELECT src_did_id, rkey, dst_did_id, src_did, dst_did,
+                       created_at, indexed_at, source
+                FROM _follow_state
+                WHERE op = 'create'
             )
-            -- New creates win when both sides hold a row with the same key
-            -- (replays into raw): they carry the freshest indexed_at.
             SELECT src_did_id, rkey, dst_did_id, src_did, dst_did,
                    created_at, indexed_at, source
             FROM (
@@ -138,15 +127,11 @@ func graphSQL(rawRoot string) []string {
         `,
 
 		// blocks mirror follows.
-		fmt.Sprintf(`
-            CREATE TEMP TABLE _raw_blocks AS
-            SELECT * FROM read_parquet('%s', union_by_name=true, filename=true)
-        `, escapeSQLLiteral(blocksGlob)),
+		fmt.Sprintf(`CREATE TEMP TABLE _raw_blocks AS %s`, rawBlocks),
 
 		`
             CREATE TEMP TABLE _block_state AS
-            SELECT *
-            FROM (
+            SELECT * EXCLUDE (rn) FROM (
                 SELECT *, row_number() OVER (PARTITION BY src_did_id, rkey ORDER BY indexed_at DESC) AS rn
                 FROM _raw_blocks
             )
@@ -169,10 +154,10 @@ func graphSQL(rawRoot string) []string {
                 WHERE t.src_did_id IS NULL
             ),
             new_creates AS (
-                SELECT s.src_did_id, s.rkey, s.dst_did_id, s.src_did, s.dst_did,
-                       s.created_at, s.indexed_at, s.source
-                FROM _block_state s
-                WHERE s.op = 'create'
+                SELECT src_did_id, rkey, dst_did_id, src_did, dst_did,
+                       created_at, indexed_at, source
+                FROM _block_state
+                WHERE op = 'create'
             )
             SELECT src_did_id, rkey, dst_did_id, src_did, dst_did,
                    created_at, indexed_at, source
@@ -188,8 +173,6 @@ func graphSQL(rawRoot string) []string {
         `,
 
 		// actor_aggs: per-actor counts derived from the now-current graph.
-		// followers / blocks_in count rows targeting this DID; following /
-		// blocks_out count rows authored by it.
 		`
             CREATE TABLE actor_aggs AS
             WITH followers AS (
@@ -230,72 +213,26 @@ func graphSQL(rawRoot string) []string {
 // The window is anchored on indexed_at: that's the snapshotter's observation
 // time, which is monotonic and tamper-evident. created_at on a record can be
 // set to anything by the publishing client.
-func windowSQL(rawRoot string, windowStart, windowEnd time.Time) []string {
-	postsGlob := rawGlob(rawRoot, "posts")
-	mediaGlob := rawGlob(rawRoot, "post_media")
-	likesGlob := rawGlob(rawRoot, "likes")
-	repostsGlob := rawGlob(rawRoot, "reposts")
+func windowSQL(files rawFiles, windowStart, windowEnd time.Time) []string {
 	startLit := timestampLiteral(windowStart)
 	endLit := timestampLiteral(windowEnd)
 
+	postsSelect := windowedPostsSelect(files.posts, startLit, endLit)
+	mediaSelect := windowedMediaSelect(files.media, startLit, endLit)
+	likesSelect := windowedLikesSelect(files.likes, startLit, endLit)
+	repostsSelect := windowedRepostsSelect(files.reposts, startLit, endLit)
+
 	return []string{
-		// posts: latest observation per uri_id within the window. We do the
-		// dedup with row_number rather than DISTINCT ON for portability with
-		// older DuckDB releases.
-		fmt.Sprintf(`
-            CREATE TABLE posts AS
-            WITH raw AS (
-                SELECT * FROM read_parquet('%s', union_by_name=true, filename=true)
-                WHERE op = 'create'
-                  AND indexed_at > %s AND indexed_at <= %s
-            )
-            SELECT * EXCLUDE (rn) FROM (
-                SELECT *, row_number() OVER (PARTITION BY uri_id ORDER BY indexed_at DESC) AS rn
-                FROM raw
-            )
-            WHERE rn = 1
-        `, escapeSQLLiteral(postsGlob), startLit, endLit),
+		fmt.Sprintf(`CREATE TABLE posts AS %s`, postsSelect),
+		fmt.Sprintf(`CREATE TABLE post_media AS %s`, mediaSelect),
+		fmt.Sprintf(`CREATE TABLE likes AS %s`, likesSelect),
+		fmt.Sprintf(`CREATE TABLE reposts AS %s`, repostsSelect),
 
-		fmt.Sprintf(`
-            CREATE TABLE post_media AS
-            SELECT * FROM read_parquet('%s', union_by_name=true, filename=true)
-            WHERE indexed_at > %s AND indexed_at <= %s
-        `, escapeSQLLiteral(mediaGlob), startLit, endLit),
-
-		fmt.Sprintf(`
-            CREATE TABLE likes AS
-            WITH raw AS (
-                SELECT * FROM read_parquet('%s', union_by_name=true, filename=true)
-                WHERE op = 'create'
-                  AND indexed_at > %s AND indexed_at <= %s
-            )
-            SELECT * EXCLUDE (rn) FROM (
-                SELECT *, row_number() OVER (PARTITION BY actor_did_id, rkey ORDER BY indexed_at DESC) AS rn
-                FROM raw
-            )
-            WHERE rn = 1
-        `, escapeSQLLiteral(likesGlob), startLit, endLit),
-
-		fmt.Sprintf(`
-            CREATE TABLE reposts AS
-            WITH raw AS (
-                SELECT * FROM read_parquet('%s', union_by_name=true, filename=true)
-                WHERE op = 'create'
-                  AND indexed_at > %s AND indexed_at <= %s
-            )
-            SELECT * EXCLUDE (rn) FROM (
-                SELECT *, row_number() OVER (PARTITION BY actor_did_id, rkey ORDER BY indexed_at DESC) AS rn
-                FROM raw
-            )
-            WHERE rn = 1
-        `, escapeSQLLiteral(repostsGlob), startLit, endLit),
-
-		// post_aggs: rebuild engagement counts strictly from in-window rows.
-		// Quotes/replies are derived from posts whose quote_parent / reply
-		// pointers reference the subject post — they are NOT bounded to
-		// posts that themselves fall in the window on the parent side, only
-		// the source side (an old post can accumulate new quotes within the
-		// window).
+		// post_aggs: rebuild engagement counts strictly from in-window rows,
+		// keyed by the posts table so we don't surface aggregates for posts
+		// that aren't themselves in the window. A like on an old post still
+		// counts as a like emitted in-window for actor_aggs purposes, but it
+		// doesn't materialize a phantom row in post_aggs.
 		`
             CREATE TABLE post_aggs AS
             WITH likes_c AS (
@@ -315,31 +252,18 @@ func windowSQL(rawRoot string, windowStart, windowEnd time.Time) []string {
                 SELECT reply_parent_uri_id AS uri_id, count(*) AS replies_count
                 FROM posts WHERE reply_parent_uri_id IS NOT NULL AND reply_parent_uri_id != 0
                 GROUP BY 1
-            ),
-            -- Cover posts that exist in-window even with zero engagement so
-            -- consumer queries that LEFT JOIN posts→post_aggs always hit.
-            keys AS (
-                SELECT uri_id FROM posts
-                UNION
-                SELECT uri_id FROM likes_c
-                UNION
-                SELECT uri_id FROM reposts_c
-                UNION
-                SELECT uri_id FROM quotes_c
-                UNION
-                SELECT uri_id FROM replies_c
             )
             SELECT
-                k.uri_id,
+                p.uri_id,
                 coalesce(l.likes_count, 0)   AS likes_count,
                 coalesce(r.reposts_count, 0) AS reposts_count,
                 coalesce(q.quotes_count, 0)  AS quotes_count,
-                coalesce(p.replies_count, 0) AS replies_count
-            FROM keys k
-            LEFT JOIN likes_c   l USING (uri_id)
-            LEFT JOIN reposts_c r USING (uri_id)
-            LEFT JOIN quotes_c  q USING (uri_id)
-            LEFT JOIN replies_c p USING (uri_id)
+                coalesce(rp.replies_count, 0) AS replies_count
+            FROM posts p
+            LEFT JOIN likes_c    l  USING (uri_id)
+            LEFT JOIN reposts_c  r  USING (uri_id)
+            LEFT JOIN quotes_c   q  USING (uri_id)
+            LEFT JOIN replies_c  rp USING (uri_id)
         `,
 
 		// Extend actor_aggs with `_in_window` columns. We rebuild rather than
@@ -404,16 +328,182 @@ func windowSQL(rawRoot string, windowStart, windowEnd time.Time) []string {
 	}
 }
 
-// timestampLiteral returns a DuckDB literal for a time value. Accepts time.Time
-// or anything that stringifies to RFC3339 (interface kept loose so the SQL
-// generators can be reused with stub clocks if needed later).
-func timestampLiteral(v interface{}) string {
-	switch t := v.(type) {
-	case time.Time:
-		return fmt.Sprintf("TIMESTAMP '%s'", t.UTC().Format("2006-01-02 15:04:05.000000"))
-	case string:
-		return fmt.Sprintf("TIMESTAMP '%s'", t)
-	default:
-		return "TIMESTAMP 'epoch'"
+// timestampLiteral returns a DuckDB literal for a UTC time value.
+func timestampLiteral(t time.Time) string {
+	return fmt.Sprintf("TIMESTAMP '%s'", t.UTC().Format("2006-01-02 15:04:05.000000"))
+}
+
+// rawProfilesSelect returns a SELECT yielding (did_id, did, handle,
+// display_name, description, avatar_cid, banner_cid, created_at, indexed_at,
+// op, source) — either from the actual parquet shards or as an empty stub
+// with the expected column types when no shards exist.
+func rawProfilesSelect(files []string) string {
+	if expr := readParquetExpr(files); expr != "" {
+		return fmt.Sprintf(`SELECT * FROM %s WHERE op = 'create'`, expr)
 	}
+	return `
+        SELECT
+            CAST(NULL AS BIGINT)    AS did_id,
+            CAST(NULL AS VARCHAR)   AS did,
+            CAST(NULL AS VARCHAR)   AS handle,
+            CAST(NULL AS VARCHAR)   AS display_name,
+            CAST(NULL AS VARCHAR)   AS description,
+            CAST(NULL AS VARCHAR)   AS avatar_cid,
+            CAST(NULL AS VARCHAR)   AS banner_cid,
+            CAST(NULL AS TIMESTAMP) AS created_at,
+            CAST(NULL AS TIMESTAMP) AS indexed_at,
+            CAST(NULL AS VARCHAR)   AS op,
+            CAST(NULL AS VARCHAR)   AS source
+        WHERE 1 = 0
+    `
+}
+
+// rawFollowsSelect mirrors rawProfilesSelect for follow records. Stub schema
+// matches model.Follow's parquet columns.
+func rawFollowsSelect(files []string) string {
+	if expr := readParquetExpr(files); expr != "" {
+		return fmt.Sprintf(`SELECT * FROM %s`, expr)
+	}
+	return graphRecordEmptyStub()
+}
+
+// rawBlocksSelect mirrors rawFollowsSelect — block records share the same shape.
+func rawBlocksSelect(files []string) string {
+	if expr := readParquetExpr(files); expr != "" {
+		return fmt.Sprintf(`SELECT * FROM %s`, expr)
+	}
+	return graphRecordEmptyStub()
+}
+
+// graphRecordEmptyStub is the shared empty schema for follows / blocks.
+func graphRecordEmptyStub() string {
+	return `
+        SELECT
+            CAST(NULL AS VARCHAR)   AS src_did,
+            CAST(NULL AS BIGINT)    AS src_did_id,
+            CAST(NULL AS VARCHAR)   AS dst_did,
+            CAST(NULL AS BIGINT)    AS dst_did_id,
+            CAST(NULL AS VARCHAR)   AS rkey,
+            CAST(NULL AS TIMESTAMP) AS created_at,
+            CAST(NULL AS TIMESTAMP) AS indexed_at,
+            CAST(NULL AS VARCHAR)   AS op,
+            CAST(NULL AS VARCHAR)   AS source
+        WHERE 1 = 0
+    `
+}
+
+// windowedPostsSelect renders the in-window post pipeline: filter by op +
+// indexed_at, then keep the latest observation per uri_id.
+func windowedPostsSelect(files []string, startLit, endLit string) string {
+	if expr := readParquetExpr(files); expr != "" {
+		return fmt.Sprintf(`
+            WITH raw AS (
+                SELECT * FROM %s
+                WHERE op = 'create'
+                  AND indexed_at > %s AND indexed_at <= %s
+            )
+            SELECT * EXCLUDE (rn) FROM (
+                SELECT *, row_number() OVER (PARTITION BY uri_id ORDER BY indexed_at DESC) AS rn
+                FROM raw
+            )
+            WHERE rn = 1
+        `, expr, startLit, endLit)
+	}
+	return postsEmptyStub()
+}
+
+func windowedMediaSelect(files []string, startLit, endLit string) string {
+	if expr := readParquetExpr(files); expr != "" {
+		return fmt.Sprintf(`
+            SELECT * FROM %s
+            WHERE indexed_at > %s AND indexed_at <= %s
+        `, expr, startLit, endLit)
+	}
+	return mediaEmptyStub()
+}
+
+func windowedLikesSelect(files []string, startLit, endLit string) string {
+	if expr := readParquetExpr(files); expr != "" {
+		return fmt.Sprintf(`
+            WITH raw AS (
+                SELECT * FROM %s
+                WHERE op = 'create'
+                  AND indexed_at > %s AND indexed_at <= %s
+            )
+            SELECT * EXCLUDE (rn) FROM (
+                SELECT *, row_number() OVER (PARTITION BY actor_did_id, rkey ORDER BY indexed_at DESC) AS rn
+                FROM raw
+            )
+            WHERE rn = 1
+        `, expr, startLit, endLit)
+	}
+	return engagementEmptyStub()
+}
+
+func windowedRepostsSelect(files []string, startLit, endLit string) string {
+	// Reposts share the same shape as likes.
+	return windowedLikesSelect(files, startLit, endLit)
+}
+
+// postsEmptyStub mirrors model.Post's parquet columns.
+func postsEmptyStub() string {
+	return `
+        SELECT
+            CAST(NULL AS VARCHAR)   AS uri,
+            CAST(NULL AS BIGINT)    AS uri_id,
+            CAST(NULL AS VARCHAR)   AS did,
+            CAST(NULL AS BIGINT)    AS did_id,
+            CAST(NULL AS VARCHAR)   AS rkey,
+            CAST(NULL AS VARCHAR)   AS cid,
+            CAST(NULL AS VARCHAR)   AS text,
+            CAST(NULL AS VARCHAR)   AS langs,
+            CAST(NULL AS VARCHAR)   AS labels,
+            CAST(NULL AS VARCHAR)   AS reply_parent_uri,
+            CAST(NULL AS BIGINT)    AS reply_parent_uri_id,
+            CAST(NULL AS VARCHAR)   AS reply_root_uri,
+            CAST(NULL AS BIGINT)    AS reply_root_uri_id,
+            CAST(NULL AS VARCHAR)   AS quote_parent_uri,
+            CAST(NULL AS BIGINT)    AS quote_parent_uri_id,
+            CAST(NULL AS BOOLEAN)   AS has_media,
+            CAST(NULL AS TIMESTAMP) AS created_at,
+            CAST(NULL AS TIMESTAMP) AS indexed_at,
+            CAST(NULL AS VARCHAR)   AS op,
+            CAST(NULL AS VARCHAR)   AS source
+        WHERE 1 = 0
+    `
+}
+
+// mediaEmptyStub mirrors model.PostMedia's parquet columns.
+func mediaEmptyStub() string {
+	return `
+        SELECT
+            CAST(NULL AS VARCHAR)   AS post_uri,
+            CAST(NULL AS BIGINT)    AS post_uri_id,
+            CAST(NULL AS VARCHAR)   AS did,
+            CAST(NULL AS BIGINT)    AS did_id,
+            CAST(NULL AS INTEGER)   AS idx,
+            CAST(NULL AS VARCHAR)   AS media_type,
+            CAST(NULL AS VARCHAR)   AS url,
+            CAST(NULL AS VARCHAR)   AS blob_cid,
+            CAST(NULL AS TIMESTAMP) AS created_at,
+            CAST(NULL AS TIMESTAMP) AS indexed_at
+        WHERE 1 = 0
+    `
+}
+
+// engagementEmptyStub mirrors model.Like / model.Repost (identical shape).
+func engagementEmptyStub() string {
+	return `
+        SELECT
+            CAST(NULL AS VARCHAR)   AS actor_did,
+            CAST(NULL AS BIGINT)    AS actor_did_id,
+            CAST(NULL AS VARCHAR)   AS subject_uri,
+            CAST(NULL AS BIGINT)    AS subject_uri_id,
+            CAST(NULL AS VARCHAR)   AS rkey,
+            CAST(NULL AS TIMESTAMP) AS created_at,
+            CAST(NULL AS TIMESTAMP) AS indexed_at,
+            CAST(NULL AS VARCHAR)   AS op,
+            CAST(NULL AS VARCHAR)   AS source
+        WHERE 1 = 0
+    `
 }
