@@ -12,6 +12,7 @@ require (
 require (
 	github.com/andybalholm/brotli v1.2.0 // indirect
 	github.com/apache/arrow-go/v18 v18.4.1 // indirect
+	github.com/coder/websocket v1.8.14 // indirect
 	github.com/duckdb/duckdb-go-bindings v0.1.21 // indirect
 	github.com/duckdb/duckdb-go-bindings/darwin-amd64 v0.1.21 // indirect
 	github.com/duckdb/duckdb-go-bindings/darwin-arm64 v0.1.21 // indirect

@@ -59,12 +59,17 @@ type Deps struct {
 }
 
 // Run wires production deps from cfg.
-//
-// Note: the production jetstream WebSocket subscriber is not yet implemented
-// in this commit; production callers should use RunWith with their own
-// jetstream.Subscriber. The CLI returns an explicit error today.
 func Run(ctx context.Context, cfg config.Config) error {
-	return errors.New("run: production jetstream subscriber not yet wired; use RunWith from a binary that supplies a Subscriber")
+	obj, err := objstore.FromConfig(cfg)
+	if err != nil {
+		return err
+	}
+	deps := Deps{
+		Subscriber: jetstream.NewWS(cfg.JetstreamEndpoints),
+		ObjStore:   obj,
+		Now:        func() time.Time { return time.Now().UTC() },
+	}
+	return RunWith(ctx, cfg, deps)
 }
 
 // RunWith is the testable entrypoint with all deps injected.
