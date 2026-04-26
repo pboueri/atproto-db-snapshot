@@ -45,6 +45,18 @@ type PostRec struct {
 	QuoteAuthorDID      string
 	QuoteRkey           string
 	EmbedType           string
+
+	// Structured embed detail. Populated alongside EmbedType so a
+	// downstream PostEmbedEvent can be derived without re-parsing.
+	// Spec: 002_post_embeds.md.
+	EmbedKind            string // see 002 §1.1 (e.g. "recordWithMedia:images")
+	EmbedExternalURI     string
+	EmbedExternalDomain  string
+	EmbedExternalTitle   string
+	EmbedImageCount      int
+	EmbedImageWithAlt    int
+	EmbedHasVideo        bool
+	EmbedVideoHasAlt     bool
 }
 
 type LikeRec struct {
@@ -186,23 +198,96 @@ func convertPost(rkey string, v *bsky.FeedPost) PostRec {
 		switch {
 		case v.Embed.EmbedImages != nil:
 			p.EmbedType = "images"
+			p.EmbedKind = "images"
+			fillImages(&p, v.Embed.EmbedImages)
 		case v.Embed.EmbedVideo != nil:
 			p.EmbedType = "video"
+			p.EmbedKind = "video"
+			fillVideo(&p, v.Embed.EmbedVideo)
 		case v.Embed.EmbedExternal != nil:
 			p.EmbedType = "external"
+			p.EmbedKind = "external"
+			fillExternal(&p, v.Embed.EmbedExternal)
 		case v.Embed.EmbedRecord != nil:
 			p.EmbedType = "record"
+			p.EmbedKind = "record"
 			if v.Embed.EmbedRecord.Record != nil {
 				p.QuoteAuthorDID, p.QuoteRkey = splitATURI(v.Embed.EmbedRecord.Record.Uri)
 			}
 		case v.Embed.EmbedRecordWithMedia != nil:
 			p.EmbedType = "recordWithMedia"
-			if v.Embed.EmbedRecordWithMedia.Record != nil && v.Embed.EmbedRecordWithMedia.Record.Record != nil {
-				p.QuoteAuthorDID, p.QuoteRkey = splitATURI(v.Embed.EmbedRecordWithMedia.Record.Record.Uri)
+			p.EmbedKind = "recordWithMedia"
+			rwm := v.Embed.EmbedRecordWithMedia
+			if rwm.Record != nil && rwm.Record.Record != nil {
+				p.QuoteAuthorDID, p.QuoteRkey = splitATURI(rwm.Record.Record.Uri)
+			}
+			if rwm.Media != nil {
+				switch {
+				case rwm.Media.EmbedImages != nil:
+					p.EmbedKind = "recordWithMedia:images"
+					fillImages(&p, rwm.Media.EmbedImages)
+				case rwm.Media.EmbedVideo != nil:
+					p.EmbedKind = "recordWithMedia:video"
+					fillVideo(&p, rwm.Media.EmbedVideo)
+				case rwm.Media.EmbedExternal != nil:
+					p.EmbedKind = "recordWithMedia:external"
+					fillExternal(&p, rwm.Media.EmbedExternal)
+				}
 			}
 		}
 	}
 	return p
+}
+
+func fillImages(p *PostRec, e *bsky.EmbedImages) {
+	if e == nil {
+		return
+	}
+	p.EmbedImageCount = len(e.Images)
+	for _, img := range e.Images {
+		if img != nil && strings.TrimSpace(img.Alt) != "" {
+			p.EmbedImageWithAlt++
+		}
+	}
+}
+
+func fillVideo(p *PostRec, e *bsky.EmbedVideo) {
+	if e == nil {
+		return
+	}
+	p.EmbedHasVideo = true
+	if e.Alt != nil && strings.TrimSpace(*e.Alt) != "" {
+		p.EmbedVideoHasAlt = true
+	}
+}
+
+func fillExternal(p *PostRec, e *bsky.EmbedExternal) {
+	if e == nil || e.External == nil {
+		return
+	}
+	p.EmbedExternalURI = e.External.Uri
+	p.EmbedExternalTitle = e.External.Title
+	p.EmbedExternalDomain = extractHost(e.External.Uri)
+}
+
+// extractHost pulls the host out of a URI. Returns "" if the URI doesn't
+// look like one — by design, no error: parser-level fields are best-effort
+// and downstream NULLs are fine.
+func extractHost(uri string) string {
+	const httpsPrefix = "https://"
+	const httpPrefix = "http://"
+	switch {
+	case strings.HasPrefix(uri, httpsPrefix):
+		uri = uri[len(httpsPrefix):]
+	case strings.HasPrefix(uri, httpPrefix):
+		uri = uri[len(httpPrefix):]
+	default:
+		return ""
+	}
+	if i := strings.IndexAny(uri, "/?#"); i >= 0 {
+		uri = uri[:i]
+	}
+	return uri
 }
 
 // splitATURI takes an at-URI like "at://did:plc:abc/app.bsky.feed.post/3rkey"

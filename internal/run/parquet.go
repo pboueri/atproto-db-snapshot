@@ -17,7 +17,7 @@ import (
 type parquetExportSpec struct {
 	table   string // staging table name
 	parquet string // parquet basename
-	kind    string // "post" | "like" | "repost" | "follow" | "block" | "profile" | "delete"
+	kind    string // "post" | "post_embed" | "like" | "repost" | "follow" | "block" | "profile" | "delete"
 }
 
 // dayManifest is the on-disk shape of `_manifest.json` per §6.
@@ -266,6 +266,8 @@ func selectForKind(kind, day string) (string, string, bool) {
 	switch kind {
 	case "post":
 		return postSelect(dayLit), "s.staging_events_post", true
+	case "post_embed":
+		return postEmbedSelect(dayLit), "s.staging_events_post", true
 	case "like":
 		return likeSelect(dayLit), "s.staging_events_like", true
 	case "repost":
@@ -325,6 +327,88 @@ func postSelect(dayLit string) string {
   WHERE day = '%s' AND operation IN ('create','update')
   ORDER BY did, rkey`,
 		dayLit, atURIExpr("app.bsky.feed.post"), recordTSExpr, dayValueFromLit(dayLit))
+}
+
+// postEmbedSelect projects the per-post embed detail into the
+// post_embeds.parquet schema (002 §1.2). Reads from staging_events_post —
+// no separate staging table — and filters to rows that actually carry
+// an `embed`. `kind` collapses recordWithMedia + inner-media into a
+// single string so analysts get the full shape in one column.
+//
+// `image_with_alt` is approximated by counting matches of `"alt":"<non-empty>"`
+// inside the images array. Alt-text content itself is never read or stored.
+func postEmbedSelect(dayLit string) string {
+	const embedTypeExpr = `json_extract_string(record_json, '$.embed.$type')`
+	const innerTypeExpr = `json_extract_string(record_json, '$.embed.media.$type')`
+	// Coalesced JSON paths so the same expression covers plain embeds and
+	// the inner media of recordWithMedia.
+	const imagesArrExpr = `coalesce(
+        json_extract(record_json, '$.embed.images')::VARCHAR,
+        json_extract(record_json, '$.embed.media.images')::VARCHAR
+    )`
+	const externalURIExpr = `coalesce(
+        json_extract_string(record_json, '$.embed.external.uri'),
+        json_extract_string(record_json, '$.embed.media.external.uri')
+    )`
+	const externalTitleExpr = `coalesce(
+        json_extract_string(record_json, '$.embed.external.title'),
+        json_extract_string(record_json, '$.embed.media.external.title')
+    )`
+	const videoAltExpr = `coalesce(
+        json_extract_string(record_json, '$.embed.alt'),
+        json_extract_string(record_json, '$.embed.media.alt')
+    )`
+	return fmt.Sprintf(`SELECT
+    %s AS date,
+    %s AS uri,
+    did,
+    rkey,
+    make_timestamp(time_us) AS event_ts,
+    CASE
+        WHEN %s = 'app.bsky.embed.images'           THEN 'images'
+        WHEN %s = 'app.bsky.embed.video'            THEN 'video'
+        WHEN %s = 'app.bsky.embed.external'         THEN 'external'
+        WHEN %s = 'app.bsky.embed.record'           THEN 'record'
+        WHEN %s = 'app.bsky.embed.recordWithMedia' THEN
+            'recordWithMedia:' || coalesce(
+                CASE %s
+                    WHEN 'app.bsky.embed.images'   THEN 'images'
+                    WHEN 'app.bsky.embed.video'    THEN 'video'
+                    WHEN 'app.bsky.embed.external' THEN 'external'
+                END, 'unknown')
+        ELSE NULL
+    END AS kind,
+    %s AS external_uri,
+    regexp_extract(%s, '^https?://([^/]+)', 1) AS external_domain,
+    %s AS external_title,
+    CASE
+        WHEN %s IN ('app.bsky.embed.images', 'app.bsky.embed.recordWithMedia')
+        THEN coalesce(json_array_length(%s), 0)::SMALLINT
+        ELSE NULL
+    END AS image_count,
+    CASE
+        WHEN %s IN ('app.bsky.embed.images', 'app.bsky.embed.recordWithMedia')
+        THEN coalesce(len(regexp_extract_all(%s, '"alt":"[^"]+"')), 0)::SMALLINT
+        ELSE NULL
+    END AS image_with_alt,
+    CASE
+        WHEN %s = 'app.bsky.embed.video'
+            OR (%s = 'app.bsky.embed.recordWithMedia' AND %s = 'app.bsky.embed.video')
+        THEN length(coalesce(trim(%s), '')) > 0
+        ELSE NULL
+    END AS video_has_alt
+  FROM {{FROM}}
+  WHERE day = '%s' AND operation IN ('create','update')
+    AND json_extract(record_json, '$.embed') IS NOT NULL
+  ORDER BY did, rkey`,
+		dayLit, atURIExpr("app.bsky.feed.post"),
+		embedTypeExpr, embedTypeExpr, embedTypeExpr, embedTypeExpr, embedTypeExpr,
+		innerTypeExpr,
+		externalURIExpr, externalURIExpr, externalTitleExpr,
+		embedTypeExpr, imagesArrExpr,
+		embedTypeExpr, imagesArrExpr,
+		embedTypeExpr, embedTypeExpr, innerTypeExpr, videoAltExpr,
+		dayValueFromLit(dayLit))
 }
 
 // Likes/reposts/follows/blocks parquets carry an `event_type` column

@@ -187,6 +187,17 @@ func ApplyTakedowns(ctx context.Context, db *sql.DB, t Takedowns, logger *slog.L
 				return fmt.Errorf("takedown post %s: %w", e.URI, err)
 			}
 			n, _ = res.RowsAffected()
+			// Also drop the sidecar — external_uri / title are takedown
+			// targets in their own right, and the row is pure metadata
+			// (no FKs reference it). 002 §4.
+			if _, err := db.ExecContext(ctx, `
+				DELETE FROM post_embeds
+				 WHERE author_id = (SELECT actor_id FROM actors_registry WHERE did = ?)
+				   AND rkey = ?`,
+				did, rkey,
+			); err != nil {
+				return fmt.Errorf("takedown post_embed %s: %w", e.URI, err)
+			}
 
 		case "app.bsky.actor.profile":
 			res, err := db.ExecContext(ctx, `

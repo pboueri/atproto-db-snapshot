@@ -40,6 +40,24 @@ type PostEvent struct {
 	EmbedType      string
 }
 
+// PostEmbedEvent is one row of post_embeds.parquet (002 §1.2). Emitted
+// only for posts that have an embed; posts without an embed produce no
+// row in this file.
+type PostEmbedEvent struct {
+	URI               string
+	DID               string
+	Rkey              string
+	EventTS           time.Time
+	Kind              string // see 002 §1.1 (e.g. "recordWithMedia:images")
+	ExternalURI       string
+	ExternalDomain    string
+	ExternalTitle     string
+	ImageCount        int
+	ImageWithAltCount int
+	HasVideo          bool // distinguishes "no video" from "video, no alt"
+	VideoHasAlt       bool
+}
+
 // LikeEvent is one row of likes.parquet.
 type LikeEvent struct {
 	EventType  string

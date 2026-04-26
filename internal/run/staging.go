@@ -326,6 +326,23 @@ func (s *stagingDB) rowCount(ctx context.Context, table, day string) (int64, err
 	return n, nil
 }
 
+// postEmbedRowCount returns the count of staging_events_post rows for the
+// day that carry a non-null `embed` — i.e. the row count that
+// post_embeds.parquet will materialize. Used by rollover to populate the
+// manifest accurately. Relies on SQLite's built-in json1 extension.
+func (s *stagingDB) postEmbedRowCount(ctx context.Context, day string) (int64, error) {
+	const q = `SELECT count(*) FROM staging_events_post
+		WHERE day = ?
+		  AND operation IN ('create','update')
+		  AND json_extract(record_json, '$.embed') IS NOT NULL`
+	row := s.db.QueryRowContext(ctx, q, day)
+	var n int64
+	if err := row.Scan(&n); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
 // daysWithEvents returns every distinct `day` present across all staging
 // tables. Used by rollover to find sealable days.
 func (s *stagingDB) daysWithEvents(ctx context.Context) ([]string, error) {

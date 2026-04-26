@@ -141,6 +141,18 @@ CREATE TABLE blocks_current (
   created_at TIMESTAMP,
   PRIMARY KEY (src_id, rkey)
 );
+CREATE TABLE post_embeds (
+  author_id BIGINT NOT NULL,
+  rkey VARCHAR NOT NULL,
+  kind VARCHAR NOT NULL,
+  external_uri VARCHAR,
+  external_domain VARCHAR,
+  external_title VARCHAR,
+  image_count SMALLINT,
+  image_with_alt_count SMALLINT,
+  video_has_alt BOOLEAN,
+  PRIMARY KEY (author_id, rkey)
+);
 INSERT INTO actors_registry VALUES
   (1, 'did:plc:alice', now()),
   (2, 'did:plc:bob',   now()),
@@ -154,6 +166,10 @@ INSERT INTO posts (author_id, rkey, cid, text, lang, like_count, repost_count, r
   VALUES
   (1, 'p1', 'bafyP1', 'hello world', 'en', 0, 0, 0),
   (2, 'p2', 'bafyP2', 'hi back',     'en', 0, 0, 0);
+INSERT INTO post_embeds (author_id, rkey, kind, external_uri, external_domain, external_title)
+  VALUES
+  (1, 'p1', 'external', 'https://example.com/x', 'example.com', 'X'),
+  (2, 'p2', 'external', 'https://example.com/y', 'example.com', 'Y');
 INSERT INTO likes_current VALUES (3, 'L1', 1, 'p1', now());
 INSERT INTO follows_current VALUES (3, 2, 'F1', now());
 `
@@ -200,6 +216,26 @@ func TestApplyTakedowns(t *testing.T) {
 	}
 	if text.Valid || cid.Valid || lang.Valid || embed.Valid {
 		t.Fatalf("post fields not nullified: text=%v cid=%v lang=%v embed=%v", text, cid, lang, embed)
+	}
+
+	// post_embeds: sidecar row for the taken-down post is gone; the
+	// untouched post's embed row remains.
+	var nEmbeds int
+	if err := db.QueryRow(
+		`SELECT count(*) FROM post_embeds WHERE author_id = 1 AND rkey = 'p1'`,
+	).Scan(&nEmbeds); err != nil {
+		t.Fatalf("count post_embeds (taken-down): %v", err)
+	}
+	if nEmbeds != 0 {
+		t.Fatalf("expected post_embeds row deleted for taken-down post, got count=%d", nEmbeds)
+	}
+	if err := db.QueryRow(
+		`SELECT count(*) FROM post_embeds WHERE author_id = 2 AND rkey = 'p2'`,
+	).Scan(&nEmbeds); err != nil {
+		t.Fatalf("count post_embeds (untouched): %v", err)
+	}
+	if nEmbeds != 1 {
+		t.Fatalf("expected untouched post_embeds row preserved, got count=%d", nEmbeds)
 	}
 
 	// profile: actors row remains, sensitive fields nulled.

@@ -632,6 +632,64 @@ func applyPosts(ctx context.Context, tx *sql.Tx, dayDir string, filters config.F
 	if _, err := tx.ExecContext(ctx, upsert); err != nil {
 		return fmt.Errorf("upsert posts: %w", err)
 	}
+	if err := applyPostEmbeds(ctx, tx, dayDir); err != nil {
+		return fmt.Errorf("apply post embeds: %w", err)
+	}
+	return nil
+}
+
+// applyPostEmbeds merges post_embeds.parquet into the post_embeds sidecar
+// table (002 §3). Runs inside the same per-day transaction as applyPosts,
+// joining on the `posts` table that was just written so any post the lang
+// filter dropped also drops its sidecar row — no duplicate filter logic.
+//
+// No-op when post_embeds.parquet is absent (older archive day, or a day
+// with no embeds at all).
+func applyPostEmbeds(ctx context.Context, tx *sql.Tx, dayDir string) error {
+	path := parquetGlob(dayDir, "post_embeds.parquet")
+	if path == "" {
+		return nil
+	}
+	src := sqlEscapeSingle(path)
+	upsert := fmt.Sprintf(`
+		WITH src AS (
+		  SELECT
+		    pe.did,
+		    pe.rkey,
+		    pe.kind,
+		    pe.external_uri,
+		    pe.external_domain,
+		    pe.external_title,
+		    pe.image_count,
+		    pe.image_with_alt,
+		    pe.video_has_alt
+		  FROM read_parquet('%s') pe
+		)
+		INSERT INTO post_embeds (
+		  author_id, rkey, kind,
+		  external_uri, external_domain, external_title,
+		  image_count, image_with_alt_count, video_has_alt
+		)
+		SELECT
+		  r.actor_id, src.rkey, src.kind,
+		  src.external_uri, src.external_domain, src.external_title,
+		  src.image_count, src.image_with_alt, src.video_has_alt
+		FROM src
+		JOIN actors_registry r ON r.did = src.did
+		JOIN posts p ON p.author_id = r.actor_id AND p.rkey = src.rkey
+		ON CONFLICT (author_id, rkey) DO UPDATE SET
+		  kind                 = EXCLUDED.kind,
+		  external_uri         = EXCLUDED.external_uri,
+		  external_domain      = EXCLUDED.external_domain,
+		  external_title       = EXCLUDED.external_title,
+		  image_count          = EXCLUDED.image_count,
+		  image_with_alt_count = EXCLUDED.image_with_alt_count,
+		  video_has_alt        = EXCLUDED.video_has_alt`,
+		src,
+	)
+	if _, err := tx.ExecContext(ctx, upsert); err != nil {
+		return fmt.Errorf("upsert post_embeds: %w", err)
+	}
 	return nil
 }
 

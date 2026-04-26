@@ -87,6 +87,7 @@ func (r *rollover) sealDay(ctx context.Context, day string) error {
 	// `staging_events_delete` → `deletions.parquet` per §6.
 	parquetWrites := []parquetExportSpec{
 		{table: "staging_events_post", parquet: "posts.parquet", kind: "post"},
+		{table: "staging_events_post", parquet: "post_embeds.parquet", kind: "post_embed"},
 		{table: "staging_events_like", parquet: "likes.parquet", kind: "like"},
 		{table: "staging_events_repost", parquet: "reposts.parquet", kind: "repost"},
 		{table: "staging_events_follow", parquet: "follows.parquet", kind: "follow"},
@@ -95,16 +96,27 @@ func (r *rollover) sealDay(ctx context.Context, day string) error {
 		{table: "staging_events_delete", parquet: "deletions.parquet", kind: "delete"},
 	}
 
-	// Pre-count rows so the manifest can populate row_counts.
+	// Pre-count rows so the manifest can populate row_counts. Most kinds
+	// can use the bare staging-table count; post_embeds reuses the posts
+	// table but only emits one row per embed-bearing post, so it needs a
+	// JSON-predicated count to avoid double-counting in the manifest.
 	rowCounts := make(map[string]int64, len(parquetWrites))
 	totalRows := int64(0)
 	for _, spec := range parquetWrites {
-		n, err := r.staging.rowCount(ctx, spec.table, day)
+		var (
+			n   int64
+			err error
+		)
+		if spec.kind == "post_embed" {
+			n, err = r.staging.postEmbedRowCount(ctx, day)
+		} else {
+			n, err = r.staging.rowCount(ctx, spec.table, day)
+			totalRows += n // post_embeds rides on staging_events_post; don't double-count
+		}
 		if err != nil {
 			return fmt.Errorf("count %s/%s: %w", spec.table, day, err)
 		}
 		rowCounts[spec.parquet] = n
-		totalRows += n
 	}
 
 	if totalRows == 0 {

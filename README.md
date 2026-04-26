@@ -98,6 +98,7 @@ erDiagram
     posts           ||--o{ likes_current   : 
     posts           ||--o{ reposts_current : 
     posts           ||--o{ posts           :
+    posts           ||--o| post_embeds     :
 ```
 
 Entity detail:
@@ -143,6 +144,18 @@ erDiagram
         VARCHAR   rkey   PK
         BIGINT    dst_id FK
     }
+
+    post_embeds {
+        BIGINT    author_id            PK
+        VARCHAR   rkey                 PK
+        VARCHAR   kind
+        VARCHAR   external_uri
+        VARCHAR   external_domain
+        VARCHAR   external_title
+        SMALLINT  image_count
+        SMALLINT  image_with_alt_count
+        BOOLEAN   video_has_alt
+    }
 ```
 
 `reposts_current` mirrors `likes_current` (`reposter_id` in place of
@@ -151,6 +164,12 @@ from the diagram above for brevity: `actors.{description, avatar_cid,
 created_at, indexed_at, likes_given_count, reposts_received_count,
 blocks_given_count}`, `posts.{cid, reply_root_author_id, reply_root_rkey,
 embed_type}`.
+
+The `post_embeds` sidecar (spec [`002`](specs/002_post_embeds.md)) carries
+one row per post with an embed — keyed `(author_id, rkey)` so it joins
+directly to `posts`. Use it for external-link analytics (`external_domain`
+is pre-computed) or image-accessibility studies (`image_with_alt_count`).
+Posts without an embed have no row.
 
 Key design points:
 

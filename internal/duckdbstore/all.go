@@ -95,6 +95,19 @@ CREATE TABLE IF NOT EXISTS reposts_current (
   PRIMARY KEY (reposter_id, rkey)
 );
 
+CREATE TABLE IF NOT EXISTS post_embeds (
+  author_id            BIGINT NOT NULL,
+  rkey                 VARCHAR NOT NULL,
+  kind                 VARCHAR NOT NULL,
+  external_uri         VARCHAR,
+  external_domain      VARCHAR,
+  external_title       VARCHAR,
+  image_count          SMALLINT,
+  image_with_alt_count SMALLINT,
+  video_has_alt        BOOLEAN,
+  PRIMARY KEY (author_id, rkey)
+);
+
 CREATE TABLE IF NOT EXISTS _meta (
   schema_version   VARCHAR,
   built_at         TIMESTAMP,
