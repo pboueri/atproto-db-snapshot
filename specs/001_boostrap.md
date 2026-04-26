@@ -113,7 +113,25 @@ Additionally to keep the tables memory efficient we will intern the following fi
 - Checkpointed: Since this will be streaming live data and hang-ups may occur or machines may reboot It's important to checkpoint work both in the local file disk as well as remotely when it makes sense to. The job should resume from the most recent checkpoint if available 
 - Simple: The implementation should be simple and use Go strengths with coroutines, channels, and buffers in order to parallelize work as much as possible while keeping the footprint small
 
-### Reference implementations to look at:
+## Additional Notes
+- Update the README.md to be concise with the following
+  - The goal this repo solves
+  - A mental model overview at the beginning
+  - the ERD in mermaid of the result 
+  - The CLI commands 
+
+## Reference implementations to look at:
 - https://docs.bsky.app/blog/introducing-tap
 - https://github.com/blacksky-algorithms/rsky/tree/main/rsky-wintermute
 - https://tangled.org/microcosm.blue/microcosm-rs/blob/main/constellation/readme.md
+
+## Implementation Guidance:
+- Use Agents where there are clear well defined steps to parallelize work and preserve context windows
+- Use Red/Green tests to build up to the end state. Wire and end to end test with mocks to start as well as a skeleton
+- Incrementally commit logical isolated units to create a linear history that's understandable
+- Validate the end result by running a subset of DIDs locally and validating everything generates. The test should be that you can run analytic queries like:
+  - How many people followed or blocked someone else yesterday
+  - What % of total follows were generated yesterday
+  - How many people who posted got 1 like
+  - How many posts got at least one like
+- If the implementation is no good we will wipe eveyrthing and restart with updated guidelines. Try to be as self consistent, logical, DRY, and use Go best practices as much as possible.
