@@ -1,0 +1,39 @@
+object_store:
+  type: r2
+  bucket: my-bsky-snapshot
+  endpoint: https://acct.r2.cloudflarestorage.com
+  public_url_base: https://pub-hash.r2.dev
+
+relay:
+  host: bsky.network
+  listrepos_workers: 150
+  rate_limit_rps: 80
+
+jetstream:
+  endpoints:
+    - wss://jetstream2.us-east.bsky.network/subscribe
+    - wss://jetstream1.us-east.bsky.network/subscribe
+  compress: true
+  rewind_seconds: 10
+
+retention:
+  parquet_days: 90
+
+filters:
+  posts:
+    langs: [en]
+    exclude_no_lang: false
+  exclude_collections: []
+
+paths:
+  data_dir: ./data
+  temp_dir: ./data/tmp
+
+duckdb:
+  memory_limit: 12GB
+  threads: 4
+
+serve:
+  listen: 127.0.0.1:8080
+  refresh_seconds: 5
+  log_tail_lines: 20000
