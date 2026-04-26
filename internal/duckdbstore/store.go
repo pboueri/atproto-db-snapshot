@@ -102,6 +102,12 @@ func Open(path string, memoryLimit string, threads int) (*Store, error) {
 			return nil, fmt.Errorf("set threads: %w", err)
 		}
 	}
+	// Bulk loads (PLC enumeration) churn through millions of rows; disabling
+	// insertion-order preservation keeps DuckDB from buffering them.
+	if _, err := db.Exec("SET preserve_insertion_order = false"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("set preserve_insertion_order: %w", err)
+	}
 	if _, err := db.Exec(schemaSQL); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("apply schema: %w", err)

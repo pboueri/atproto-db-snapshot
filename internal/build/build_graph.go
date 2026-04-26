@@ -48,7 +48,7 @@ func runGraphBackfill(ctx context.Context, cfg config.Config, logger *slog.Logge
 	}
 	outPath := filepath.Join(cfg.DataDir, "current_graph.duckdb")
 
-	store, err := duckdbstore.Open(outPath, "4GB", 4)
+	store, err := duckdbstore.Open(outPath, "8GB", 2)
 	if err != nil {
 		return "", fmt.Errorf("open duckdb: %w", err)
 	}
