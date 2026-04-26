@@ -16,93 +16,94 @@
 //     collection stays simple.
 //   - Source is "bootstrap" or "firehose"; useful for diagnostics and lets the
 //     snapshot job tell baseline records from incremental ones.
+//
+// Parquet tags (`parquet:"name,..."`) define the on-disk column name and the
+// codec. We use zstd everywhere — it pays for itself many times over on text
+// columns and DuckDB reads it natively.
 package model
 
 import "time"
 
-// Op classifies a record as a creation or a tombstone.
-type Op string
-
+// Op values classify a record as a creation or a tombstone. Stored as a
+// plain string so parquet-go writes a vanilla BYTE_ARRAY column.
 const (
-	OpCreate Op = "create"
-	OpDelete Op = "delete"
+	OpCreate = "create"
+	OpDelete = "delete"
 )
 
-// Source records which pipeline produced a record.
-type Source string
-
+// Source values record which pipeline produced a record.
 const (
-	SourceBootstrap Source = "bootstrap"
-	SourceFirehose  Source = "firehose"
+	SourceBootstrap = "bootstrap"
+	SourceFirehose  = "firehose"
 )
 
 // Profile captures app.bsky.actor.profile records.
 type Profile struct {
-	DID         string    `json:"did"`
-	DIDID       int64     `json:"did_id"`
-	Handle      string    `json:"handle,omitempty"`
-	DisplayName string    `json:"display_name,omitempty"`
-	Description string    `json:"description,omitempty"`
-	AvatarCID   string    `json:"avatar_cid,omitempty"`
-	BannerCID   string    `json:"banner_cid,omitempty"`
-	CreatedAt   time.Time `json:"created_at"`
-	IndexedAt   time.Time `json:"indexed_at"`
-	Op          Op        `json:"op"`
-	Source      Source    `json:"source"`
+	DID         string    `json:"did" parquet:"did,zstd"`
+	DIDID       int64     `json:"did_id" parquet:"did_id,zstd"`
+	Handle      string    `json:"handle,omitempty" parquet:"handle,zstd"`
+	DisplayName string    `json:"display_name,omitempty" parquet:"display_name,zstd"`
+	Description string    `json:"description,omitempty" parquet:"description,zstd"`
+	AvatarCID   string    `json:"avatar_cid,omitempty" parquet:"avatar_cid,zstd"`
+	BannerCID   string    `json:"banner_cid,omitempty" parquet:"banner_cid,zstd"`
+	CreatedAt   time.Time `json:"created_at" parquet:"created_at,timestamp(microsecond),zstd"`
+	IndexedAt   time.Time `json:"indexed_at" parquet:"indexed_at,timestamp(microsecond),zstd"`
+	Op          string    `json:"op" parquet:"op,zstd"`
+	Source      string    `json:"source" parquet:"source,zstd"`
 }
 
 // Follow captures app.bsky.graph.follow records.
 type Follow struct {
-	SrcDID    string    `json:"src_did"`
-	SrcDIDID  int64     `json:"src_did_id"`
-	DstDID    string    `json:"dst_did"`
-	DstDIDID  int64     `json:"dst_did_id"`
-	RKey      string    `json:"rkey"`
-	CreatedAt time.Time `json:"created_at"`
-	IndexedAt time.Time `json:"indexed_at"`
-	Op        Op        `json:"op"`
-	Source    Source    `json:"source"`
+	SrcDID    string    `json:"src_did" parquet:"src_did,zstd"`
+	SrcDIDID  int64     `json:"src_did_id" parquet:"src_did_id,zstd"`
+	DstDID    string    `json:"dst_did" parquet:"dst_did,zstd"`
+	DstDIDID  int64     `json:"dst_did_id" parquet:"dst_did_id,zstd"`
+	RKey      string    `json:"rkey" parquet:"rkey,zstd"`
+	CreatedAt time.Time `json:"created_at" parquet:"created_at,timestamp(microsecond),zstd"`
+	IndexedAt time.Time `json:"indexed_at" parquet:"indexed_at,timestamp(microsecond),zstd"`
+	Op        string    `json:"op" parquet:"op,zstd"`
+	Source    string    `json:"source" parquet:"source,zstd"`
 }
 
 // Block captures app.bsky.graph.block records (same shape as Follow).
 type Block struct {
-	SrcDID    string    `json:"src_did"`
-	SrcDIDID  int64     `json:"src_did_id"`
-	DstDID    string    `json:"dst_did"`
-	DstDIDID  int64     `json:"dst_did_id"`
-	RKey      string    `json:"rkey"`
-	CreatedAt time.Time `json:"created_at"`
-	IndexedAt time.Time `json:"indexed_at"`
-	Op        Op        `json:"op"`
-	Source    Source    `json:"source"`
+	SrcDID    string    `json:"src_did" parquet:"src_did,zstd"`
+	SrcDIDID  int64     `json:"src_did_id" parquet:"src_did_id,zstd"`
+	DstDID    string    `json:"dst_did" parquet:"dst_did,zstd"`
+	DstDIDID  int64     `json:"dst_did_id" parquet:"dst_did_id,zstd"`
+	RKey      string    `json:"rkey" parquet:"rkey,zstd"`
+	CreatedAt time.Time `json:"created_at" parquet:"created_at,timestamp(microsecond),zstd"`
+	IndexedAt time.Time `json:"indexed_at" parquet:"indexed_at,timestamp(microsecond),zstd"`
+	Op        string    `json:"op" parquet:"op,zstd"`
+	Source    string    `json:"source" parquet:"source,zstd"`
 }
 
 // Post captures app.bsky.feed.post records.
 //
 // Langs and Labels are stored as comma-joined strings rather than list columns
 // for portability across parquet readers. Snapshot splits them back into
-// arrays when building the final DuckDB tables.
+// arrays via DuckDB's string_split when building the final tables.
 type Post struct {
-	URI             string    `json:"uri"`
-	URIID           int64     `json:"uri_id"`
-	DID             string    `json:"did"`
-	DIDID           int64     `json:"did_id"`
-	RKey            string    `json:"rkey"`
-	CID             string    `json:"cid,omitempty"`
-	Text            string    `json:"text"`
-	Langs           string    `json:"langs"`  // comma-separated
-	Labels          string    `json:"labels"` // comma-separated
-	ReplyParentURI  string    `json:"reply_parent_uri,omitempty"`
-	ReplyParentID   int64     `json:"reply_parent_uri_id,omitempty"`
-	ReplyRootURI    string    `json:"reply_root_uri,omitempty"`
-	ReplyRootURIID  int64     `json:"reply_root_uri_id,omitempty"`
-	QuoteParentURI  string    `json:"quote_parent_uri,omitempty"`
-	QuoteParentID   int64     `json:"quote_parent_uri_id,omitempty"`
-	HasMedia        bool      `json:"has_media"`
-	CreatedAt       time.Time `json:"created_at"`
-	IndexedAt       time.Time `json:"indexed_at"`
-	Op              Op        `json:"op"`
-	Source          Source    `json:"source"`
+	URI            string    `json:"uri" parquet:"uri,zstd"`
+	URIID          int64     `json:"uri_id" parquet:"uri_id,zstd"`
+	DID            string    `json:"did" parquet:"did,zstd"`
+	DIDID          int64     `json:"did_id" parquet:"did_id,zstd"`
+	RKey           string    `json:"rkey" parquet:"rkey,zstd"`
+	CID            string    `json:"cid,omitempty" parquet:"cid,zstd"`
+	Text           string    `json:"text" parquet:"text,zstd"`
+	Langs          string    `json:"langs" parquet:"langs,zstd"`
+	Labels         string    `json:"labels" parquet:"labels,zstd"`
+	ReplyParentURI string    `json:"reply_parent_uri,omitempty" parquet:"reply_parent_uri,zstd"`
+	ReplyParentID  int64     `json:"reply_parent_uri_id,omitempty" parquet:"reply_parent_uri_id,zstd"`
+	ReplyRootURI   string    `json:"reply_root_uri,omitempty" parquet:"reply_root_uri,zstd"`
+	ReplyRootID    int64     `json:"reply_root_uri_id,omitempty" parquet:"reply_root_uri_id,zstd"`
+	QuoteParentURI string    `json:"quote_parent_uri,omitempty" parquet:"quote_parent_uri,zstd"`
+	QuoteParentID  int64     `json:"quote_parent_uri_id,omitempty" parquet:"quote_parent_uri_id,zstd"`
+	HasMedia       bool      `json:"has_media" parquet:"has_media,zstd"`
+	CreatedAt      time.Time `json:"created_at" parquet:"created_at,timestamp(microsecond),zstd"`
+	IndexedAt      time.Time `json:"indexed_at" parquet:"indexed_at,timestamp(microsecond),zstd"`
+	Op             string    `json:"op" parquet:"op,zstd"`
+	Source         string    `json:"source" parquet:"source,zstd"`
 }
 
 // PostMedia captures embed media references derived from post records.
@@ -111,42 +112,42 @@ type Post struct {
 // position survive — enough to count "posts with media" and group by media
 // type without retaining user content beyond the post text itself.
 type PostMedia struct {
-	PostURI    string    `json:"post_uri"`
-	PostURIID  int64     `json:"post_uri_id"`
-	DID        string    `json:"did"`
-	DIDID      int64     `json:"did_id"`
-	Index      int32     `json:"idx"` // position within the embed list
-	MediaType  string    `json:"media_type"` // "image" | "video" | "external" | "record"
-	URL        string    `json:"url,omitempty"`
-	BlobCID    string    `json:"blob_cid,omitempty"`
-	CreatedAt  time.Time `json:"created_at"`
-	IndexedAt  time.Time `json:"indexed_at"`
+	PostURI   string    `json:"post_uri" parquet:"post_uri,zstd"`
+	PostURIID int64     `json:"post_uri_id" parquet:"post_uri_id,zstd"`
+	DID       string    `json:"did" parquet:"did,zstd"`
+	DIDID     int64     `json:"did_id" parquet:"did_id,zstd"`
+	Index     int32     `json:"idx" parquet:"idx,zstd"`
+	MediaType string    `json:"media_type" parquet:"media_type,zstd"`
+	URL       string    `json:"url,omitempty" parquet:"url,zstd"`
+	BlobCID   string    `json:"blob_cid,omitempty" parquet:"blob_cid,zstd"`
+	CreatedAt time.Time `json:"created_at" parquet:"created_at,timestamp(microsecond),zstd"`
+	IndexedAt time.Time `json:"indexed_at" parquet:"indexed_at,timestamp(microsecond),zstd"`
 }
 
 // Like captures app.bsky.feed.like records.
 type Like struct {
-	ActorDID    string    `json:"actor_did"`
-	ActorDIDID  int64     `json:"actor_did_id"`
-	SubjectURI  string    `json:"subject_uri"`
-	SubjectID   int64     `json:"subject_uri_id"`
-	RKey        string    `json:"rkey"`
-	CreatedAt   time.Time `json:"created_at"`
-	IndexedAt   time.Time `json:"indexed_at"`
-	Op          Op        `json:"op"`
-	Source      Source    `json:"source"`
+	ActorDID   string    `json:"actor_did" parquet:"actor_did,zstd"`
+	ActorDIDID int64     `json:"actor_did_id" parquet:"actor_did_id,zstd"`
+	SubjectURI string    `json:"subject_uri" parquet:"subject_uri,zstd"`
+	SubjectID  int64     `json:"subject_uri_id" parquet:"subject_uri_id,zstd"`
+	RKey       string    `json:"rkey" parquet:"rkey,zstd"`
+	CreatedAt  time.Time `json:"created_at" parquet:"created_at,timestamp(microsecond),zstd"`
+	IndexedAt  time.Time `json:"indexed_at" parquet:"indexed_at,timestamp(microsecond),zstd"`
+	Op         string    `json:"op" parquet:"op,zstd"`
+	Source     string    `json:"source" parquet:"source,zstd"`
 }
 
 // Repost captures app.bsky.feed.repost records (same shape as Like).
 type Repost struct {
-	ActorDID    string    `json:"actor_did"`
-	ActorDIDID  int64     `json:"actor_did_id"`
-	SubjectURI  string    `json:"subject_uri"`
-	SubjectID   int64     `json:"subject_uri_id"`
-	RKey        string    `json:"rkey"`
-	CreatedAt   time.Time `json:"created_at"`
-	IndexedAt   time.Time `json:"indexed_at"`
-	Op          Op        `json:"op"`
-	Source      Source    `json:"source"`
+	ActorDID   string    `json:"actor_did" parquet:"actor_did,zstd"`
+	ActorDIDID int64     `json:"actor_did_id" parquet:"actor_did_id,zstd"`
+	SubjectURI string    `json:"subject_uri" parquet:"subject_uri,zstd"`
+	SubjectID  int64     `json:"subject_uri_id" parquet:"subject_uri_id,zstd"`
+	RKey       string    `json:"rkey" parquet:"rkey,zstd"`
+	CreatedAt  time.Time `json:"created_at" parquet:"created_at,timestamp(microsecond),zstd"`
+	IndexedAt  time.Time `json:"indexed_at" parquet:"indexed_at,timestamp(microsecond),zstd"`
+	Op         string    `json:"op" parquet:"op,zstd"`
+	Source     string    `json:"source" parquet:"source,zstd"`
 }
 
 // Collection enumerates the ATProto record collections this snapshotter cares about.
