@@ -25,6 +25,8 @@
 
 set -euo pipefail
 
+source .env
+
 cd "$(dirname "$0")"
 
 # ----- defaults -----
