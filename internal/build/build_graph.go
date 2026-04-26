@@ -98,7 +98,10 @@ func runGraphBackfill(ctx context.Context, cfg config.Config, logger *slog.Logge
 	}
 
 	stats := &backfillStats{}
-	records := make(chan *parse.Records, cfg.PDS.PerHostWorkers*4)
+	// Big buffer so the per-host worker pools don't synchronously block
+	// on the writer when CHECKPOINT is in progress. Writer is the
+	// single-goroutine bottleneck; this is its absorber.
+	records := make(chan *parse.Records, 1024)
 	writeDone := make(chan error, 1)
 	go writerLoop(ctx, writer, store, reg, records, seenRegistry, seenProcessed, stats, logger, writeDone)
 
@@ -814,24 +817,30 @@ func writerLoop(
 	done chan<- error,
 ) {
 	defer close(done)
-	tick := time.NewTicker(30 * time.Second)
-	defer tick.Stop()
-
-	checkpoint := func() {
-		if err := w.FlushAll(); err != nil {
-			logger.Warn("periodic flush failed", "err", err)
-			return
-		}
-		if err := s.Checkpoint(); err != nil {
-			logger.Warn("periodic checkpoint failed", "err", err)
-			return
-		}
-	}
+	// FlushAll is cheap (Appender.Flush() pushes the in-memory column
+	// buffer to the WAL — necessary so seenProcessed survives a crash).
+	flushTick := time.NewTicker(60 * time.Second)
+	defer flushTick.Stop()
+	// CHECKPOINT is expensive (rewrites the on-disk database to merge
+	// the WAL); on a 4 GB DB it can stall the writer for tens of seconds
+	// while upstream worker pools fill. Run it far less often. We still
+	// CHECKPOINT explicitly at end-of-run.
+	ckptTick := time.NewTicker(15 * time.Minute)
+	defer ckptTick.Stop()
 
 	for {
 		select {
-		case <-tick.C:
-			checkpoint()
+		case <-flushTick.C:
+			if err := w.FlushAll(); err != nil {
+				logger.Warn("periodic flush failed", "err", err)
+			}
+		case <-ckptTick.C:
+			t0 := time.Now()
+			if err := s.Checkpoint(); err != nil {
+				logger.Warn("periodic checkpoint failed", "err", err)
+			} else {
+				logger.Info("periodic checkpoint", "took", time.Since(t0).Round(time.Millisecond))
+			}
 		case rec, ok := <-in:
 			if !ok {
 				done <- nil
