@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/url"
 	"path/filepath"
+	"sync"
 	"time"
 
 	comatproto "github.com/bluesky-social/indigo/api/atproto"
@@ -152,8 +153,13 @@ func Run(ctx context.Context, opts Options, logger *slog.Logger) error {
 type consumer struct {
 	opts   Options
 	st     *store
-	cursor *cursorState
 	logger *slog.Logger
+
+	// cursorMu guards every access to *cursor. The read loop writes via
+	// handleLabels; the checkpoint goroutine reads. Without this lock the
+	// race detector flags the cursor.Seq update vs the periodic flush.
+	cursorMu sync.Mutex
+	cursor   *cursorState
 }
 
 func newConsumer(opts Options, st *store, cur *cursorState, logger *slog.Logger) *consumer {
@@ -175,16 +181,30 @@ func (c *consumer) connectAndStream(ctx context.Context, cursorPath string) erro
 	if err != nil {
 		return fmt.Errorf("dial %s: %w", u, err)
 	}
-	c.logger.Info("labeler connected", "endpoint", c.opts.LabelerURL, "cursor", c.cursor.Seq)
+	c.cursorMu.Lock()
+	startSeq := c.cursor.Seq
+	c.cursorMu.Unlock()
+	c.logger.Info("labeler connected", "endpoint", c.opts.LabelerURL, "cursor", startSeq)
 	// Labeler frames fit easily in 32KiB but bump just in case a batch
 	// arrives. The real relay spec puts an upper bound ~1MB.
 	conn.SetReadLimit(1 << 22) // 4 MiB
 	defer conn.Close(websocket.StatusNormalClosure, "shutdown")
 
 	// Periodic checkpoint ticker runs concurrently with the read loop.
+	// We wait for it to finish before returning so the next reconnect
+	// (which creates a new consumer with a fresh mutex on the same
+	// shared *cursorState) does not race with this iteration's flush.
 	ckCtx, ckCancel := context.WithCancel(ctx)
-	defer ckCancel()
-	go c.checkpointLoop(ckCtx, cursorPath)
+	var ckWG sync.WaitGroup
+	ckWG.Add(1)
+	go func() {
+		defer ckWG.Done()
+		c.checkpointLoop(ckCtx, cursorPath)
+	}()
+	defer func() {
+		ckCancel()
+		ckWG.Wait()
+	}()
 
 	for {
 		if err := ctx.Err(); err != nil {
@@ -278,10 +298,12 @@ func (c *consumer) handleLabels(ctx context.Context, evt *comatproto.LabelSubscr
 			return fmt.Errorf("upsert label: %w", err)
 		}
 	}
+	c.cursorMu.Lock()
 	if evt.Seq > c.cursor.Seq {
 		c.cursor.Seq = evt.Seq
 		c.cursor.Endpoint = c.opts.LabelerURL
 	}
+	c.cursorMu.Unlock()
 	return nil
 }
 
@@ -298,8 +320,13 @@ func (c *consumer) checkpointLoop(ctx context.Context, cursorPath string) {
 			c.logger.Warn("labels checkpoint", "why", why, "err", err)
 			return
 		}
-		if c.cursor.Seq > 0 {
-			if err := saveCursorAtomic(cursorPath, *c.cursor); err != nil {
+		// Snapshot the cursor under the lock so we don't read torn fields
+		// while handleLabels is mid-update.
+		c.cursorMu.Lock()
+		snap := *c.cursor
+		c.cursorMu.Unlock()
+		if snap.Seq > 0 {
+			if err := saveCursorAtomic(cursorPath, snap); err != nil {
 				c.logger.Warn("labels cursor save", "err", err)
 			}
 		}
