@@ -397,6 +397,13 @@ func phase1PLCStreaming(
 // submits every unprocessed DID to the dispatcher. This is what makes
 // resume + streaming dispatch start producing work at t=0 instead of
 // waiting for phase 1 to complete.
+//
+// The naive single-goroutine submit serializes pre-seed at the slowest
+// host's drain rate (e.g. bsky.social handles ~50% of DIDs but its
+// per-host worker pool drains at ~16 DIDs/sec, so a serial pre-seed
+// blocks the whole feeder behind that one host). We bucket by host
+// upfront and feed each bucket from its own goroutine so hosts ramp
+// up in parallel.
 func preSeedFromStore(
 	ctx context.Context,
 	store *duckdbstore.Store,
@@ -409,19 +416,49 @@ func preSeedFromStore(
 		return fmt.Errorf("preseed load: %w", err)
 	}
 	logger.Info("pre-seed: loaded existing pds_endpoints", "total", len(endpoints))
-	var n int
+
+	// Bucket by normalized host so we know how to fan out.
+	type didEP struct{ did, ep string }
+	byHost := map[string][]didEP{}
 	for did, ep := range endpoints {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
 		if _, done := processed[did]; done {
 			continue
 		}
-		disp.submit(did, ep)
-		n++
+		host := normalizeHost(ep)
+		if host == "" {
+			continue
+		}
+		byHost[host] = append(byHost[host], didEP{did, ep})
 	}
-	logger.Info("pre-seed: dispatched", "submitted", n)
-	return nil
+
+	var totalQueued int
+	for _, b := range byHost {
+		totalQueued += len(b)
+	}
+	logger.Info("pre-seed: bucketed", "hosts", len(byHost), "dids", totalQueued)
+
+	// One goroutine per host bucket. submit() only blocks on its own
+	// host's channel, so different hosts proceed independently.
+	var wg sync.WaitGroup
+	var submitted int64
+	for _, bucket := range byHost {
+		bucket := bucket
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for _, item := range bucket {
+				if ctx.Err() != nil {
+					return
+				}
+				disp.submit(item.did, item.ep)
+				atomic.AddInt64(&submitted, 1)
+			}
+		}()
+	}
+	wg.Wait()
+
+	logger.Info("pre-seed: dispatched", "submitted", atomic.LoadInt64(&submitted))
+	return ctx.Err()
 }
 
 // ---------- Streaming dispatcher ----------
@@ -512,7 +549,10 @@ func (d *dispatcher) submit(did, endpoint string) {
 			BreakerCooldown:  d.cfg.PDS.BreakerCooldown,
 		})
 		p = &hostPool{
-			in:     make(chan string, d.workers*2),
+			// Generous buffer so phase-1 onBatch (which submits up to
+			// ~50K DIDs at once, ~50% of which can land on bsky.social)
+			// doesn't block the PLC flusher.
+			in:     make(chan string, 4096),
 			client: client,
 		}
 		d.pools[host] = p
