@@ -27,16 +27,38 @@ func New() *Registry {
 
 // GetOrAssign returns the actor_id for did, minting one if absent.
 func (r *Registry) GetOrAssign(did string) int64 {
+	id, _ := r.GetOrAssignFresh(did)
+	return id
+}
+
+// GetOrAssignFresh returns the actor_id for did, minting one if absent.
+// fresh is true if this call minted a new id.
+func (r *Registry) GetOrAssignFresh(did string) (id int64, fresh bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if id, ok := r.byDID[did]; ok {
-		return id
+	if existing, ok := r.byDID[did]; ok {
+		return existing, false
 	}
-	id := r.next
+	id = r.next
 	r.next++
 	r.byDID[did] = id
 	r.FirstSeen[id] = time.Now().UTC()
-	return id
+	return id, true
+}
+
+// Reload seeds the registry from a previously-persisted set of entries.
+// Called on graph-backfill resume so freshly-minted ids continue past the
+// last persisted actor_id. Safe to call only on an empty Registry.
+func (r *Registry) Reload(entries []Entry) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, e := range entries {
+		r.byDID[e.DID] = e.ActorID
+		r.FirstSeen[e.ActorID] = e.FirstSeen
+		if e.ActorID >= r.next {
+			r.next = e.ActorID + 1
+		}
+	}
 }
 
 // Len reports the number of DIDs in the registry.

@@ -22,9 +22,10 @@ type StreamingWriter struct {
 	connector *duckdb.Connector
 	conn      driver.Conn
 
-	follows *duckdb.Appender
-	blocks  *duckdb.Appender
-	actors  *duckdb.Appender
+	follows  *duckdb.Appender
+	blocks   *duckdb.Appender
+	actors   *duckdb.Appender
+	registry *duckdb.Appender
 }
 
 func NewStreamingWriter(dbPath string) (*StreamingWriter, error) {
@@ -53,6 +54,11 @@ func NewStreamingWriter(dbPath string) (*StreamingWriter, error) {
 		w.closeAll()
 		return nil, fmt.Errorf("actors appender: %w", err)
 	}
+	w.registry, err = duckdb.NewAppenderFromConn(conn, "", "actors_registry")
+	if err != nil {
+		w.closeAll()
+		return nil, fmt.Errorf("actors_registry appender: %w", err)
+	}
 	return w, nil
 }
 
@@ -71,14 +77,15 @@ func (w *StreamingWriter) AppendBlock(r BlockRow) error {
 // ActorRow is an actor row to append. Counts start at 0 and are
 // recomputed in a separate pass after all data is loaded.
 type ActorRow struct {
-	ActorID     int64
-	DID         string
-	Handle      string
-	DisplayName string
-	Description string
-	AvatarCID   string
-	CreatedAt   any // time.Time or nil
-	IndexedAt   any
+	ActorID       int64
+	DID           string
+	Handle        string
+	DisplayName   string
+	Description   string
+	AvatarCID     string
+	CreatedAt     any // time.Time or nil
+	IndexedAt     any
+	RepoProcessed bool // true if the actor row originates from a successful CAR crawl
 }
 
 func (w *StreamingWriter) AppendActor(r ActorRow) error {
@@ -91,12 +98,19 @@ func (w *StreamingWriter) AppendActor(r ActorRow) error {
 		r.CreatedAt,
 		r.IndexedAt,
 		int64(0), int64(0), int64(0), int64(0), int64(0), int64(0), int64(0),
+		r.RepoProcessed,
 	)
+}
+
+// AppendRegistryEntry persists the DID → actor_id assignment so the
+// mapping survives crashes and can be reloaded on resume.
+func (w *StreamingWriter) AppendRegistryEntry(actorID int64, did string, firstSeen any) error {
+	return w.registry.AppendRow(actorID, did, firstSeen)
 }
 
 // FlushAll pushes accumulated rows to DuckDB.
 func (w *StreamingWriter) FlushAll() error {
-	for _, a := range []*duckdb.Appender{w.follows, w.blocks, w.actors} {
+	for _, a := range []*duckdb.Appender{w.follows, w.blocks, w.actors, w.registry} {
 		if a != nil {
 			if err := a.Flush(); err != nil {
 				return err
@@ -120,6 +134,7 @@ func (w *StreamingWriter) Close() error {
 	closeOne(w.follows)
 	closeOne(w.blocks)
 	closeOne(w.actors)
+	closeOne(w.registry)
 	if w.conn != nil {
 		w.conn.Close()
 	}
@@ -138,6 +153,9 @@ func (w *StreamingWriter) closeAll() {
 	}
 	if w.actors != nil {
 		w.actors.Close()
+	}
+	if w.registry != nil {
+		w.registry.Close()
 	}
 	if w.conn != nil {
 		w.conn.Close()

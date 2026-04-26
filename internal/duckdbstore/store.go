@@ -6,12 +6,19 @@ import (
 	"time"
 
 	_ "github.com/marcboeker/go-duckdb/v2"
+
+	"github.com/pboueri/atproto-db-snapshot/internal/registry"
 )
 
 // Schemas for current_graph.duckdb per spec §5: actors + edge graph
 // (follows, blocks) only. Posts / likes / reposts live in
 // current_all.duckdb, which is assembled separately from the parquet
 // archive by the incremental `build` path — NOT emitted by CAR backfill.
+//
+// actors_registry is the resume-safe DID → actor_id map: it's written
+// incrementally during backfill so a crashed run can resume with stable
+// ids. actors.repo_processed marks DIDs whose repos have been crawled
+// to completion — resume re-pulls only the unmarked ones.
 const schemaSQL = `
 CREATE TABLE IF NOT EXISTS actors (
   actor_id   BIGINT PRIMARY KEY,
@@ -28,7 +35,14 @@ CREATE TABLE IF NOT EXISTS actors (
   likes_given_count    BIGINT,
   likes_received_count BIGINT,
   reposts_received_count BIGINT,
-  blocks_given_count   BIGINT
+  blocks_given_count   BIGINT,
+  repo_processed       BOOLEAN
+);
+
+CREATE TABLE IF NOT EXISTS actors_registry (
+  actor_id   BIGINT PRIMARY KEY,
+  did        VARCHAR NOT NULL UNIQUE,
+  first_seen TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS follows_current (
@@ -86,7 +100,93 @@ func Open(path string, memoryLimit string, threads int) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("apply schema: %w", err)
 	}
+	// Defensive migration for graph DBs created before resume support
+	// landed. CREATE TABLE IF NOT EXISTS is a no-op on existing tables,
+	// so the new column needs an explicit ALTER.
+	if _, err := db.Exec(`ALTER TABLE actors ADD COLUMN IF NOT EXISTS repo_processed BOOLEAN`); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate actors.repo_processed: %w", err)
+	}
 	return &Store{DB: db, path: path}, nil
+}
+
+// LoadRegistry returns every (actor_id, did, first_seen) row from
+// actors_registry. Used on resume to rehydrate the in-memory Registry so
+// freshly-minted actor_ids continue past the persisted max.
+func (s *Store) LoadRegistry() ([]registry.Entry, error) {
+	rows, err := s.DB.Query(`SELECT actor_id, did, first_seen FROM actors_registry ORDER BY actor_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []registry.Entry
+	for rows.Next() {
+		var e registry.Entry
+		var fs sql.NullTime
+		if err := rows.Scan(&e.ActorID, &e.DID, &fs); err != nil {
+			return nil, err
+		}
+		if fs.Valid {
+			e.FirstSeen = fs.Time
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+// LoadProcessedDIDs returns the DIDs whose repos have been crawled in a
+// previous run (rows in actors with repo_processed = TRUE). On resume
+// these are skipped from the listRepos enumeration.
+func (s *Store) LoadProcessedDIDs() (map[string]struct{}, error) {
+	rows, err := s.DB.Query(`SELECT did FROM actors WHERE repo_processed = TRUE`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make(map[string]struct{})
+	for rows.Next() {
+		var did string
+		if err := rows.Scan(&did); err != nil {
+			return nil, err
+		}
+		out[did] = struct{}{}
+	}
+	return out, rows.Err()
+}
+
+// MaterializeTargetOnlyActors fills the actors table with rows for every
+// actor_id in actors_registry that isn't already an actor row. Called
+// once at end-of-run after all processed-author rows have been written.
+// Idempotent: re-running after a crash overwrites prior target-only
+// rows by deleting them first.
+func (s *Store) MaterializeTargetOnlyActors(now time.Time) error {
+	if _, err := s.DB.Exec(
+		`DELETE FROM actors WHERE repo_processed IS NOT TRUE`,
+	); err != nil {
+		return fmt.Errorf("clear target-only: %w", err)
+	}
+	_, err := s.DB.Exec(`
+		INSERT INTO actors (actor_id, did, indexed_at, repo_processed)
+		SELECT r.actor_id, r.did, ?, FALSE
+		  FROM actors_registry r
+		 WHERE r.actor_id NOT IN (SELECT actor_id FROM actors)
+	`, now)
+	if err != nil {
+		return fmt.Errorf("materialize target-only: %w", err)
+	}
+	return nil
+}
+
+// IsComplete reports whether a successful build_graph.Run has previously
+// finalized this DB. The presence of any _meta row is the signal — the
+// streaming writer never inserts there, only the post-finalize step.
+func (s *Store) IsComplete() (bool, error) {
+	var n int64
+	row := s.DB.QueryRow(`SELECT count(*) FROM _meta`)
+	if err := row.Scan(&n); err != nil {
+		return false, err
+	}
+	return n > 0, nil
 }
 
 func (s *Store) Close() error { return s.DB.Close() }
