@@ -41,6 +41,9 @@ fn render_sql(raw_dir: &Path, memory_limit: &str) -> Result<String> {
     let raw = raw_dir
         .canonicalize()
         .with_context(|| format!("canonicalize {}", raw_dir.display()))?;
+    let tmp = raw.join("duckdb_tmp");
+    std::fs::create_dir_all(&tmp)
+        .with_context(|| format!("create duckdb tmp {}", tmp.display()))?;
     let raw = raw.to_string_lossy().to_string();
 
     let mut sql = String::new();
