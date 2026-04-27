@@ -1,7 +1,7 @@
 // Package objstore is the storage abstraction shared by the bootstrap, run,
 // and snapshot subcommands.
 //
-// Two backends ship in this package:
+// Three backends ship in this package:
 //
 //   - local: a directory-rooted backend used as the default for tests and
 //     single-host operation. Its URL() returns absolute file paths so DuckDB
@@ -11,9 +11,10 @@
 //     hermetic isolation. URL() returns a magic mem:// URL that no external
 //     tool can read; consumers that need DuckDB integration should use local.
 //
-// An s3 backend backs the production R2 deployment and is wired up in a
-// follow-up commit; the interface is fixed here so callers can be written
-// against it today.
+//   - s3: an S3-compatible backend that backs the production R2 deployment.
+//     URL() returns paths inside a per-instance local cache directory; the
+//     snapshot package calls Cache(prefix) before resolving paths to populate
+//     the cache. See s3.go for the rationale.
 package objstore
 
 import (

@@ -5,9 +5,12 @@ import (
 	"context"
 	"errors"
 	"io"
+	"os"
 	"sort"
 	"strings"
 	"testing"
+
+	"github.com/pboueri/atproto-db-snapshot/internal/config"
 )
 
 // TestStoreConformance runs the same suite against every backend.
@@ -25,6 +28,28 @@ func TestStoreConformance(t *testing.T) {
 			return s
 		}},
 		{"memory", func(t *testing.T) Store { return NewMemory() }},
+		{"s3", func(t *testing.T) Store {
+			if os.Getenv("AT_SNAPSHOT_S3_TEST") != "1" {
+				t.Skip("AT_SNAPSHOT_S3_TEST not set; skipping live S3 conformance")
+			}
+			cfg := config.Config{
+				DataDir:           t.TempDir(),
+				ObjectStore:       "s3",
+				ObjectStoreRoot:   os.Getenv("AT_SNAPSHOT_OBJECT_STORE_ROOT"),
+				S3Endpoint:        os.Getenv("AT_SNAPSHOT_S3_ENDPOINT"),
+				S3Region:          envOrDefault("AT_SNAPSHOT_S3_REGION", "auto"),
+				S3AccessKeyID:     os.Getenv("AT_SNAPSHOT_S3_ACCESS_KEY_ID"),
+				S3SecretAccessKey: os.Getenv("AT_SNAPSHOT_S3_SECRET_ACCESS_KEY"),
+			}
+			if cfg.ObjectStoreRoot == "" {
+				t.Skip("AT_SNAPSHOT_OBJECT_STORE_ROOT (bucket) required")
+			}
+			s, err := NewS3(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return s
+		}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

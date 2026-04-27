@@ -7,10 +7,6 @@ import (
 )
 
 // FromConfig constructs the Store backend named by cfg.ObjectStore.
-//
-// The s3 backend is intentionally not yet wired up here — the production
-// deployment commit lands it without churning every caller. For now s3
-// returns an error and tests use local or memory.
 func FromConfig(cfg config.Config) (Store, error) {
 	switch cfg.ObjectStore {
 	case "local":
@@ -18,7 +14,7 @@ func FromConfig(cfg config.Config) (Store, error) {
 	case "memory":
 		return NewMemory(), nil
 	case "s3":
-		return nil, fmt.Errorf("objstore: s3 backend not yet implemented; use local for now")
+		return NewS3(cfg)
 	default:
 		return nil, fmt.Errorf("objstore: unsupported backend %q", cfg.ObjectStore)
 	}
