@@ -39,8 +39,23 @@ at-snapshot build [flags]
 | `--skip-stage` | — | Reuse existing `./var/raw/<date>/*.parquet`. |
 | `--skip-hydrate` | — | Stop after staging. |
 
-Hydrate shells out to the system `duckdb` CLI (install via
-`brew install duckdb`). All other heavy lifting is pure Rust.
+## System dependencies
+
+| Tool | Purpose | Install |
+|---|---|---|
+| `duckdb` CLI | Hydrate stage shells out for SQL execution and aggregations. | `brew install duckdb` |
+| RocksDB | Vendored via `librocksdb-sys` (currently pinned to rocksdb 8.10). Built once on first `cargo build` and cached. | none — bundled |
+
+Notes on RocksDB: the `rocksdb` Rust crate's latest `librocksdb-sys`
+(0.17.x) targets rocksdb 10.4.2, while Homebrew now ships rocksdb 11
+which is C-API-incompatible. Until either side catches up we keep the
+vendored 8.10 build — it compiles once (~2 min) and Cargo reuses the
+artifact for every subsequent build. If you have a matching `librocksdb`
+on disk you can switch by setting `ROCKSDB_LIB_DIR` /
+`ROCKSDB_INCLUDE_DIR` in `.cargo/config.toml` and bumping the crate
+version to one whose `librocksdb-sys` matches your rocksdb major.
+
+Everything else is pure Rust.
 
 ## Output layout
 
