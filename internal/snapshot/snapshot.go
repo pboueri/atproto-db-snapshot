@@ -22,8 +22,12 @@
 //   - The job reads only from object storage. There is no expectation of any
 //     local file from a prior bootstrap or run. For the local backend
 //     objstore.URL returns an absolute filesystem path, which we hand directly
-//     to DuckDB's ATTACH and read_parquet so we never re-stage parquet files
-//     on disk. An s3 backend would need a download-to-temp helper here.
+//     to DuckDB's ATTACH and read_parquet. Backends that don't expose direct
+//     filesystem access (s3) implement an optional Cache(ctx, prefix) method
+//     that pre-downloads keys under a prefix into a local cache directory;
+//     URL() then resolves to a path inside that directory. We probe the
+//     backend with a type assertion so the snapshot doesn't have to know
+//     which concrete store it's dealing with.
 //
 //   - DuckDB does the heavy lifting: a sequence of CREATE TABLE AS SELECT
 //     statements pulls from the ATTACHed bootstrap database and read_parquet
@@ -87,6 +91,10 @@ func RunWith(ctx context.Context, cfg config.Config, deps Deps) error {
 	windowEnd := now
 	windowStart := now.AddDate(0, 0, -cfg.LookbackDays)
 
+	if err := primeCache(ctx, deps.ObjStore, "bootstrap/", "raw/"); err != nil {
+		return fmt.Errorf("snapshot: prime cache: %w", err)
+	}
+
 	bootstrapDate, bootstrapPath, err := resolveBootstrap(ctx, deps.ObjStore)
 	if err != nil {
 		return err
@@ -142,6 +150,29 @@ func RunWith(ctx context.Context, cfg config.Config, deps Deps) error {
 		"window_end", windowEnd,
 		"counts", meta.RowCounts,
 	)
+	return nil
+}
+
+// cacher is satisfied by object stores that need a local cache populated
+// before URL() returns useful paths (s3 today). Local and Memory don't
+// implement it; the type assertion in primeCache short-circuits to a no-op.
+type cacher interface {
+	Cache(ctx context.Context, prefix string) error
+}
+
+// primeCache asks the backend, when it supports it, to pre-download every
+// key under each prefix so subsequent URL() calls land on local files. For
+// backends that do not implement cacher this is a no-op.
+func primeCache(ctx context.Context, obj objstore.Store, prefixes ...string) error {
+	c, ok := obj.(cacher)
+	if !ok {
+		return nil
+	}
+	for _, p := range prefixes {
+		if err := c.Cache(ctx, p); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
