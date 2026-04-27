@@ -61,10 +61,16 @@ type HTTPClient struct {
 	// MinBackoff and MaxBackoff bracket the exponential schedule. Retry-After
 	// from the server overrides the schedule when present.
 	MinBackoff, MaxBackoff time.Duration
+	// Limiter, if set, gates every request through a per-host token bucket
+	// so the worker pool collectively stays under the PDS rate limit. nil =
+	// unlimited (only safe in tests or against trusted private hosts).
+	Limiter *HostLimiter
 }
 
-// NewHTTP returns a production HTTPClient with a sensible 30s timeout and
-// retry policy tuned for shared-host rate limits (bsky.social).
+// NewHTTP returns a production HTTPClient with a sensible 30s timeout, retry
+// policy, and per-host rate limiting tuned for shared PDSes (bsky.social
+// publishes ~10 RPS as the per-IP global; we default to 5 RPS sustained
+// with a small burst so concurrent collections per DID can clear quickly).
 func NewHTTP() *HTTPClient {
 	return &HTTPClient{
 		HTTP:       &http.Client{Timeout: 30 * time.Second},
@@ -72,6 +78,7 @@ func NewHTTP() *HTTPClient {
 		MaxRetries: 5,
 		MinBackoff: 1 * time.Second,
 		MaxBackoff: 30 * time.Second,
+		Limiter:    NewHostLimiter(5, 5),
 	}
 }
 
@@ -188,6 +195,12 @@ func (c *HTTPClient) do(ctx context.Context, u *url.URL) (*http.Response, error)
 
 	backoff := min
 	for attempt := 0; ; attempt++ {
+		// Acquire a token from the per-host bucket before issuing the request.
+		// On a fresh worker this is essentially free; under contention with
+		// other workers it serializes them at the configured RPS.
+		if err := c.Limiter.Wait(ctx, u.Host); err != nil {
+			return nil, err
+		}
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 		if err != nil {
 			return nil, err
@@ -201,6 +214,11 @@ func (c *HTTPClient) do(ctx context.Context, u *url.URL) (*http.Response, error)
 			(resp.StatusCode >= 500 && resp.StatusCode < 600)
 		if !retryable || attempt >= maxRetries {
 			return resp, nil
+		}
+		// On 429 specifically, tell the limiter so the next call from any
+		// worker also slows down — not just the one that got rate-limited.
+		if resp.StatusCode == http.StatusTooManyRequests {
+			c.Limiter.Penalize(u.Host)
 		}
 
 		// Drain and close so the connection can be reused.

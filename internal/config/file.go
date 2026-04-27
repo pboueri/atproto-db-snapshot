@@ -49,10 +49,12 @@ type fileConfig struct {
 	JetstreamEndpoints []string `yaml:"jetstream_endpoints"`
 
 	// Concurrency / timing.
-	Concurrency   int           `yaml:"concurrency"`
-	StatsInterval time.Duration `yaml:"stats_interval"`
-	MaxDIDs       int           `yaml:"max_dids"`
-	RunDuration   time.Duration `yaml:"run_duration"`
+	Concurrency    int           `yaml:"concurrency"`
+	StatsInterval  time.Duration `yaml:"stats_interval"`
+	MaxDIDs        int           `yaml:"max_dids"`
+	RunDuration    time.Duration `yaml:"run_duration"`
+	PDSRateLimit   float64       `yaml:"pds_rate_limit"`
+	PDSBurst       int           `yaml:"pds_burst"`
 
 	// Monitor.
 	MonitorAddr string `yaml:"monitor_addr"`
@@ -100,6 +102,8 @@ func (c *fileConfig) UnmarshalYAML(node *yaml.Node) error {
 		"jetstream_endpoints": &c.JetstreamEndpoints,
 		"concurrency":         &c.Concurrency,
 		"max_dids":            &c.MaxDIDs,
+		"pds_rate_limit":      &c.PDSRateLimit,
+		"pds_burst":           &c.PDSBurst,
 		"monitor_addr":        &c.MonitorAddr,
 		"log_level":           &c.LogLevel,
 	}

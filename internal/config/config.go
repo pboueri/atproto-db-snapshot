@@ -68,6 +68,16 @@ type Config struct {
 	// jetstream without leaving a long-running process behind.
 	RunDuration time.Duration
 
+	// PDSRateLimit is the sustained per-host requests-per-second budget
+	// the bootstrap fan-out divides among its workers. The default of 5
+	// stays well under bsky.social's published ~10 RPS per-IP global so
+	// short bursts plus retries don't trip the cap.
+	PDSRateLimit float64
+	// PDSBurst is the maximum number of tokens the per-host bucket can
+	// accumulate, governing how many concurrent in-flight requests can
+	// clear before throttling kicks in.
+	PDSBurst int
+
 	// MonitorAddr is the listen address for `at-snapshot monitor`.
 	MonitorAddr string
 
@@ -155,6 +165,10 @@ func ParseFlags(sub string, args []string) (Config, error) {
 
 	fs.IntVar(&cfg.Concurrency, "concurrency", layeredInt(fc.Concurrency, "AT_SNAPSHOT_CONCURRENCY", 16),
 		"Parallel worker count for fan-out fetches")
+	pdsRateStr := fs.String("pds-rate-limit", layered(formatFloat(fc.PDSRateLimit), "AT_SNAPSHOT_PDS_RATE_LIMIT", "5"),
+		"Per-PDS sustained requests-per-second across all workers")
+	fs.IntVar(&cfg.PDSBurst, "pds-burst", layeredInt(fc.PDSBurst, "AT_SNAPSHOT_PDS_BURST", 5),
+		"Per-PDS burst capacity (max in-flight before throttling)")
 	fs.IntVar(&cfg.MaxDIDs, "max-dids", layeredInt(fc.MaxDIDs, "AT_SNAPSHOT_MAX_DIDS", 0),
 		"Bootstrap: cap the number of DIDs consumed from PLC (0 = no cap)")
 	fs.DurationVar(&cfg.RunDuration, "run-duration", layeredDuration(fc.RunDuration, "AT_SNAPSHOT_RUN_DURATION", 0),
@@ -177,10 +191,21 @@ func ParseFlags(sub string, args []string) (Config, error) {
 	cfg.IncludeLabels = splitCSV(*includeLabelsCSV)
 	cfg.ExcludeLabels = splitCSV(*excludeLabelsCSV)
 
+	if v, err := strconv.ParseFloat(*pdsRateStr, 64); err == nil {
+		cfg.PDSRateLimit = v
+	}
+
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
 	}
 	return cfg, nil
+}
+
+func formatFloat(f float64) string {
+	if f == 0 {
+		return ""
+	}
+	return strconv.FormatFloat(f, 'f', -1, 64)
 }
 
 // configPath finds the -config value across args, env, and the implicit

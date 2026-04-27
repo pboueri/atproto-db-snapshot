@@ -62,9 +62,11 @@ func Run(ctx context.Context, cfg config.Config) error {
 	if err != nil {
 		return err
 	}
+	repoClient := repo.NewHTTP()
+	repoClient.Limiter = repo.NewHostLimiter(cfg.PDSRateLimit, cfg.PDSBurst)
 	deps := Deps{
 		PLC:      plc.NewHTTP(cfg.PLCEndpoint),
-		Repo:     repo.NewHTTP(),
+		Repo:     repoClient,
 		ObjStore: obj,
 		Now:      func() time.Time { return time.Now().UTC() },
 	}
