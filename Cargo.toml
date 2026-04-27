@@ -30,6 +30,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 sysinfo = "0.32"
 url = "2"
 hex = "0.4"
+lru = "0.12"
 
 [profile.release]
 opt-level = 3
