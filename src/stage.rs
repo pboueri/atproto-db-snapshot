@@ -480,7 +480,7 @@ fn resolve_did_to_id(
     cf: &rocksdb::ColumnFamily,
     did_str: &str,
 ) -> Result<Option<u64>> {
-    let key = bincode::Options::serialize(&rs::bincode_opts(), &Did(did_str.to_string()))
+    let key = bincode::Options::serialize(rs::bincode_opts(), &Did(did_str.to_string()))
         .context("encode did key")?;
     let raw = db.get_cf(cf, key).context("get_cf did_ids forward")?;
     let Some(raw) = raw else { return Ok(None) };
