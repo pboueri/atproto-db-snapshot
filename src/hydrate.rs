@@ -76,29 +76,21 @@ fn render_sql(raw_dir: &Path, memory_limit: &str) -> Result<String> {
     sql.push_str(
         r#"
 CREATE TABLE posts AS
-WITH unioned AS (
-  SELECT
-    uri, author_did_id, rkey, created_at,
-    reply_root_uri, reply_parent_uri, quote_uri,
-    'record' AS source
-  FROM posts_from_records
-  UNION ALL
-  SELECT
-    t.uri,
-    a.did_id AS author_did_id,
-    t.rkey, t.created_at,
-    NULL AS reply_root_uri, NULL AS reply_parent_uri, NULL AS quote_uri,
-    'target_only' AS source
-  FROM posts_from_targets t
-  LEFT JOIN actors a ON a.did = t.author_did
-), ranked AS (
-  SELECT *, ROW_NUMBER() OVER (
-    PARTITION BY uri ORDER BY (source = 'record') DESC
-  ) AS rn FROM unioned
-)
-SELECT uri, author_did_id, rkey, created_at,
-       reply_root_uri, reply_parent_uri, quote_uri, source
-FROM ranked WHERE rn = 1;
+SELECT
+  uri, author_did_id, rkey, created_at,
+  reply_root_uri, reply_parent_uri, quote_uri,
+  'record' AS source
+FROM posts_from_records
+UNION ALL
+SELECT
+  t.uri,
+  a.did_id AS author_did_id,
+  t.rkey, t.created_at,
+  NULL AS reply_root_uri, NULL AS reply_parent_uri, NULL AS quote_uri,
+  'target_only' AS source
+FROM posts_from_targets t
+LEFT JOIN actors a ON a.did = t.author_did
+WHERE NOT EXISTS (SELECT 1 FROM posts_from_records r WHERE r.uri = t.uri);
 
 CREATE TABLE actor_aggs AS
 SELECT
