@@ -41,19 +41,47 @@ at-snapshot build [flags]
 
 ## System dependencies
 
-| Tool | Purpose | Install |
+| Tool | Purpose | How it links |
 |---|---|---|
-| `duckdb` CLI | Hydrate stage shells out for SQL execution and aggregations. | `brew install duckdb` |
-| RocksDB | Vendored via `librocksdb-sys` (currently pinned to rocksdb 8.10). Built once on first `cargo build` and cached. | none — bundled |
+| `libduckdb` 1.5.x | Hydrate stage uses the `duckdb` Rust crate, dynamically linked. | system shared library (`libduckdb.dylib`) |
+| RocksDB | Stage stage opens the constellation mirror read-only via the `rocksdb` crate. | vendored (`librocksdb-sys` 0.16+8.10) |
 
-Notes on RocksDB: the `rocksdb` Rust crate's latest `librocksdb-sys`
-(0.17.x) targets rocksdb 10.4.2, while Homebrew now ships rocksdb 11
-which is C-API-incompatible. Until either side catches up we keep the
-vendored 8.10 build — it compiles once (~2 min) and Cargo reuses the
-artifact for every subsequent build. If you have a matching `librocksdb`
-on disk you can switch by setting `ROCKSDB_LIB_DIR` /
-`ROCKSDB_INCLUDE_DIR` in `.cargo/config.toml` and bumping the crate
-version to one whose `librocksdb-sys` matches your rocksdb major.
+### libduckdb (system, dynamic link)
+
+Homebrew's `duckdb` formula ships only the CLI binary. Grab the official
+release zip with the headers and shared library:
+
+```sh
+mkdir -p ~/.local/duckdb-1.5.2/lib ~/.local/duckdb-1.5.2/include
+cd /tmp
+curl -L -o libduckdb.zip https://github.com/duckdb/duckdb/releases/download/v1.5.2/libduckdb-osx-universal.zip
+unzip -q libduckdb.zip
+cp libduckdb.dylib ~/.local/duckdb-1.5.2/lib/
+cp duckdb.h duckdb.hpp ~/.local/duckdb-1.5.2/include/
+```
+
+Then point Cargo at it via `.cargo/config.toml`:
+
+```toml
+[env]
+DUCKDB_LIB_DIR     = "/Users/<you>/.local/duckdb-1.5.2/lib"
+DUCKDB_INCLUDE_DIR = "/Users/<you>/.local/duckdb-1.5.2/include"
+LIBCLANG_PATH      = "/Library/Developer/CommandLineTools/usr/lib"
+```
+
+When you run the resulting binary you may need
+`DYLD_LIBRARY_PATH=$HOME/.local/duckdb-1.5.2/lib` so the loader can find
+the dylib at runtime. No long C++ amalgamation compile.
+
+### RocksDB (bundled)
+
+The latest `librocksdb-sys` (0.17.x) targets rocksdb 10.4.2 while
+Homebrew ships 11, whose C API is incompatible. We pin
+`rocksdb = "0.22"` / `librocksdb-sys 0.16+8.10` and let it build from
+source. Cargo caches the resulting library so it compiles **once**
+(~2 min), then incremental builds are seconds. If you want to switch to
+a system rocksdb, set `ROCKSDB_LIB_DIR` / `ROCKSDB_INCLUDE_DIR` and
+bump the crate to a matching major.
 
 Everything else is pure Rust.
 

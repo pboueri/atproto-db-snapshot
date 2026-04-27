@@ -20,10 +20,11 @@ tokio = { version = "1", features = ["full"] }
 futures = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-parquet = { version = "53", default-features = false, features = ["arrow", "snap", "lz4", "zstd"] }
-arrow = { version = "53", default-features = false }
-arrow-array = "53"
-arrow-schema = "53"
+parquet = { version = "58", default-features = false, features = ["arrow", "snap", "lz4", "zstd"] }
+arrow = { version = "58", default-features = false }
+arrow-array = "58"
+arrow-schema = "58"
+duckdb = { version = "1.10502", default-features = false }
 object_store = { version = "0.13", features = ["aws", "http"] }
 eat-rocks = { git = "https://tangled.org/microcosm.blue/eat-rocks", default-features = false, features = ["easy"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }

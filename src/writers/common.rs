@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 pub fn writer_props() -> WriterProperties {
     WriterProperties::builder()
         .set_compression(Compression::ZSTD(ZstdLevel::try_new(3).unwrap()))
-        .set_max_row_group_size(1_000_000)
+        .set_max_row_group_row_count(1_000_000)
         .build()
 }
 
