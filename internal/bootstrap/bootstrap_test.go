@@ -11,10 +11,11 @@ import (
 	_ "github.com/marcboeker/go-duckdb/v2"
 
 	"github.com/pboueri/atproto-db-snapshot/internal/config"
-	"github.com/pboueri/atproto-db-snapshot/internal/repo"
+	"github.com/pboueri/atproto-db-snapshot/internal/constellation"
 	"github.com/pboueri/atproto-db-snapshot/internal/model"
 	"github.com/pboueri/atproto-db-snapshot/internal/objstore"
 	"github.com/pboueri/atproto-db-snapshot/internal/plc"
+	"github.com/pboueri/atproto-db-snapshot/internal/slingshot"
 )
 
 func TestBootstrapEndToEndWithFakes(t *testing.T) {
@@ -26,19 +27,27 @@ func TestBootstrapEndToEndWithFakes(t *testing.T) {
 	}
 
 	plcFake := plc.NewFake(time.Date(2026, 4, 1, 0, 0, 0, 0, time.UTC), []string{"did:plc:a", "did:plc:b"})
-	con := repo.NewFake()
 
-	// Profile + 2 follows for did:plc:a; just a profile for did:plc:b.
-	con.Set("did:plc:a", model.CollectionProfile, []repo.Record{
-		{URI: "at://did:plc:a/app.bsky.actor.profile/self", Value: json.RawMessage(`{"displayName":"Alice","createdAt":"2025-01-01T00:00:00Z"}`)},
+	// Profiles via Slingshot.
+	sling := slingshot.NewFake()
+	sling.Set("did:plc:a", string(model.CollectionProfile), "self", slingshot.Record{
+		URI: "at://did:plc:a/app.bsky.actor.profile/self",
+		CID: "bafy",
+		Value: json.RawMessage(`{"displayName":"Alice","createdAt":"2025-01-01T00:00:00Z"}`),
 	})
-	con.Set("did:plc:a", model.CollectionFollow, []repo.Record{
-		{URI: "at://did:plc:a/app.bsky.graph.follow/r1", Value: json.RawMessage(`{"subject":"did:plc:b","createdAt":"2025-01-02T00:00:00Z"}`)},
-		{URI: "at://did:plc:a/app.bsky.graph.follow/r2", Value: json.RawMessage(`{"subject":"did:plc:c","createdAt":"2025-01-03T00:00:00Z"}`)},
+	sling.Set("did:plc:b", string(model.CollectionProfile), "self", slingshot.Record{
+		URI: "at://did:plc:b/app.bsky.actor.profile/self",
+		CID: "bafy",
+		Value: json.RawMessage(`{"displayName":"Bob"}`),
 	})
-	con.Set("did:plc:a", model.CollectionBlock, nil)
-	con.Set("did:plc:b", model.CollectionProfile, []repo.Record{
-		{URI: "at://did:plc:b/app.bsky.actor.profile/self", Value: json.RawMessage(`{"displayName":"Bob"}`)},
+
+	// Follows via Constellation, target-indexed: alice and a third party
+	// follow bob, so bob's bundle gets two incoming follows. No one follows
+	// alice, so alice's incoming bundle is empty.
+	con := constellation.NewFake()
+	con.Set("did:plc:b", string(model.CollectionFollow), ".subject", []constellation.Link{
+		{DID: "did:plc:a", Collection: string(model.CollectionFollow), RKey: "3l6oveex3ii2l"},
+		{DID: "did:plc:c", Collection: string(model.CollectionFollow), RKey: "3l6oveex3ii2l"},
 	})
 
 	cfg := config.Config{
@@ -52,22 +61,21 @@ func TestBootstrapEndToEndWithFakes(t *testing.T) {
 		PLCEndpoint:     "fake",
 	}
 	deps := Deps{
-		PLC:      plcFake,
-		Repo:     con,
-		ObjStore: obj,
-		Now:      func() time.Time { return time.Date(2026, 4, 26, 12, 0, 0, 0, time.UTC) },
+		PLC:           plcFake,
+		Slingshot:     sling,
+		Constellation: con,
+		ObjStore:      obj,
+		Now:           func() time.Time { return time.Date(2026, 4, 26, 12, 0, 0, 0, time.UTC) },
 	}
 
 	if err := RunWith(context.Background(), cfg, deps); err != nil {
 		t.Fatalf("RunWith: %v", err)
 	}
 
-	// The remote duckdb should exist at bootstrap/2026-04-26/social_graph.duckdb.
 	if _, err := obj.Stat(context.Background(), "bootstrap/2026-04-26/social_graph.duckdb"); err != nil {
 		t.Fatalf("expected uploaded duckdb: %v", err)
 	}
 
-	// Verify table contents via the local staging copy.
 	dbPath := filepath.Join(dataDir, "bootstrap-staging", "social_graph.duckdb")
 	db, err := sql.Open("duckdb", dbPath)
 	if err != nil {
@@ -85,6 +93,8 @@ func TestBootstrapEndToEndWithFakes(t *testing.T) {
 	if err := db.QueryRow("SELECT count(*) FROM bootstrap_progress").Scan(&progress); err != nil {
 		t.Fatal(err)
 	}
+	// 2 actors (a, b). 2 follows (a→b and c→b, both captured when b was the
+	// target). 2 progress rows (one per DID iterated from PLC).
 	if actors != 2 {
 		t.Errorf("actors = %d, want 2", actors)
 	}
@@ -93,6 +103,15 @@ func TestBootstrapEndToEndWithFakes(t *testing.T) {
 	}
 	if progress != 2 {
 		t.Errorf("progress = %d, want 2", progress)
+	}
+
+	// Spot-check direction: there should be a row with src=a, dst=b.
+	var srcADstB int64
+	if err := db.QueryRow(`SELECT count(*) FROM follows WHERE src_did = 'did:plc:a' AND dst_did = 'did:plc:b'`).Scan(&srcADstB); err != nil {
+		t.Fatal(err)
+	}
+	if srcADstB != 1 {
+		t.Errorf("a→b follows = %d, want 1", srcADstB)
 	}
 }
 
@@ -104,13 +123,16 @@ func TestBootstrapResumeSkipsCompleted(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	con := repo.NewFake()
-	con.Set("did:plc:a", model.CollectionProfile, []repo.Record{
-		{URI: "at://did:plc:a/app.bsky.actor.profile/self", Value: json.RawMessage(`{"displayName":"Alice"}`)},
+	sling := slingshot.NewFake()
+	sling.Set("did:plc:a", string(model.CollectionProfile), "self", slingshot.Record{
+		URI: "u", CID: "c",
+		Value: json.RawMessage(`{"displayName":"Alice"}`),
 	})
-	con.Set("did:plc:b", model.CollectionProfile, []repo.Record{
-		{URI: "at://did:plc:b/app.bsky.actor.profile/self", Value: json.RawMessage(`{"displayName":"Bob"}`)},
+	sling.Set("did:plc:b", string(model.CollectionProfile), "self", slingshot.Record{
+		URI: "u", CID: "c",
+		Value: json.RawMessage(`{"displayName":"Bob"}`),
 	})
+	con := constellation.NewFake()
 
 	cfg := config.Config{
 		DataDir:         dataDir,
@@ -122,39 +144,36 @@ func TestBootstrapResumeSkipsCompleted(t *testing.T) {
 		StatsInterval:   time.Hour,
 	}
 
-	// First pass: only DID a is in PLC, succeeds.
+	// First pass: only DID a is in PLC.
 	deps1 := Deps{
-		PLC:      plc.NewFake(time.Now(), []string{"did:plc:a"}),
-		Repo:     con,
-		ObjStore: obj,
-		Now:      func() time.Time { return time.Date(2026, 4, 26, 12, 0, 0, 0, time.UTC) },
+		PLC:           plc.NewFake(time.Now(), []string{"did:plc:a"}),
+		Slingshot:     sling,
+		Constellation: con,
+		ObjStore:      obj,
+		Now:           func() time.Time { return time.Date(2026, 4, 26, 12, 0, 0, 0, time.UTC) },
 	}
 	if err := RunWith(context.Background(), cfg, deps1); err != nil {
 		t.Fatalf("first run: %v", err)
 	}
 
-	// Second pass: PLC now has a + b. Bootstrap should refuse to overwrite
-	// the already-uploaded file but still process b locally — to verify the
-	// resume path we re-run before the upload step by deleting the remote
-	// file. (The real-world resume scenario is interrupting *before* upload.)
+	// Second pass: PLC has a + b. Delete the remote so RunWith doesn't
+	// refuse-overwrite, then re-run. FailOnce on did:plc:a as a tripwire:
+	// if the resume path re-fetched it, the test fails.
 	if err := obj.Delete(context.Background(), "bootstrap/2026-04-26/social_graph.duckdb"); err != nil {
 		t.Fatal(err)
 	}
-	// FailOnce on did:plc:a so we'd notice if the resume path re-fetched it.
-	con.FailOnce["did:plc:a"] = true
+	sling.FailOnce["did:plc:a"] = true
 	deps2 := Deps{
-		PLC:      plc.NewFake(time.Now(), []string{"did:plc:a", "did:plc:b"}),
-		Repo:     con,
-		ObjStore: obj,
-		Now:      func() time.Time { return time.Date(2026, 4, 26, 12, 0, 0, 0, time.UTC) },
+		PLC:           plc.NewFake(time.Now(), []string{"did:plc:a", "did:plc:b"}),
+		Slingshot:     sling,
+		Constellation: con,
+		ObjStore:      obj,
+		Now:           func() time.Time { return time.Date(2026, 4, 26, 12, 0, 0, 0, time.UTC) },
 	}
 	if err := RunWith(context.Background(), cfg, deps2); err != nil {
 		t.Fatalf("second run: %v", err)
 	}
-	// FailOnce stays true until the fake consumes it — i.e. until someone
-	// actually calls ListRecords for the DID. If the resume path skipped
-	// did:plc:a (the desired behavior), the entry should still be set.
-	if !con.FailOnce["did:plc:a"] {
+	if !sling.FailOnce["did:plc:a"] {
 		t.Errorf("resume re-fetched did:plc:a (FailOnce was consumed)")
 	}
 }
@@ -178,18 +197,16 @@ func TestBootstrapRefusesToOverwrite(t *testing.T) {
 	}
 	now := time.Date(2026, 4, 26, 12, 0, 0, 0, time.UTC)
 	deps := Deps{
-		PLC:      plc.NewFake(now, []string{"did:plc:a"}),
-		Repo:     repo.NewFake(),
-		ObjStore: obj,
-		Now:      func() time.Time { return now },
+		PLC:           plc.NewFake(now, []string{"did:plc:a"}),
+		Slingshot:     slingshot.NewFake(),
+		Constellation: constellation.NewFake(),
+		ObjStore:      obj,
+		Now:           func() time.Time { return now },
 	}
 
-	// First run uploads.
 	if err := RunWith(context.Background(), cfg, deps); err != nil {
 		t.Fatalf("first run: %v", err)
 	}
-	// Second run with the staging file already present and the remote in place
-	// must refuse so we don't clobber the canonical baseline.
 	err = RunWith(context.Background(), cfg, deps)
 	if err == nil {
 		t.Errorf("expected overwrite-refusal error")

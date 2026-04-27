@@ -72,11 +72,36 @@ type Config struct {
 	// the bootstrap fan-out divides among its workers. The default of 5
 	// stays well under bsky.social's published ~10 RPS per-IP global so
 	// short bursts plus retries don't trip the cap.
+	//
+	// Currently only consulted by the legacy PDS-direct path; the
+	// bootstrap fetches via Slingshot + Constellation and uses
+	// MicrocosmRateLimit / MicrocosmBurst instead.
 	PDSRateLimit float64
 	// PDSBurst is the maximum number of tokens the per-host bucket can
 	// accumulate, governing how many concurrent in-flight requests can
 	// clear before throttling kicks in.
 	PDSBurst int
+
+	// ConstellationEndpoint is the backlinks index used for follows /
+	// blocks during bootstrap. https://constellation.microcosm.blue is the
+	// public instance; operators can self-host.
+	ConstellationEndpoint string
+	// SlingshotEndpoint is the edge record cache used for the profile
+	// leg of bootstrap. https://slingshot.microcosm.blue is the public
+	// instance.
+	SlingshotEndpoint string
+	// MicrocosmRateLimit is the sustained RPS budget shared across all
+	// workers when calling Slingshot or Constellation. Each service has
+	// its own bucket; both default to this value.
+	MicrocosmRateLimit float64
+	// MicrocosmBurst is the bucket capacity (max in-flight before
+	// throttling kicks in).
+	MicrocosmBurst int
+	// Contact is appended to the User-Agent on requests to
+	// Constellation / Slingshot per microcosm.blue's "if you want to be
+	// nice, put your project name and bsky username (or email) in your
+	// user-agent" guidance. Optional.
+	Contact string
 
 	// MonitorAddr is the listen address for `at-snapshot monitor`.
 	MonitorAddr string
@@ -169,6 +194,21 @@ func ParseFlags(sub string, args []string) (Config, error) {
 		"Per-PDS sustained requests-per-second across all workers")
 	fs.IntVar(&cfg.PDSBurst, "pds-burst", layeredInt(fc.PDSBurst, "AT_SNAPSHOT_PDS_BURST", 5),
 		"Per-PDS burst capacity (max in-flight before throttling)")
+	fs.StringVar(&cfg.ConstellationEndpoint, "constellation-endpoint",
+		layered(fc.ConstellationEndpoint, "AT_SNAPSHOT_CONSTELLATION_ENDPOINT", "https://constellation.microcosm.blue"),
+		"Backlinks index URL (used for follows/blocks during bootstrap)")
+	fs.StringVar(&cfg.SlingshotEndpoint, "slingshot-endpoint",
+		layered(fc.SlingshotEndpoint, "AT_SNAPSHOT_SLINGSHOT_ENDPOINT", "https://slingshot.microcosm.blue"),
+		"Edge record cache URL (used for profile fetches during bootstrap)")
+	microRateStr := fs.String("microcosm-rate-limit",
+		layered(formatFloat(fc.MicrocosmRateLimit), "AT_SNAPSHOT_MICROCOSM_RATE_LIMIT", "20"),
+		"Sustained requests-per-second to Slingshot / Constellation (shared across workers, per service)")
+	fs.IntVar(&cfg.MicrocosmBurst, "microcosm-burst",
+		layeredInt(fc.MicrocosmBurst, "AT_SNAPSHOT_MICROCOSM_BURST", 40),
+		"Microcosm bucket capacity (max in-flight before throttling)")
+	fs.StringVar(&cfg.Contact, "contact",
+		layered(fc.Contact, "AT_SNAPSHOT_CONTACT", ""),
+		"Contact (bsky handle or email) appended to outgoing User-Agent — microcosm.blue requests it")
 	fs.IntVar(&cfg.MaxDIDs, "max-dids", layeredInt(fc.MaxDIDs, "AT_SNAPSHOT_MAX_DIDS", 0),
 		"Bootstrap: cap the number of DIDs consumed from PLC (0 = no cap)")
 	fs.DurationVar(&cfg.RunDuration, "run-duration", layeredDuration(fc.RunDuration, "AT_SNAPSHOT_RUN_DURATION", 0),
@@ -193,6 +233,9 @@ func ParseFlags(sub string, args []string) (Config, error) {
 
 	if v, err := strconv.ParseFloat(*pdsRateStr, 64); err == nil {
 		cfg.PDSRateLimit = v
+	}
+	if v, err := strconv.ParseFloat(*microRateStr, 64); err == nil {
+		cfg.MicrocosmRateLimit = v
 	}
 
 	if err := cfg.Validate(); err != nil {

@@ -4,8 +4,17 @@
 //
 //   - the canonical DID list from PLC (one streaming GET to /export, paginated
 //     by createdAt cursor);
-//   - per-DID profile / follow / block records from Constellation (one
-//     listRecords per (did, collection)).
+//   - per-DID profile records from Slingshot
+//     (https://slingshot.microcosm.blue), an edge cache that fronts every
+//     PDS via com.atproto.repo.getRecord;
+//   - per-DID *incoming* follow / block backlinks from Constellation
+//     (https://constellation.microcosm.blue), the network-wide backlinks
+//     index. Querying Constellation with target=<did> returns every record
+//     in the network whose .subject points at <did> — i.e. the DIDs that
+//     follow / block <did>. Iterating every DID in PLC as a target therefore
+//     enumerates the same edge set as the original "ask each DID's PDS for
+//     its outgoing follows" approach, but routed through one centralized
+//     index instead of fan-out into thousands of rate-limited PDSes.
 //
 // The output lands at bootstrap/YYYY-MM-DD/social_graph.duckdb in object
 // storage exactly once; the spec calls out that this file must never be
@@ -16,16 +25,17 @@
 //   - Local staging: while the run is in progress, all writes go to a local
 //     file at {data_dir}/bootstrap-staging/social_graph.duckdb. We only copy
 //     it up to object storage at the end of a successful run.
-//   - Per-DID idempotency: every DID's profile + follows + blocks land in a
-//     single transaction along with a row in bootstrap_progress. On restart
-//     we re-read the progress table and skip already-completed DIDs.
-//   - Crash safety: a partial DID's records are never visible because we
-//     commit them in the same transaction as the progress row.
+//   - Per-DID idempotency: every chunk is committed in its own transaction
+//     with INSERT OR REPLACE on the natural keys. bootstrap_progress is
+//     only updated by the FINAL chunk for a DID, so a crash mid-DID leaves
+//     orphan rows that the resume re-fetch will overwrite cleanly.
+//   - Crash safety: chunks for one DID may straddle a crash; on restart
+//     the DID is re-fetched and the orphan rows are upserted.
 //
-// Concurrency: cfg.Concurrency goroutines pull DIDs off a channel, fetch the
-// three collections, and hand a bundle to a single writer goroutine that
-// owns the duckdb connection. Single-writer keeps the SQL simple and avoids
-// fighting DuckDB's writer lock.
+// Concurrency: cfg.Concurrency goroutines pull DIDs off a channel, fetch
+// profile + paginated backlinks, and stream chunks to a single writer
+// goroutine that owns the duckdb connection. Single-writer keeps the SQL
+// simple and avoids fighting DuckDB's writer lock.
 package bootstrap
 
 import (
@@ -40,18 +50,27 @@ import (
 
 	"github.com/pboueri/atproto-db-snapshot/internal/atrecord"
 	"github.com/pboueri/atproto-db-snapshot/internal/config"
+	"github.com/pboueri/atproto-db-snapshot/internal/constellation"
 	"github.com/pboueri/atproto-db-snapshot/internal/model"
 	"github.com/pboueri/atproto-db-snapshot/internal/objstore"
 	"github.com/pboueri/atproto-db-snapshot/internal/plc"
-	"github.com/pboueri/atproto-db-snapshot/internal/repo"
+	"github.com/pboueri/atproto-db-snapshot/internal/slingshot"
 )
+
+// chunkBatchSize is the number of follow/block rows accumulated before a
+// chunk is flushed to the writer. Tuned so a chunk's transaction is small
+// enough to not stall the writer (~hundred-row INSERT batches commit in
+// under 100ms on local DuckDB) and large enough to amortize transaction
+// overhead. Constellation paginates at 100 rows; one chunk = one page.
+const chunkBatchSize = 500
 
 // Deps lets tests inject fake source clients and object stores. Run wires
 // production defaults via FromConfig.
 type Deps struct {
-	PLC      plc.Directory
-	Repo     repo.Client
-	ObjStore objstore.Store
+	PLC           plc.Directory
+	Slingshot     slingshot.Client
+	Constellation constellation.Client
+	ObjStore      objstore.Store
 	// Now lets tests pin the partition date the bootstrap publishes under.
 	Now func() time.Time
 }
@@ -62,13 +81,12 @@ func Run(ctx context.Context, cfg config.Config) error {
 	if err != nil {
 		return err
 	}
-	repoClient := repo.NewHTTP()
-	repoClient.Limiter = repo.NewHostLimiter(cfg.PDSRateLimit, cfg.PDSBurst)
 	deps := Deps{
-		PLC:      plc.NewHTTP(cfg.PLCEndpoint),
-		Repo:     repoClient,
-		ObjStore: obj,
-		Now:      func() time.Time { return time.Now().UTC() },
+		PLC:           plc.NewHTTP(cfg.PLCEndpoint),
+		Slingshot:     slingshot.NewHTTP(cfg.SlingshotEndpoint, cfg.Contact, cfg.MicrocosmRateLimit, cfg.MicrocosmBurst),
+		Constellation: constellation.NewHTTP(cfg.ConstellationEndpoint, cfg.Contact, cfg.MicrocosmRateLimit, cfg.MicrocosmBurst),
+		ObjStore:      obj,
+		Now:           func() time.Time { return time.Now().UTC() },
 	}
 	return RunWith(ctx, cfg, deps)
 }
@@ -100,7 +118,7 @@ func RunWith(ctx context.Context, cfg config.Config, deps Deps) error {
 	}
 	defer closeOnce()
 
-	if err := st.MarkStarted(ctx, cfg.PLCEndpoint, "pds:listRecords"); err != nil {
+	if err := st.MarkStarted(ctx, cfg.PLCEndpoint, cfg.ConstellationEndpoint); err != nil {
 		return err
 	}
 	completed, err := st.CompletedDIDs(ctx)
@@ -109,11 +127,9 @@ func RunWith(ctx context.Context, cfg config.Config, deps Deps) error {
 	}
 	slog.Info("bootstrap resume state", "already_complete", len(completed))
 
-	// Channels: PLC stream -> jobs; workers -> bundles -> writer.
-	// Each job carries the DID and the resolved PDS endpoint from PLC; a
-	// DID without a PDS (tombstoned) is dropped at producer time.
+	// Channels: PLC stream -> jobs; workers -> chunks -> writer.
 	jobs := make(chan plc.Entry, cfg.Concurrency*4)
-	bundles := make(chan didBundle, cfg.Concurrency*4)
+	chunks := make(chan didChunk, cfg.Concurrency*4)
 
 	var (
 		fetched   atomic.Int64
@@ -121,23 +137,28 @@ func RunWith(ctx context.Context, cfg config.Config, deps Deps) error {
 		fetchErrs atomic.Int64
 	)
 
-	// Producer: PLC stream pushes DIDs not in `completed`. If cfg.MaxDIDs is
-	// set, stop yielding once we've enqueued that many *new* DIDs (already-
-	// completed DIDs from prior runs don't count against the cap, since the
-	// cap exists to bound new fetch work).
+	// Producer: PLC stream pushes DIDs not in `completed`. The PDS field on
+	// plc.Entry is no longer used — Slingshot resolves identities itself
+	// and Constellation is keyed only by DID. We still read PLC to enumerate
+	// every DID in the network (Constellation can't tell us about DIDs that
+	// have zero incoming links, so PLC remains the source of truth for
+	// "which DIDs exist").
 	prodErr := make(chan error, 1)
 	go func() {
 		defer close(jobs)
 		yielded := 0
+		seen := make(map[string]struct{}, len(completed))
 		err := deps.PLC.Stream(ctx, time.Time{}, func(e plc.Entry) bool {
 			if _, ok := completed[e.DID]; ok {
 				return true
 			}
-			if e.PDS == "" {
-				// Tombstoned or pre-v2 DIDs without a current PDS — skip
-				// rather than queue a doomed listRecords job.
+			if _, ok := seen[e.DID]; ok {
+				// Same DID can appear in PLC's chronological export
+				// across multiple ops (key rotation, PDS migration, etc.).
+				// Dedupe in-memory so we don't queue duplicate jobs.
 				return true
 			}
+			seen[e.DID] = struct{}{}
 			if cfg.MaxDIDs > 0 && yielded >= cfg.MaxDIDs {
 				return false
 			}
@@ -156,21 +177,23 @@ func RunWith(ctx context.Context, cfg config.Config, deps Deps) error {
 	workersDone := make(chan struct{})
 	go func() {
 		defer close(workersDone)
-		startWorkers(ctx, cfg.Concurrency, jobs, bundles, deps, &fetched, &fetchErrs)
+		startWorkers(ctx, cfg.Concurrency, jobs, chunks, deps, &fetched, &fetchErrs)
 	}()
 
-	// Writer: drain bundles until workers close the channel.
+	// Writer: drain chunks until workers close the channel.
 	writerErr := make(chan error, 1)
 	go func() {
 		defer close(writerErr)
-		for b := range bundles {
-			if err := st.commitBundle(ctx, b); err != nil {
+		for c := range chunks {
+			if err := st.commitChunk(ctx, c); err != nil {
 				writerErr <- err
 				return
 			}
-			n := written.Add(1)
-			if n%1000 == 0 {
-				slog.Info("bootstrap progress", "completed_dids", n)
+			if c.final {
+				n := written.Add(1)
+				if n%1000 == 0 {
+					slog.Info("bootstrap progress", "completed_dids", n)
+				}
 			}
 		}
 	}()
@@ -195,10 +218,10 @@ func RunWith(ctx context.Context, cfg config.Config, deps Deps) error {
 	go statsLoop(statsCtx, cfg.StatsInterval, &fetched, &written, &fetchErrs)
 	go progressLoop(statsCtx, cfg.StatsInterval, pw)
 
-	// Wait for workers to finish (which closes bundles, which lets the
+	// Wait for workers to finish (which closes chunks, which lets the
 	// writer exit), then check for errors from each stage.
 	<-workersDone
-	close(bundles)
+	close(chunks)
 	if err := <-writerErr; err != nil {
 		return fmt.Errorf("bootstrap: writer: %w", err)
 	}
@@ -239,8 +262,8 @@ func RunWith(ctx context.Context, cfg config.Config, deps Deps) error {
 	return uploadFile(ctx, deps.ObjStore, remote, stagingPath)
 }
 
-// startWorkers fans out fetch goroutines; closes bundles once all workers exit.
-func startWorkers(ctx context.Context, n int, jobs <-chan plc.Entry, bundles chan<- didBundle, deps Deps, fetched, fetchErrs *atomic.Int64) {
+// startWorkers fans out fetch goroutines; closes when all workers exit.
+func startWorkers(ctx context.Context, n int, jobs <-chan plc.Entry, chunks chan<- didChunk, deps Deps, fetched, fetchErrs *atomic.Int64) {
 	done := make(chan struct{}, n)
 	for i := 0; i < n; i++ {
 		go func() {
@@ -253,18 +276,20 @@ func startWorkers(ctx context.Context, n int, jobs <-chan plc.Entry, bundles cha
 					if !ok {
 						return
 					}
-					b, err := fetchBundle(ctx, deps, job)
-					if err != nil {
+					if err := fetchDID(ctx, deps, job, chunks); err != nil {
 						fetchErrs.Add(1)
-						slog.Warn("bootstrap fetch error", "did", job.DID, "pds", job.PDS, "err", err)
+						slog.Warn("bootstrap fetch error", "did", job.DID, "err", err)
+						// Even on error, send a final chunk so the DID is
+						// marked complete with whatever we got. Otherwise
+						// resume would re-fetch indefinitely on a DID whose
+						// upstream is permanently broken.
+						select {
+						case <-ctx.Done():
+						case chunks <- didChunk{did: job.DID, final: true}:
+						}
 						continue
 					}
 					fetched.Add(1)
-					select {
-					case <-ctx.Done():
-						return
-					case bundles <- b:
-					}
 				}
 			}
 		}()
@@ -274,56 +299,97 @@ func startWorkers(ctx context.Context, n int, jobs <-chan plc.Entry, bundles cha
 	}
 }
 
-// fetchBundle pulls profile + follows + blocks for a single DID off its
-// home PDS. Failures on individual collections are logged but don't fail the
-// bundle — a deactivated repo, for example, may have one collection
-// returning 4xx but others succeeding. The progress row still gets written
-// because we'd rather make forward progress than block on flaky individuals.
-func fetchBundle(ctx context.Context, deps Deps, job plc.Entry) (didBundle, error) {
+// fetchDID streams chunks for one DID's profile + incoming follows + incoming
+// blocks. Every successful return is followed by a `final: true` chunk so
+// the writer marks bootstrap_progress.
+//
+// On Slingshot ErrNotFound for the profile, the actor row is still written
+// (as a minimal "DID exists, no public profile" placeholder) by the final
+// chunk's INSERT OR IGNORE.
+func fetchDID(ctx context.Context, deps Deps, job plc.Entry, chunks chan<- didChunk) error {
 	now := deps.Now()
-	b := didBundle{did: job.DID}
+	did := job.DID
 
-	if profileRecs, err := deps.Repo.ListRecords(ctx, job.PDS, job.DID, model.CollectionProfile); err == nil {
-		if len(profileRecs) > 0 {
-			// app.bsky.actor.profile is a singleton-ish: rkey "self".
-			rec := profileRecs[0]
-			p, derr := atrecord.DecodeProfile(rec.Value, job.DID, now, model.SourceBootstrap)
-			if derr != nil {
-				return didBundle{}, derr
-			}
-			b.profile = &p
+	// Profile: getRecord at rkey=self.
+	var profile *model.Profile
+	rec, err := deps.Slingshot.GetRecord(ctx, did, string(model.CollectionProfile), "self")
+	switch {
+	case err == nil:
+		p, derr := atrecord.DecodeProfile(rec.Value, did, now, model.SourceBootstrap)
+		if derr != nil {
+			return fmt.Errorf("decode profile: %w", derr)
 		}
-	} else {
-		return didBundle{}, fmt.Errorf("profile fetch: %w", err)
+		profile = &p
+	case errors.Is(err, slingshot.ErrNotFound):
+		// Tombstoned / no public profile — fall through; the final chunk
+		// still writes a bare actor row.
+	default:
+		return fmt.Errorf("profile fetch: %w", err)
 	}
 
-	if followRecs, err := deps.Repo.ListRecords(ctx, job.PDS, job.DID, model.CollectionFollow); err == nil {
-		for _, r := range followRecs {
-			f, derr := atrecord.DecodeFollow(r.Value, job.DID, r.RKey, now, model.SourceBootstrap)
-			if derr != nil {
-				slog.Warn("decode follow", "did", job.DID, "rkey", r.RKey, "err", derr)
-				continue
-			}
-			b.follows = append(b.follows, f)
-		}
-	} else {
-		return didBundle{}, fmt.Errorf("follow fetch: %w", err)
+	if err := sendChunk(ctx, chunks, didChunk{did: did, profile: profile}); err != nil {
+		return err
 	}
 
-	if blockRecs, err := deps.Repo.ListRecords(ctx, job.PDS, job.DID, model.CollectionBlock); err == nil {
-		for _, r := range blockRecs {
-			bl, derr := atrecord.DecodeBlock(r.Value, job.DID, r.RKey, now, model.SourceBootstrap)
-			if derr != nil {
-				slog.Warn("decode block", "did", job.DID, "rkey", r.RKey, "err", derr)
-				continue
-			}
-			b.blocks = append(b.blocks, bl)
-		}
-	} else {
-		return didBundle{}, fmt.Errorf("block fetch: %w", err)
+	// Follows: incoming backlinks where this DID is the target's .subject.
+	if err := streamBacklinks(ctx, deps.Constellation, did, model.CollectionFollow, now, chunks); err != nil {
+		return fmt.Errorf("follow backlinks: %w", err)
+	}
+	if err := streamBacklinks(ctx, deps.Constellation, did, model.CollectionBlock, now, chunks); err != nil {
+		return fmt.Errorf("block backlinks: %w", err)
 	}
 
-	return b, nil
+	// Final marker — even when there were no follows / blocks, this fires
+	// the bare-actor INSERT OR IGNORE and writes bootstrap_progress.
+	return sendChunk(ctx, chunks, didChunk{did: did, final: true})
+}
+
+// streamBacklinks paginates Constellation for (target=did, collection,
+// path=.subject) and flushes a chunk every chunkBatchSize rows. It does
+// NOT send the final chunk — that's the caller's responsibility so it can
+// be coordinated with the other collections.
+func streamBacklinks(ctx context.Context, c constellation.Client, did string, collection model.Collection, now time.Time, chunks chan<- didChunk) error {
+	var follows []model.Follow
+	var blocks []model.Block
+
+	flush := func() error {
+		if len(follows) == 0 && len(blocks) == 0 {
+			return nil
+		}
+		err := sendChunk(ctx, chunks, didChunk{did: did, follows: follows, blocks: blocks})
+		follows = nil
+		blocks = nil
+		return err
+	}
+
+	err := c.GetBacklinks(ctx, did, string(collection), ".subject", func(l constellation.Link) bool {
+		switch collection {
+		case model.CollectionFollow:
+			follows = append(follows, atrecord.BuildFollowFromBacklink(l.DID, did, l.RKey, now, model.SourceBootstrap))
+		case model.CollectionBlock:
+			blocks = append(blocks, atrecord.BuildBlockFromBacklink(l.DID, did, l.RKey, now, model.SourceBootstrap))
+		}
+		if len(follows)+len(blocks) >= chunkBatchSize {
+			if err := flush(); err != nil {
+				return false
+			}
+		}
+		return ctx.Err() == nil
+	})
+	if err != nil {
+		return err
+	}
+	return flush()
+}
+
+// sendChunk forwards c to chunks while honoring context cancellation.
+func sendChunk(ctx context.Context, chunks chan<- didChunk, c didChunk) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case chunks <- c:
+		return nil
+	}
 }
 
 func uploadFile(ctx context.Context, obj objstore.Store, dst, src string) error {

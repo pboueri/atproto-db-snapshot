@@ -258,6 +258,82 @@ func LangsFromPost(p model.Post) []string {
 	return strings.Split(p.Langs, ",")
 }
 
+// tidAlphabet is atproto's sorted base32 alphabet for TID encoding:
+// 0-5 = '2'..'7', 6-31 = 'a'..'z'. See atproto.com/specs/record-key#tid.
+const tidAlphabet = "234567abcdefghijklmnopqrstuvwxyz"
+
+// TIDToTime decodes a 13-char atproto TID rkey to its embedded creation
+// timestamp. TIDs are 64-bit values where the top bit is 0, the next 53
+// bits are microseconds since the UNIX epoch, and the bottom 10 bits are
+// a clock id; the encoding is base32-sorted MSB-first across 13 chars.
+//
+// Returns ok=false on a malformed rkey (wrong length, bad alphabet) so
+// callers can fall back to indexedAt rather than producing a year-1970
+// timestamp.
+func TIDToTime(rkey string) (time.Time, bool) {
+	if len(rkey) != 13 {
+		return time.Time{}, false
+	}
+	var v uint64
+	for i := 0; i < 13; i++ {
+		c := rkey[i]
+		var idx int
+		switch {
+		case c >= '2' && c <= '7':
+			idx = int(c - '2')
+		case c >= 'a' && c <= 'z':
+			idx = int(c-'a') + 6
+		default:
+			return time.Time{}, false
+		}
+		v = (v << 5) | uint64(idx)
+	}
+	micros := int64((v >> 10) & ((1 << 53) - 1))
+	return time.UnixMicro(micros).UTC(), true
+}
+
+// BuildFollowFromBacklink synthesizes a model.Follow from a Constellation
+// backlink: the rkey carries the source DID's TID-encoded creation time, so
+// CreatedAt is derived from rkey rather than a record body. linker is the
+// follower (record owner); target is the followed DID (record's .subject).
+// Falls back to indexedAt when the rkey isn't a parseable TID.
+func BuildFollowFromBacklink(linker, target, rkey string, indexedAt time.Time, source string) model.Follow {
+	createdAt, ok := TIDToTime(rkey)
+	if !ok {
+		createdAt = indexedAt.UTC()
+	}
+	return model.Follow{
+		SrcDID:    linker,
+		SrcDIDID:  intern.DIDID(linker),
+		DstDID:    target,
+		DstDIDID:  intern.DIDID(target),
+		RKey:      rkey,
+		CreatedAt: createdAt,
+		IndexedAt: indexedAt.UTC(),
+		Op:        model.OpCreate,
+		Source:    source,
+	}
+}
+
+// BuildBlockFromBacklink is the block analog of BuildFollowFromBacklink.
+func BuildBlockFromBacklink(linker, target, rkey string, indexedAt time.Time, source string) model.Block {
+	createdAt, ok := TIDToTime(rkey)
+	if !ok {
+		createdAt = indexedAt.UTC()
+	}
+	return model.Block{
+		SrcDID:    linker,
+		SrcDIDID:  intern.DIDID(linker),
+		DstDID:    target,
+		DstDIDID:  intern.DIDID(target),
+		RKey:      rkey,
+		CreatedAt: createdAt,
+		IndexedAt: indexedAt.UTC(),
+		Op:        model.OpCreate,
+		Source:    source,
+	}
+}
+
 func blobLink(b *blobRef) string {
 	if b == nil {
 		return ""

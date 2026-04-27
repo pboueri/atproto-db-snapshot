@@ -56,6 +56,13 @@ type fileConfig struct {
 	PDSRateLimit   float64       `yaml:"pds_rate_limit"`
 	PDSBurst       int           `yaml:"pds_burst"`
 
+	// Microcosm services (slingshot + constellation) used by bootstrap.
+	ConstellationEndpoint string  `yaml:"constellation_endpoint"`
+	SlingshotEndpoint     string  `yaml:"slingshot_endpoint"`
+	MicrocosmRateLimit    float64 `yaml:"microcosm_rate_limit"`
+	MicrocosmBurst        int     `yaml:"microcosm_burst"`
+	Contact               string  `yaml:"contact"`
+
 	// Monitor.
 	MonitorAddr string `yaml:"monitor_addr"`
 
@@ -102,10 +109,15 @@ func (c *fileConfig) UnmarshalYAML(node *yaml.Node) error {
 		"jetstream_endpoints": &c.JetstreamEndpoints,
 		"concurrency":         &c.Concurrency,
 		"max_dids":            &c.MaxDIDs,
-		"pds_rate_limit":      &c.PDSRateLimit,
-		"pds_burst":           &c.PDSBurst,
-		"monitor_addr":        &c.MonitorAddr,
-		"log_level":           &c.LogLevel,
+		"pds_rate_limit":         &c.PDSRateLimit,
+		"pds_burst":              &c.PDSBurst,
+		"constellation_endpoint": &c.ConstellationEndpoint,
+		"slingshot_endpoint":     &c.SlingshotEndpoint,
+		"microcosm_rate_limit":   &c.MicrocosmRateLimit,
+		"microcosm_burst":        &c.MicrocosmBurst,
+		"contact":                &c.Contact,
+		"monitor_addr":           &c.MonitorAddr,
+		"log_level":              &c.LogLevel,
 	}
 	durationFields := map[string]*time.Duration{
 		"stats_interval": &c.StatsInterval,

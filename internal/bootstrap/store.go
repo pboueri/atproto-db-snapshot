@@ -137,17 +137,26 @@ func (s *store) MarkFinished(ctx context.Context) error {
 	return err
 }
 
-// didBundle is what a worker hands to the writer goroutine: everything we
-// need to atomically commit one DID's worth of work.
-type didBundle struct {
+// didChunk is one slice of a DID's bootstrap work handed to the writer
+// goroutine. Mega-followed DIDs (think bsky.app at 11M followers) would
+// blow up memory if we accumulated everything before committing, so the
+// worker streams Constellation pages and emits a chunk per page or so.
+//
+// final marks the last chunk for did. Only on a final chunk does the
+// writer mark bootstrap_progress and ensure the bare actor row exists.
+// INSERT OR REPLACE on (src_did_id, rkey) makes mid-DID crashes
+// idempotent against the resume re-fetch.
+type didChunk struct {
 	did     string
 	profile *model.Profile
 	follows []model.Follow
 	blocks  []model.Block
+	final   bool
 }
 
-// commitBundle writes a bundle in a transaction and marks the DID complete.
-func (s *store) commitBundle(ctx context.Context, b didBundle) error {
+// commitChunk writes one chunk in a transaction. When chunk.final is
+// true, also ensures the actor row exists and marks bootstrap_progress.
+func (s *store) commitChunk(ctx context.Context, c didChunk) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -161,49 +170,52 @@ func (s *store) commitBundle(ctx context.Context, b didBundle) error {
 		}
 	}()
 
-	if b.profile != nil {
-		p := b.profile
+	if c.profile != nil {
+		p := c.profile
 		if _, err := tx.ExecContext(ctx,
 			`INSERT OR REPLACE INTO actors(did_id, did, handle, display_name, description, avatar_cid, banner_cid, created_at, indexed_at, source)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			p.DIDID, p.DID, p.Handle, p.DisplayName, p.Description, p.AvatarCID, p.BannerCID, p.CreatedAt, p.IndexedAt, p.Source,
 		); err != nil {
-			return fmt.Errorf("insert actor %s: %w", b.did, err)
-		}
-	} else {
-		// We always want at least the DID row in actors so downstream joins
-		// don't lose the DID even if the user has no public profile.
-		if _, err := tx.ExecContext(ctx,
-			`INSERT OR IGNORE INTO actors(did_id, did, indexed_at, source) VALUES (?, ?, ?, ?)`,
-			internDID(b.did), b.did, time.Now().UTC(), model.SourceBootstrap,
-		); err != nil {
-			return fmt.Errorf("insert minimal actor %s: %w", b.did, err)
+			return fmt.Errorf("insert actor %s: %w", c.did, err)
 		}
 	}
 
-	for _, f := range b.follows {
+	for _, f := range c.follows {
 		if _, err := tx.ExecContext(ctx,
 			`INSERT OR REPLACE INTO follows(src_did_id, rkey, dst_did_id, src_did, dst_did, created_at, indexed_at, source)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 			f.SrcDIDID, f.RKey, f.DstDIDID, f.SrcDID, f.DstDID, f.CreatedAt, f.IndexedAt, f.Source,
 		); err != nil {
-			return fmt.Errorf("insert follow %s/%s: %w", b.did, f.RKey, err)
+			return fmt.Errorf("insert follow %s/%s: %w", c.did, f.RKey, err)
 		}
 	}
-	for _, bl := range b.blocks {
+	for _, bl := range c.blocks {
 		if _, err := tx.ExecContext(ctx,
 			`INSERT OR REPLACE INTO blocks(src_did_id, rkey, dst_did_id, src_did, dst_did, created_at, indexed_at, source)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 			bl.SrcDIDID, bl.RKey, bl.DstDIDID, bl.SrcDID, bl.DstDID, bl.CreatedAt, bl.IndexedAt, bl.Source,
 		); err != nil {
-			return fmt.Errorf("insert block %s/%s: %w", b.did, bl.RKey, err)
+			return fmt.Errorf("insert block %s/%s: %w", c.did, bl.RKey, err)
 		}
 	}
 
-	if _, err := tx.ExecContext(ctx,
-		`INSERT OR REPLACE INTO bootstrap_progress(did, completed_at) VALUES (?, ?)`,
-		b.did, time.Now().UTC()); err != nil {
-		return fmt.Errorf("mark progress %s: %w", b.did, err)
+	if c.final {
+		// Always ensure the actor row exists — if no profile was seen for
+		// this DID across any chunk, write a minimal row so downstream
+		// joins don't lose the DID. INSERT OR IGNORE makes this a no-op
+		// when an earlier chunk already wrote the full profile row.
+		if _, err := tx.ExecContext(ctx,
+			`INSERT OR IGNORE INTO actors(did_id, did, indexed_at, source) VALUES (?, ?, ?, ?)`,
+			internDID(c.did), c.did, time.Now().UTC(), model.SourceBootstrap,
+		); err != nil {
+			return fmt.Errorf("insert minimal actor %s: %w", c.did, err)
+		}
+		if _, err := tx.ExecContext(ctx,
+			`INSERT OR REPLACE INTO bootstrap_progress(did, completed_at) VALUES (?, ?)`,
+			c.did, time.Now().UTC()); err != nil {
+			return fmt.Errorf("mark progress %s: %w", c.did, err)
+		}
 	}
 
 	if err := tx.Commit(); err != nil {

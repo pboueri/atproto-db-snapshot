@@ -21,7 +21,7 @@ import (
 
 	"github.com/pboueri/atproto-db-snapshot/internal/bootstrap"
 	"github.com/pboueri/atproto-db-snapshot/internal/config"
-	"github.com/pboueri/atproto-db-snapshot/internal/repo"
+	"github.com/pboueri/atproto-db-snapshot/internal/constellation"
 	"github.com/pboueri/atproto-db-snapshot/internal/intern"
 	"github.com/pboueri/atproto-db-snapshot/internal/jetstream"
 	"github.com/pboueri/atproto-db-snapshot/internal/model"
@@ -29,6 +29,7 @@ import (
 	"github.com/pboueri/atproto-db-snapshot/internal/objstore"
 	"github.com/pboueri/atproto-db-snapshot/internal/plc"
 	"github.com/pboueri/atproto-db-snapshot/internal/runcmd"
+	"github.com/pboueri/atproto-db-snapshot/internal/slingshot"
 	"github.com/pboueri/atproto-db-snapshot/internal/snapshot"
 )
 
@@ -53,30 +54,42 @@ func TestPipelineEndToEnd(t *testing.T) {
 	// --- bootstrap ---
 	bootstrapPLCFake := plc.NewFake(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
 		[]string{"did:plc:alice", "did:plc:bob", "did:plc:carol"})
-	con := repo.NewFake()
-	con.Set("did:plc:alice", model.CollectionProfile, []repo.Record{
-		{URI: "at://did:plc:alice/app.bsky.actor.profile/self",
-			Value: json.RawMessage(`{"displayName":"Alice","createdAt":"2025-12-01T00:00:00Z"}`)},
+
+	// Profiles via Slingshot.
+	sling := slingshot.NewFake()
+	sling.Set("did:plc:alice", string(model.CollectionProfile), "self", slingshot.Record{
+		URI: "at://did:plc:alice/app.bsky.actor.profile/self",
+		Value: json.RawMessage(`{"displayName":"Alice","createdAt":"2025-12-01T00:00:00Z"}`),
 	})
-	con.Set("did:plc:bob", model.CollectionProfile, []repo.Record{
-		{URI: "at://did:plc:bob/app.bsky.actor.profile/self",
-			Value: json.RawMessage(`{"displayName":"Bob"}`)},
+	sling.Set("did:plc:bob", string(model.CollectionProfile), "self", slingshot.Record{
+		URI: "at://did:plc:bob/app.bsky.actor.profile/self",
+		Value: json.RawMessage(`{"displayName":"Bob"}`),
 	})
-	con.Set("did:plc:carol", model.CollectionProfile, []repo.Record{
-		{URI: "at://did:plc:carol/app.bsky.actor.profile/self",
-			Value: json.RawMessage(`{"displayName":"Carol"}`)},
+	sling.Set("did:plc:carol", string(model.CollectionProfile), "self", slingshot.Record{
+		URI: "at://did:plc:carol/app.bsky.actor.profile/self",
+		Value: json.RawMessage(`{"displayName":"Carol"}`),
 	})
-	con.Set("did:plc:alice", model.CollectionFollow, []repo.Record{
-		{URI: "at://did:plc:alice/app.bsky.graph.follow/r1",
-			Value: json.RawMessage(`{"subject":"did:plc:bob","createdAt":"2026-01-15T00:00:00Z"}`)},
+
+	// Follows via Constellation, target-indexed: edge (alice → bob) is
+	// captured when bob is the target; edge (bob → alice) when alice is
+	// the target. Block (carol → alice) is on alice's incoming bundle.
+	// Real Constellation responses don't include createdAt, so the rkey
+	// is the only timestamp signal — we use real TIDs that decode to
+	// 2024-10 to keep the schema realistic. The aliceFollowsBobRKey is
+	// shared with the firehose deleteF event below to verify tombstone
+	// reconciliation.
+	const aliceFollowsBobRKey = "3l6oveex3ii2l"
+	const bobFollowsAliceRKey = "3l6oveex3ii2m"
+	const carolBlocksAliceRKey = "3l6oveex3ii2n"
+	con := constellation.NewFake()
+	con.Set("did:plc:bob", string(model.CollectionFollow), ".subject", []constellation.Link{
+		{DID: "did:plc:alice", Collection: string(model.CollectionFollow), RKey: aliceFollowsBobRKey},
 	})
-	con.Set("did:plc:bob", model.CollectionFollow, []repo.Record{
-		{URI: "at://did:plc:bob/app.bsky.graph.follow/r1",
-			Value: json.RawMessage(`{"subject":"did:plc:alice","createdAt":"2026-01-16T00:00:00Z"}`)},
+	con.Set("did:plc:alice", string(model.CollectionFollow), ".subject", []constellation.Link{
+		{DID: "did:plc:bob", Collection: string(model.CollectionFollow), RKey: bobFollowsAliceRKey},
 	})
-	con.Set("did:plc:carol", model.CollectionBlock, []repo.Record{
-		{URI: "at://did:plc:carol/app.bsky.graph.block/r1",
-			Value: json.RawMessage(`{"subject":"did:plc:alice","createdAt":"2026-02-01T00:00:00Z"}`)},
+	con.Set("did:plc:alice", string(model.CollectionBlock), ".subject", []constellation.Link{
+		{DID: "did:plc:carol", Collection: string(model.CollectionBlock), RKey: carolBlocksAliceRKey},
 	})
 
 	cfg := config.Config{
@@ -92,7 +105,7 @@ func TestPipelineEndToEnd(t *testing.T) {
 		MonitorAddr:       ":0",
 	}
 	if err := bootstrap.RunWith(context.Background(), cfg, bootstrap.Deps{
-		PLC: bootstrapPLCFake, Repo: con, ObjStore: obj, Now: nowFn,
+		PLC: bootstrapPLCFake, Slingshot: sling, Constellation: con, ObjStore: obj, Now: nowFn,
 	}); err != nil {
 		t.Fatalf("bootstrap: %v", err)
 	}
@@ -117,12 +130,13 @@ func TestPipelineEndToEnd(t *testing.T) {
 	followF1 := commit("did:plc:carol", string(model.CollectionFollow), "f1", jetstream.OpCreate,
 		`{"subject":"did:plc:bob","createdAt":"2026-04-25T10:00:00Z"}`,
 		fixedNow.Add(-26*time.Hour)) // yesterday
-	// Delete one bootstrap follow (alice unfollows bob).
+	// Delete one bootstrap follow (alice unfollows bob). The rkey must
+	// match the one set via Constellation above so the tombstone hits.
 	deleteF := jetstream.Event{
 		DID:    "did:plc:alice",
 		TimeUS: fixedNow.Add(-2 * time.Hour).UnixMicro(),
 		Kind:   jetstream.KindCommit,
-		Commit: &jetstream.Commit{Operation: jetstream.OpDelete, Collection: string(model.CollectionFollow), RKey: "r1"},
+		Commit: &jetstream.Commit{Operation: jetstream.OpDelete, Collection: string(model.CollectionFollow), RKey: aliceFollowsBobRKey},
 	}
 	events := []jetstream.Event{postP1, postP2, postP3, likeL1, repostR1, followF1, deleteF}
 	sub := jetstream.NewFake(events)
@@ -287,13 +301,14 @@ func TestPipelineInterruptResumeBootstrap(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	con := repo.NewFake()
+	sling := slingshot.NewFake()
 	for _, d := range []string{"did:plc:a", "did:plc:b", "did:plc:c"} {
-		con.Set(d, model.CollectionProfile, []repo.Record{
-			{URI: "at://" + d + "/app.bsky.actor.profile/self",
-				Value: json.RawMessage(`{"displayName":"x"}`)},
+		sling.Set(d, string(model.CollectionProfile), "self", slingshot.Record{
+			URI: "at://" + d + "/app.bsky.actor.profile/self",
+			Value: json.RawMessage(`{"displayName":"x"}`),
 		})
 	}
+	con := constellation.NewFake()
 	cfg := config.Config{
 		DataDir:         dataDir,
 		ObjectStore:     "local",
@@ -304,35 +319,41 @@ func TestPipelineInterruptResumeBootstrap(t *testing.T) {
 		StatsInterval:   time.Hour,
 	}
 
-	// First run: simulate a transient failure on did:plc:b. The fetcher logs
-	// and skips; only a and c land in bootstrap_progress.
-	con.FailOnce["did:plc:b"] = true
+	// First run: simulate a transient failure on did:plc:b's profile fetch.
+	// The fetcher still emits a final chunk for did:plc:b (so we don't loop
+	// forever on broken upstreams), so all three land in bootstrap_progress
+	// — but only a and c successfully fetched a profile.
+	sling.FailOnce["did:plc:b"] = true
 	if err := bootstrap.RunWith(context.Background(), cfg, bootstrap.Deps{
 		PLC:           plc.NewFake(time.Now(), []string{"did:plc:a", "did:plc:b", "did:plc:c"}),
-		Repo: con, ObjStore: obj, Now: nowFn,
+		Slingshot:     sling,
+		Constellation: con,
+		ObjStore:      obj,
+		Now:           nowFn,
 	}); err != nil {
 		t.Fatalf("first run: %v", err)
 	}
-	if con.FailOnce["did:plc:b"] {
+	if sling.FailOnce["did:plc:b"] {
 		t.Errorf("FailOnce on did:plc:b never consumed (no fetch attempted)")
 	}
 
-	// Second run: re-run with the same PLC list. did:plc:b should now be
-	// the only DID we fetch; FailOnce is cleared so the fetch succeeds.
-	// Re-create FailOnce on did:plc:a as a tripwire — if the resume re-
-	// fetched it, the test fails.
-	con.FailOnce["did:plc:a"] = true
-	// Have to delete the remote baseline since the first run uploaded it.
+	// Second run: PLC has the same three DIDs. All are already in
+	// bootstrap_progress, so the producer skips them. FailOnce on
+	// did:plc:a as a tripwire: if the resume re-fetched, the test fails.
+	sling.FailOnce["did:plc:a"] = true
 	if err := obj.Delete(context.Background(), "bootstrap/2026-04-26/social_graph.duckdb"); err != nil {
 		t.Fatal(err)
 	}
 	if err := bootstrap.RunWith(context.Background(), cfg, bootstrap.Deps{
 		PLC:           plc.NewFake(time.Now(), []string{"did:plc:a", "did:plc:b", "did:plc:c"}),
-		Repo: con, ObjStore: obj, Now: nowFn,
+		Slingshot:     sling,
+		Constellation: con,
+		ObjStore:      obj,
+		Now:           nowFn,
 	}); err != nil {
 		t.Fatalf("second run: %v", err)
 	}
-	if !con.FailOnce["did:plc:a"] {
+	if !sling.FailOnce["did:plc:a"] {
 		t.Errorf("resume incorrectly re-fetched did:plc:a")
 	}
 

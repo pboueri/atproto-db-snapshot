@@ -102,6 +102,46 @@ func TestDecodeLike(t *testing.T) {
 	}
 }
 
+func TestTIDToTime(t *testing.T) {
+	// 3l6oveex3ii2l is the rkey of bsky.app's pinned post; it decodes to a
+	// 2024-era microsecond timestamp.
+	got, ok := TIDToTime("3l6oveex3ii2l")
+	if !ok {
+		t.Fatalf("TIDToTime returned ok=false on a valid TID")
+	}
+	if got.Year() != 2024 {
+		t.Errorf("TIDToTime year = %d, want 2024", got.Year())
+	}
+	if _, ok := TIDToTime(""); ok {
+		t.Errorf("empty rkey should return ok=false")
+	}
+	if _, ok := TIDToTime("not-a-tid-13c"); ok {
+		t.Errorf("bad-alphabet rkey should return ok=false")
+	}
+	if _, ok := TIDToTime("3l6oveex3ii2"); ok {
+		t.Errorf("12-char rkey should return ok=false")
+	}
+}
+
+func TestBuildFollowFromBacklink(t *testing.T) {
+	indexedAt := time.Date(2026, 4, 26, 0, 0, 0, 0, time.UTC)
+	f := BuildFollowFromBacklink("did:plc:src", "did:plc:dst", "3l6oveex3ii2l", indexedAt, model.SourceBootstrap)
+	if f.SrcDID != "did:plc:src" || f.DstDID != "did:plc:dst" || f.RKey != "3l6oveex3ii2l" {
+		t.Errorf("fields = %+v", f)
+	}
+	if f.CreatedAt.Year() != 2024 {
+		t.Errorf("CreatedAt should derive from TID; got %v", f.CreatedAt)
+	}
+	if f.SrcDIDID == 0 || f.DstDIDID == 0 {
+		t.Errorf("ids not interned")
+	}
+	// Bad rkey → CreatedAt falls back to indexedAt.
+	bad := BuildFollowFromBacklink("did:plc:src", "did:plc:dst", "not-a-tid", indexedAt, model.SourceBootstrap)
+	if !bad.CreatedAt.Equal(indexedAt) {
+		t.Errorf("bad rkey CreatedAt = %v, want indexedAt fallback", bad.CreatedAt)
+	}
+}
+
 func TestFlexTimeTolerance(t *testing.T) {
 	for _, s := range []string{
 		`"2026-04-01T00:00:00Z"`,
