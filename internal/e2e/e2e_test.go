@@ -21,7 +21,7 @@ import (
 
 	"github.com/pboueri/atproto-db-snapshot/internal/bootstrap"
 	"github.com/pboueri/atproto-db-snapshot/internal/config"
-	"github.com/pboueri/atproto-db-snapshot/internal/constellation"
+	"github.com/pboueri/atproto-db-snapshot/internal/repo"
 	"github.com/pboueri/atproto-db-snapshot/internal/intern"
 	"github.com/pboueri/atproto-db-snapshot/internal/jetstream"
 	"github.com/pboueri/atproto-db-snapshot/internal/model"
@@ -53,28 +53,28 @@ func TestPipelineEndToEnd(t *testing.T) {
 	// --- bootstrap ---
 	bootstrapPLCFake := plc.NewFake(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
 		[]string{"did:plc:alice", "did:plc:bob", "did:plc:carol"})
-	con := constellation.NewFake()
-	con.Set("did:plc:alice", model.CollectionProfile, []constellation.Record{
+	con := repo.NewFake()
+	con.Set("did:plc:alice", model.CollectionProfile, []repo.Record{
 		{URI: "at://did:plc:alice/app.bsky.actor.profile/self",
 			Value: json.RawMessage(`{"displayName":"Alice","createdAt":"2025-12-01T00:00:00Z"}`)},
 	})
-	con.Set("did:plc:bob", model.CollectionProfile, []constellation.Record{
+	con.Set("did:plc:bob", model.CollectionProfile, []repo.Record{
 		{URI: "at://did:plc:bob/app.bsky.actor.profile/self",
 			Value: json.RawMessage(`{"displayName":"Bob"}`)},
 	})
-	con.Set("did:plc:carol", model.CollectionProfile, []constellation.Record{
+	con.Set("did:plc:carol", model.CollectionProfile, []repo.Record{
 		{URI: "at://did:plc:carol/app.bsky.actor.profile/self",
 			Value: json.RawMessage(`{"displayName":"Carol"}`)},
 	})
-	con.Set("did:plc:alice", model.CollectionFollow, []constellation.Record{
+	con.Set("did:plc:alice", model.CollectionFollow, []repo.Record{
 		{URI: "at://did:plc:alice/app.bsky.graph.follow/r1",
 			Value: json.RawMessage(`{"subject":"did:plc:bob","createdAt":"2026-01-15T00:00:00Z"}`)},
 	})
-	con.Set("did:plc:bob", model.CollectionFollow, []constellation.Record{
+	con.Set("did:plc:bob", model.CollectionFollow, []repo.Record{
 		{URI: "at://did:plc:bob/app.bsky.graph.follow/r1",
 			Value: json.RawMessage(`{"subject":"did:plc:alice","createdAt":"2026-01-16T00:00:00Z"}`)},
 	})
-	con.Set("did:plc:carol", model.CollectionBlock, []constellation.Record{
+	con.Set("did:plc:carol", model.CollectionBlock, []repo.Record{
 		{URI: "at://did:plc:carol/app.bsky.graph.block/r1",
 			Value: json.RawMessage(`{"subject":"did:plc:alice","createdAt":"2026-02-01T00:00:00Z"}`)},
 	})
@@ -92,7 +92,7 @@ func TestPipelineEndToEnd(t *testing.T) {
 		MonitorAddr:       ":0",
 	}
 	if err := bootstrap.RunWith(context.Background(), cfg, bootstrap.Deps{
-		PLC: bootstrapPLCFake, Constellation: con, ObjStore: obj, Now: nowFn,
+		PLC: bootstrapPLCFake, Repo: con, ObjStore: obj, Now: nowFn,
 	}); err != nil {
 		t.Fatalf("bootstrap: %v", err)
 	}
@@ -287,9 +287,9 @@ func TestPipelineInterruptResumeBootstrap(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	con := constellation.NewFake()
+	con := repo.NewFake()
 	for _, d := range []string{"did:plc:a", "did:plc:b", "did:plc:c"} {
-		con.Set(d, model.CollectionProfile, []constellation.Record{
+		con.Set(d, model.CollectionProfile, []repo.Record{
 			{URI: "at://" + d + "/app.bsky.actor.profile/self",
 				Value: json.RawMessage(`{"displayName":"x"}`)},
 		})
@@ -309,7 +309,7 @@ func TestPipelineInterruptResumeBootstrap(t *testing.T) {
 	con.FailOnce["did:plc:b"] = true
 	if err := bootstrap.RunWith(context.Background(), cfg, bootstrap.Deps{
 		PLC:           plc.NewFake(time.Now(), []string{"did:plc:a", "did:plc:b", "did:plc:c"}),
-		Constellation: con, ObjStore: obj, Now: nowFn,
+		Repo: con, ObjStore: obj, Now: nowFn,
 	}); err != nil {
 		t.Fatalf("first run: %v", err)
 	}
@@ -328,7 +328,7 @@ func TestPipelineInterruptResumeBootstrap(t *testing.T) {
 	}
 	if err := bootstrap.RunWith(context.Background(), cfg, bootstrap.Deps{
 		PLC:           plc.NewFake(time.Now(), []string{"did:plc:a", "did:plc:b", "did:plc:c"}),
-		Constellation: con, ObjStore: obj, Now: nowFn,
+		Repo: con, ObjStore: obj, Now: nowFn,
 	}); err != nil {
 		t.Fatalf("second run: %v", err)
 	}

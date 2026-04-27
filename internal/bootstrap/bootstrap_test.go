@@ -11,7 +11,7 @@ import (
 	_ "github.com/marcboeker/go-duckdb/v2"
 
 	"github.com/pboueri/atproto-db-snapshot/internal/config"
-	"github.com/pboueri/atproto-db-snapshot/internal/constellation"
+	"github.com/pboueri/atproto-db-snapshot/internal/repo"
 	"github.com/pboueri/atproto-db-snapshot/internal/model"
 	"github.com/pboueri/atproto-db-snapshot/internal/objstore"
 	"github.com/pboueri/atproto-db-snapshot/internal/plc"
@@ -26,37 +26,36 @@ func TestBootstrapEndToEndWithFakes(t *testing.T) {
 	}
 
 	plcFake := plc.NewFake(time.Date(2026, 4, 1, 0, 0, 0, 0, time.UTC), []string{"did:plc:a", "did:plc:b"})
-	con := constellation.NewFake()
+	con := repo.NewFake()
 
 	// Profile + 2 follows for did:plc:a; just a profile for did:plc:b.
-	con.Set("did:plc:a", model.CollectionProfile, []constellation.Record{
+	con.Set("did:plc:a", model.CollectionProfile, []repo.Record{
 		{URI: "at://did:plc:a/app.bsky.actor.profile/self", Value: json.RawMessage(`{"displayName":"Alice","createdAt":"2025-01-01T00:00:00Z"}`)},
 	})
-	con.Set("did:plc:a", model.CollectionFollow, []constellation.Record{
+	con.Set("did:plc:a", model.CollectionFollow, []repo.Record{
 		{URI: "at://did:plc:a/app.bsky.graph.follow/r1", Value: json.RawMessage(`{"subject":"did:plc:b","createdAt":"2025-01-02T00:00:00Z"}`)},
 		{URI: "at://did:plc:a/app.bsky.graph.follow/r2", Value: json.RawMessage(`{"subject":"did:plc:c","createdAt":"2025-01-03T00:00:00Z"}`)},
 	})
 	con.Set("did:plc:a", model.CollectionBlock, nil)
-	con.Set("did:plc:b", model.CollectionProfile, []constellation.Record{
+	con.Set("did:plc:b", model.CollectionProfile, []repo.Record{
 		{URI: "at://did:plc:b/app.bsky.actor.profile/self", Value: json.RawMessage(`{"displayName":"Bob"}`)},
 	})
 
 	cfg := config.Config{
-		DataDir:               dataDir,
-		ObjectStore:           "local",
-		ObjectStoreRoot:       objDir,
-		LookbackDays:          30,
-		Concurrency:           2,
-		LogLevel:              "info",
-		StatsInterval:         time.Hour,
-		PLCEndpoint:           "fake",
-		ConstellationEndpoint: "fake",
+		DataDir:         dataDir,
+		ObjectStore:     "local",
+		ObjectStoreRoot: objDir,
+		LookbackDays:    30,
+		Concurrency:     2,
+		LogLevel:        "info",
+		StatsInterval:   time.Hour,
+		PLCEndpoint:     "fake",
 	}
 	deps := Deps{
-		PLC:           plcFake,
-		Constellation: con,
-		ObjStore:      obj,
-		Now:           func() time.Time { return time.Date(2026, 4, 26, 12, 0, 0, 0, time.UTC) },
+		PLC:      plcFake,
+		Repo:     con,
+		ObjStore: obj,
+		Now:      func() time.Time { return time.Date(2026, 4, 26, 12, 0, 0, 0, time.UTC) },
 	}
 
 	if err := RunWith(context.Background(), cfg, deps); err != nil {
@@ -105,11 +104,11 @@ func TestBootstrapResumeSkipsCompleted(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	con := constellation.NewFake()
-	con.Set("did:plc:a", model.CollectionProfile, []constellation.Record{
+	con := repo.NewFake()
+	con.Set("did:plc:a", model.CollectionProfile, []repo.Record{
 		{URI: "at://did:plc:a/app.bsky.actor.profile/self", Value: json.RawMessage(`{"displayName":"Alice"}`)},
 	})
-	con.Set("did:plc:b", model.CollectionProfile, []constellation.Record{
+	con.Set("did:plc:b", model.CollectionProfile, []repo.Record{
 		{URI: "at://did:plc:b/app.bsky.actor.profile/self", Value: json.RawMessage(`{"displayName":"Bob"}`)},
 	})
 
@@ -125,10 +124,10 @@ func TestBootstrapResumeSkipsCompleted(t *testing.T) {
 
 	// First pass: only DID a is in PLC, succeeds.
 	deps1 := Deps{
-		PLC:           plc.NewFake(time.Now(), []string{"did:plc:a"}),
-		Constellation: con,
-		ObjStore:      obj,
-		Now:           func() time.Time { return time.Date(2026, 4, 26, 12, 0, 0, 0, time.UTC) },
+		PLC:      plc.NewFake(time.Now(), []string{"did:plc:a"}),
+		Repo:     con,
+		ObjStore: obj,
+		Now:      func() time.Time { return time.Date(2026, 4, 26, 12, 0, 0, 0, time.UTC) },
 	}
 	if err := RunWith(context.Background(), cfg, deps1); err != nil {
 		t.Fatalf("first run: %v", err)
@@ -144,10 +143,10 @@ func TestBootstrapResumeSkipsCompleted(t *testing.T) {
 	// FailOnce on did:plc:a so we'd notice if the resume path re-fetched it.
 	con.FailOnce["did:plc:a"] = true
 	deps2 := Deps{
-		PLC:           plc.NewFake(time.Now(), []string{"did:plc:a", "did:plc:b"}),
-		Constellation: con,
-		ObjStore:      obj,
-		Now:           func() time.Time { return time.Date(2026, 4, 26, 12, 0, 0, 0, time.UTC) },
+		PLC:      plc.NewFake(time.Now(), []string{"did:plc:a", "did:plc:b"}),
+		Repo:     con,
+		ObjStore: obj,
+		Now:      func() time.Time { return time.Date(2026, 4, 26, 12, 0, 0, 0, time.UTC) },
 	}
 	if err := RunWith(context.Background(), cfg, deps2); err != nil {
 		t.Fatalf("second run: %v", err)
@@ -179,10 +178,10 @@ func TestBootstrapRefusesToOverwrite(t *testing.T) {
 	}
 	now := time.Date(2026, 4, 26, 12, 0, 0, 0, time.UTC)
 	deps := Deps{
-		PLC:           plc.NewFake(now, []string{"did:plc:a"}),
-		Constellation: constellation.NewFake(),
-		ObjStore:      obj,
-		Now:           func() time.Time { return now },
+		PLC:      plc.NewFake(now, []string{"did:plc:a"}),
+		Repo:     repo.NewFake(),
+		ObjStore: obj,
+		Now:      func() time.Time { return now },
 	}
 
 	// First run uploads.

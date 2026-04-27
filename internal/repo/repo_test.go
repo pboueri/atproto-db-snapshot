@@ -1,4 +1,4 @@
-package constellation
+package repo
 
 import (
 	"context"
@@ -23,7 +23,6 @@ func TestHTTPListRecordsPaginates(t *testing.T) {
 			http.Error(w, "bad repo", 400)
 			return
 		}
-		// Simulate two pages: 2 records, then 1 record, then empty.
 		page := q.Get("cursor")
 		w.Header().Set("Content-Type", "application/json")
 		switch page {
@@ -45,8 +44,8 @@ func TestHTTPListRecordsPaginates(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := &HTTPClient{BaseURL: srv.URL, HTTP: srv.Client(), PageSize: 2}
-	got, err := c.ListRecords(context.Background(), "did:plc:abc", model.CollectionFollow)
+	c := &HTTPClient{HTTP: srv.Client(), PageSize: 2}
+	got, err := c.ListRecords(context.Background(), srv.URL, "did:plc:abc", model.CollectionFollow)
 	if err != nil {
 		t.Fatalf("ListRecords: %v", err)
 	}
@@ -71,8 +70,8 @@ func TestHTTPListRecords404IsEmpty(t *testing.T) {
 		http.Error(w, "deactivated", http.StatusNotFound)
 	}))
 	defer srv.Close()
-	c := &HTTPClient{BaseURL: srv.URL, HTTP: srv.Client()}
-	got, err := c.ListRecords(context.Background(), "did:plc:gone", model.CollectionFollow)
+	c := &HTTPClient{HTTP: srv.Client()}
+	got, err := c.ListRecords(context.Background(), srv.URL, "did:plc:gone", model.CollectionFollow)
 	if err != nil {
 		t.Fatalf("err = %v, want nil", err)
 	}
@@ -81,15 +80,26 @@ func TestHTTPListRecords404IsEmpty(t *testing.T) {
 	}
 }
 
+func TestHTTPListRecordsEmptyPDS(t *testing.T) {
+	c := &HTTPClient{}
+	got, err := c.ListRecords(context.Background(), "", "did:plc:x", model.CollectionFollow)
+	if err != nil {
+		t.Fatalf("err = %v, want nil", err)
+	}
+	if got != nil {
+		t.Errorf("len = %d, want nil (empty pds short-circuits)", len(got))
+	}
+}
+
 func TestFakeFailOnce(t *testing.T) {
 	f := NewFake()
 	f.FailOnce["did:plc:x"] = true
 	f.Set("did:plc:x", model.CollectionProfile, []Record{{URI: "at://did:plc:x/app.bsky.actor.profile/self"}})
 
-	if _, err := f.ListRecords(context.Background(), "did:plc:x", model.CollectionProfile); err == nil {
+	if _, err := f.ListRecords(context.Background(), "irrelevant", "did:plc:x", model.CollectionProfile); err == nil {
 		t.Fatalf("expected first call to fail")
 	}
-	got, err := f.ListRecords(context.Background(), "did:plc:x", model.CollectionProfile)
+	got, err := f.ListRecords(context.Background(), "irrelevant", "did:plc:x", model.CollectionProfile)
 	if err != nil {
 		t.Fatalf("second call: %v", err)
 	}

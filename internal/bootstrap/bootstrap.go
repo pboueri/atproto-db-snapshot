@@ -40,18 +40,18 @@ import (
 
 	"github.com/pboueri/atproto-db-snapshot/internal/atrecord"
 	"github.com/pboueri/atproto-db-snapshot/internal/config"
-	"github.com/pboueri/atproto-db-snapshot/internal/constellation"
 	"github.com/pboueri/atproto-db-snapshot/internal/model"
 	"github.com/pboueri/atproto-db-snapshot/internal/objstore"
 	"github.com/pboueri/atproto-db-snapshot/internal/plc"
+	"github.com/pboueri/atproto-db-snapshot/internal/repo"
 )
 
 // Deps lets tests inject fake source clients and object stores. Run wires
 // production defaults via FromConfig.
 type Deps struct {
-	PLC           plc.Directory
-	Constellation constellation.Client
-	ObjStore      objstore.Store
+	PLC      plc.Directory
+	Repo     repo.Client
+	ObjStore objstore.Store
 	// Now lets tests pin the partition date the bootstrap publishes under.
 	Now func() time.Time
 }
@@ -63,10 +63,10 @@ func Run(ctx context.Context, cfg config.Config) error {
 		return err
 	}
 	deps := Deps{
-		PLC:           plc.NewHTTP(cfg.PLCEndpoint),
-		Constellation: constellation.NewHTTP(cfg.ConstellationEndpoint),
-		ObjStore:      obj,
-		Now:           func() time.Time { return time.Now().UTC() },
+		PLC:      plc.NewHTTP(cfg.PLCEndpoint),
+		Repo:     repo.NewHTTP(),
+		ObjStore: obj,
+		Now:      func() time.Time { return time.Now().UTC() },
 	}
 	return RunWith(ctx, cfg, deps)
 }
@@ -98,7 +98,7 @@ func RunWith(ctx context.Context, cfg config.Config, deps Deps) error {
 	}
 	defer closeOnce()
 
-	if err := st.MarkStarted(ctx, cfg.PLCEndpoint, cfg.ConstellationEndpoint); err != nil {
+	if err := st.MarkStarted(ctx, cfg.PLCEndpoint, "pds:listRecords"); err != nil {
 		return err
 	}
 	completed, err := st.CompletedDIDs(ctx)
@@ -107,8 +107,10 @@ func RunWith(ctx context.Context, cfg config.Config, deps Deps) error {
 	}
 	slog.Info("bootstrap resume state", "already_complete", len(completed))
 
-	// Channels: PLC stream -> dids; workers -> bundles -> writer.
-	dids := make(chan string, cfg.Concurrency*4)
+	// Channels: PLC stream -> jobs; workers -> bundles -> writer.
+	// Each job carries the DID and the resolved PDS endpoint from PLC; a
+	// DID without a PDS (tombstoned) is dropped at producer time.
+	jobs := make(chan plc.Entry, cfg.Concurrency*4)
 	bundles := make(chan didBundle, cfg.Concurrency*4)
 
 	var (
@@ -123,10 +125,15 @@ func RunWith(ctx context.Context, cfg config.Config, deps Deps) error {
 	// cap exists to bound new fetch work).
 	prodErr := make(chan error, 1)
 	go func() {
-		defer close(dids)
+		defer close(jobs)
 		yielded := 0
 		err := deps.PLC.Stream(ctx, time.Time{}, func(e plc.Entry) bool {
 			if _, ok := completed[e.DID]; ok {
+				return true
+			}
+			if e.PDS == "" {
+				// Tombstoned or pre-v2 DIDs without a current PDS — skip
+				// rather than queue a doomed listRecords job.
 				return true
 			}
 			if cfg.MaxDIDs > 0 && yielded >= cfg.MaxDIDs {
@@ -135,7 +142,7 @@ func RunWith(ctx context.Context, cfg config.Config, deps Deps) error {
 			select {
 			case <-ctx.Done():
 				return false
-			case dids <- e.DID:
+			case jobs <- e:
 				yielded++
 				return true
 			}
@@ -147,7 +154,7 @@ func RunWith(ctx context.Context, cfg config.Config, deps Deps) error {
 	workersDone := make(chan struct{})
 	go func() {
 		defer close(workersDone)
-		startWorkers(ctx, cfg.Concurrency, dids, bundles, deps, &fetched, &fetchErrs)
+		startWorkers(ctx, cfg.Concurrency, jobs, bundles, deps, &fetched, &fetchErrs)
 	}()
 
 	// Writer: drain bundles until workers close the channel.
@@ -213,7 +220,7 @@ func RunWith(ctx context.Context, cfg config.Config, deps Deps) error {
 }
 
 // startWorkers fans out fetch goroutines; closes bundles once all workers exit.
-func startWorkers(ctx context.Context, n int, dids <-chan string, bundles chan<- didBundle, deps Deps, fetched, fetchErrs *atomic.Int64) {
+func startWorkers(ctx context.Context, n int, jobs <-chan plc.Entry, bundles chan<- didBundle, deps Deps, fetched, fetchErrs *atomic.Int64) {
 	done := make(chan struct{}, n)
 	for i := 0; i < n; i++ {
 		go func() {
@@ -222,14 +229,14 @@ func startWorkers(ctx context.Context, n int, dids <-chan string, bundles chan<-
 				select {
 				case <-ctx.Done():
 					return
-				case did, ok := <-dids:
+				case job, ok := <-jobs:
 					if !ok {
 						return
 					}
-					b, err := fetchBundle(ctx, deps, did)
+					b, err := fetchBundle(ctx, deps, job)
 					if err != nil {
 						fetchErrs.Add(1)
-						slog.Warn("bootstrap fetch error", "did", did, "err", err)
+						slog.Warn("bootstrap fetch error", "did", job.DID, "pds", job.PDS, "err", err)
 						continue
 					}
 					fetched.Add(1)
@@ -247,20 +254,20 @@ func startWorkers(ctx context.Context, n int, dids <-chan string, bundles chan<-
 	}
 }
 
-// fetchBundle pulls profile + follows + blocks for a single DID. Failures on
-// individual collections are logged and zeroed out — a deactivated repo, for
-// example, may have one collection but not others. The progress row still
-// gets written because we'd rather make forward progress than block on
-// flaky individual collections.
-func fetchBundle(ctx context.Context, deps Deps, did string) (didBundle, error) {
+// fetchBundle pulls profile + follows + blocks for a single DID off its
+// home PDS. Failures on individual collections are logged but don't fail the
+// bundle — a deactivated repo, for example, may have one collection
+// returning 4xx but others succeeding. The progress row still gets written
+// because we'd rather make forward progress than block on flaky individuals.
+func fetchBundle(ctx context.Context, deps Deps, job plc.Entry) (didBundle, error) {
 	now := deps.Now()
-	b := didBundle{did: did}
+	b := didBundle{did: job.DID}
 
-	if profileRecs, err := deps.Constellation.ListRecords(ctx, did, model.CollectionProfile); err == nil {
+	if profileRecs, err := deps.Repo.ListRecords(ctx, job.PDS, job.DID, model.CollectionProfile); err == nil {
 		if len(profileRecs) > 0 {
 			// app.bsky.actor.profile is a singleton-ish: rkey "self".
 			rec := profileRecs[0]
-			p, derr := atrecord.DecodeProfile(rec.Value, did, now, model.SourceBootstrap)
+			p, derr := atrecord.DecodeProfile(rec.Value, job.DID, now, model.SourceBootstrap)
 			if derr != nil {
 				return didBundle{}, derr
 			}
@@ -270,11 +277,11 @@ func fetchBundle(ctx context.Context, deps Deps, did string) (didBundle, error) 
 		return didBundle{}, fmt.Errorf("profile fetch: %w", err)
 	}
 
-	if followRecs, err := deps.Constellation.ListRecords(ctx, did, model.CollectionFollow); err == nil {
+	if followRecs, err := deps.Repo.ListRecords(ctx, job.PDS, job.DID, model.CollectionFollow); err == nil {
 		for _, r := range followRecs {
-			f, derr := atrecord.DecodeFollow(r.Value, did, r.RKey, now, model.SourceBootstrap)
+			f, derr := atrecord.DecodeFollow(r.Value, job.DID, r.RKey, now, model.SourceBootstrap)
 			if derr != nil {
-				slog.Warn("decode follow", "did", did, "rkey", r.RKey, "err", derr)
+				slog.Warn("decode follow", "did", job.DID, "rkey", r.RKey, "err", derr)
 				continue
 			}
 			b.follows = append(b.follows, f)
@@ -283,11 +290,11 @@ func fetchBundle(ctx context.Context, deps Deps, did string) (didBundle, error) 
 		return didBundle{}, fmt.Errorf("follow fetch: %w", err)
 	}
 
-	if blockRecs, err := deps.Constellation.ListRecords(ctx, did, model.CollectionBlock); err == nil {
+	if blockRecs, err := deps.Repo.ListRecords(ctx, job.PDS, job.DID, model.CollectionBlock); err == nil {
 		for _, r := range blockRecs {
-			bl, derr := atrecord.DecodeBlock(r.Value, did, r.RKey, now, model.SourceBootstrap)
+			bl, derr := atrecord.DecodeBlock(r.Value, job.DID, r.RKey, now, model.SourceBootstrap)
 			if derr != nil {
-				slog.Warn("decode block", "did", did, "rkey", r.RKey, "err", derr)
+				slog.Warn("decode block", "did", job.DID, "rkey", r.RKey, "err", derr)
 				continue
 			}
 			b.blocks = append(b.blocks, bl)

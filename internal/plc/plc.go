@@ -19,8 +19,14 @@ import (
 )
 
 // Entry is one row from the export — only the bits the snapshotter needs.
+//
+// PDS is the DID's current Personal Data Server endpoint, extracted from the
+// operation's `services.atproto_pds.endpoint` field. The bootstrap pipeline
+// dispatches listRecords calls to this URL, since each repo lives on its
+// home PDS rather than a centralized index.
 type Entry struct {
 	DID       string
+	PDS       string
 	CreatedAt time.Time
 }
 
@@ -56,9 +62,39 @@ func NewHTTP(base string) *HTTPDirectory {
 
 // rawOp is the subset of fields we read from the PLC export. The export
 // contains many other fields (operation, sig, prev, etc.) that we don't need.
+//
+// The Operation field is a sum type: a "plc_operation" carries Services with
+// the PDS endpoint; a "plc_tombstone" or older "create" formats may not.
+// We unmarshal everything as RawMessage and probe lazily so the unknown
+// shapes don't crash decoding.
 type rawOp struct {
-	DID       string    `json:"did"`
-	CreatedAt time.Time `json:"createdAt"`
+	DID       string          `json:"did"`
+	CreatedAt time.Time       `json:"createdAt"`
+	Operation json.RawMessage `json:"operation"`
+}
+
+// rawOpInner is the subset of operation fields we sniff for the PDS endpoint.
+type rawOpInner struct {
+	Type     string `json:"type"`
+	Services struct {
+		AtprotoPDS struct {
+			Endpoint string `json:"endpoint"`
+		} `json:"atproto_pds"`
+	} `json:"services"`
+}
+
+// extractPDS returns the PDS endpoint from a PLC operation, or "" if absent.
+// Tombstones and pre-v2 formats produce empty strings; the bootstrap caller
+// then skips that DID rather than fanning out a doomed listRecords.
+func extractPDS(op json.RawMessage) string {
+	if len(op) == 0 {
+		return ""
+	}
+	var inner rawOpInner
+	if err := json.Unmarshal(op, &inner); err != nil {
+		return ""
+	}
+	return inner.Services.AtprotoPDS.Endpoint
 }
 
 func (h *HTTPDirectory) Stream(ctx context.Context, since time.Time, yield func(Entry) bool) error {
@@ -141,7 +177,7 @@ func scanPage(r io.Reader, cursor time.Time, yield func(Entry) bool) (int, time.
 			lastSeen = op.CreatedAt
 			continue
 		}
-		if !yield(Entry{DID: op.DID, CreatedAt: op.CreatedAt}) {
+		if !yield(Entry{DID: op.DID, PDS: extractPDS(op.Operation), CreatedAt: op.CreatedAt}) {
 			return count, lastSeen, true, nil
 		}
 		count++

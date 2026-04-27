@@ -42,10 +42,11 @@ type Config struct {
 	// DuckDBMemoryLimit caps DuckDB working memory (e.g. "2GB"). Empty = no cap.
 	DuckDBMemoryLimit string
 
-	// PLCEndpoint, ConstellationEndpoint, JetstreamEndpoints are source URLs.
-	PLCEndpoint           string
-	ConstellationEndpoint string
-	JetstreamEndpoints    []string
+	// PLCEndpoint and JetstreamEndpoints are source URLs. Per-DID
+	// listRecords is dispatched to whatever PDS PLC reports for that DID,
+	// so there is no single repo-side endpoint here.
+	PLCEndpoint        string
+	JetstreamEndpoints []string
 
 	// Filters applied at write time on records that carry the metadata.
 	Languages       []string // default ["en"]
@@ -107,8 +108,6 @@ func ParseFlags(sub string, args []string) (Config, error) {
 
 	fs.StringVar(&cfg.PLCEndpoint, "plc-endpoint", envOr("AT_SNAPSHOT_PLC_ENDPOINT", "https://plc.directory"),
 		"PLC directory base URL")
-	fs.StringVar(&cfg.ConstellationEndpoint, "constellation-endpoint", envOr("AT_SNAPSHOT_CONSTELLATION_ENDPOINT", "https://constellation.microcosm.blue"),
-		"Constellation base URL")
 	jsDefault := envOr("AT_SNAPSHOT_JETSTREAM_ENDPOINTS",
 		"wss://jetstream1.us-east.bsky.network/subscribe,wss://jetstream2.us-east.bsky.network/subscribe,wss://jetstream1.us-west.bsky.network/subscribe,wss://jetstream2.us-west.bsky.network/subscribe")
 	jsCSV := fs.String("jetstream-endpoints", jsDefault,
