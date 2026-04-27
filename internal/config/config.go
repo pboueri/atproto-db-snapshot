@@ -56,6 +56,17 @@ type Config struct {
 	// Concurrency for fan-out work (bootstrap fetch, snapshot reads).
 	Concurrency int
 
+	// MaxDIDs caps the number of DIDs the bootstrap consumes from PLC.
+	// Zero means unlimited (the production case). Set to a small value to
+	// validate the pipeline against real services without pulling the full
+	// millions-strong export.
+	MaxDIDs int
+
+	// RunDuration, if non-zero, makes the run command exit cleanly after
+	// the configured duration. Useful for smoke-testing against a real
+	// jetstream without leaving a long-running process behind.
+	RunDuration time.Duration
+
 	// MonitorAddr is the listen address for `at-snapshot monitor`.
 	MonitorAddr string
 
@@ -114,6 +125,10 @@ func ParseFlags(sub string, args []string) (Config, error) {
 
 	fs.IntVar(&cfg.Concurrency, "concurrency", envOrInt("AT_SNAPSHOT_CONCURRENCY", 16),
 		"Parallel worker count for fan-out fetches")
+	fs.IntVar(&cfg.MaxDIDs, "max-dids", envOrInt("AT_SNAPSHOT_MAX_DIDS", 0),
+		"Bootstrap: cap the number of DIDs consumed from PLC (0 = no cap)")
+	fs.DurationVar(&cfg.RunDuration, "run-duration", envOrDuration("AT_SNAPSHOT_RUN_DURATION", 0),
+		"Run: exit cleanly after this duration (0 = run forever)")
 	fs.StringVar(&cfg.MonitorAddr, "addr", envOr("AT_SNAPSHOT_MONITOR_ADDR", ":8080"),
 		"Monitor HTTP listen address (monitor only)")
 	fs.StringVar(&cfg.LogLevel, "log-level", envOr("AT_SNAPSHOT_LOG_LEVEL", "info"),

@@ -108,6 +108,16 @@ func RunWith(ctx context.Context, cfg config.Config, deps Deps) error {
 		slog.Info("run start at now")
 	}
 
+	// If a finite RunDuration was configured, derive a cancel-after context.
+	// We let the parent ctx still drive shutdown on SIGINT; the deadline
+	// just imposes an upper bound for short smoke runs.
+	if cfg.RunDuration > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, cfg.RunDuration)
+		defer cancel()
+		slog.Info("run will exit", "after", cfg.RunDuration)
+	}
+
 	collections := make([]string, 0, len(model.AllCollections))
 	for _, c := range model.AllCollections {
 		collections = append(collections, string(c))

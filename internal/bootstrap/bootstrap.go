@@ -117,18 +117,26 @@ func RunWith(ctx context.Context, cfg config.Config, deps Deps) error {
 		fetchErrs atomic.Int64
 	)
 
-	// Producer: PLC stream pushes DIDs not in `completed`.
+	// Producer: PLC stream pushes DIDs not in `completed`. If cfg.MaxDIDs is
+	// set, stop yielding once we've enqueued that many *new* DIDs (already-
+	// completed DIDs from prior runs don't count against the cap, since the
+	// cap exists to bound new fetch work).
 	prodErr := make(chan error, 1)
 	go func() {
 		defer close(dids)
+		yielded := 0
 		err := deps.PLC.Stream(ctx, time.Time{}, func(e plc.Entry) bool {
 			if _, ok := completed[e.DID]; ok {
 				return true
+			}
+			if cfg.MaxDIDs > 0 && yielded >= cfg.MaxDIDs {
+				return false
 			}
 			select {
 			case <-ctx.Done():
 				return false
 			case dids <- e.DID:
+				yielded++
 				return true
 			}
 		})
