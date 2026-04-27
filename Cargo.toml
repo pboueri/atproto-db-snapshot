@@ -24,7 +24,6 @@ parquet = { version = "53", default-features = false, features = ["arrow", "snap
 arrow = { version = "53", default-features = false }
 arrow-array = "53"
 arrow-schema = "53"
-duckdb = { version = "1.0", features = ["bundled"] }
 object_store = { version = "0.13", features = ["aws", "http"] }
 eat-rocks = { git = "https://tangled.org/microcosm.blue/eat-rocks", default-features = false, features = ["easy"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
