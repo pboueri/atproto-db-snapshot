@@ -27,34 +27,19 @@ pub fn dir_size_bytes(path: &Path) -> u64 {
 
 pub fn free_bytes_for(path: &Path) -> Option<u64> {
     let parent = if path.exists() { path } else { path.parent()? };
-    let cs = std::ffi::CString::new(parent.to_string_lossy().as_bytes()).ok()?;
-    let mut stat: libc_statvfs = unsafe { std::mem::zeroed() };
-    let rc = unsafe { statvfs(cs.as_ptr(), &mut stat as *mut _) };
-    if rc != 0 {
+    let parent_str = parent.to_string_lossy();
+    let out = std::process::Command::new("df")
+        .args(["-Pk", parent_str.as_ref()])
+        .output()
+        .ok()?;
+    if !out.status.success() {
         return None;
     }
-    Some(stat.f_bavail as u64 * stat.f_frsize as u64)
-}
-
-#[allow(non_camel_case_types)]
-#[repr(C)]
-struct libc_statvfs {
-    f_bsize: u64,
-    f_frsize: u64,
-    f_blocks: u64,
-    f_bfree: u64,
-    f_bavail: u64,
-    f_files: u64,
-    f_ffree: u64,
-    f_favail: u64,
-    f_fsid: u64,
-    f_flag: u64,
-    f_namemax: u64,
-    _padding: [u64; 16],
-}
-
-extern "C" {
-    fn statvfs(path: *const std::ffi::c_char, buf: *mut libc_statvfs) -> i32;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let line = stdout.lines().nth(1)?;
+    let cols: Vec<&str> = line.split_whitespace().collect();
+    let avail_kb: u64 = cols.get(3)?.parse().ok()?;
+    Some(avail_kb * 1024)
 }
 
 pub struct DiskGuard {
