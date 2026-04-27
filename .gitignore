@@ -1,0 +1,5 @@
+target/
+var/
+.claude/
+*.lock
+!Cargo.lock
