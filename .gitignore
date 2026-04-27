@@ -1,5 +1,6 @@
 target/
 var/
 .claude/
+.DS_Store
 *.lock
 !Cargo.lock
