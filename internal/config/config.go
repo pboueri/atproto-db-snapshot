@@ -97,6 +97,10 @@ type Config struct {
 	// MicrocosmBurst is the bucket capacity (max in-flight before
 	// throttling kicks in).
 	MicrocosmBurst int
+	// ConstellationPageSize is the per-request /links limit. Constellation's
+	// docs cap this at 100 but the live server accepts up to 1000 — set
+	// higher to amortize per-request latency on heavy-follower DIDs.
+	ConstellationPageSize int
 	// Contact is appended to the User-Agent on requests to
 	// Constellation / Slingshot per microcosm.blue's "if you want to be
 	// nice, put your project name and bsky username (or email) in your
@@ -206,6 +210,9 @@ func ParseFlags(sub string, args []string) (Config, error) {
 	fs.IntVar(&cfg.MicrocosmBurst, "microcosm-burst",
 		layeredInt(fc.MicrocosmBurst, "AT_SNAPSHOT_MICROCOSM_BURST", 40),
 		"Microcosm bucket capacity (max in-flight before throttling)")
+	fs.IntVar(&cfg.ConstellationPageSize, "constellation-page-size",
+		layeredInt(fc.ConstellationPageSize, "AT_SNAPSHOT_CONSTELLATION_PAGE_SIZE", 1000),
+		"Constellation /links page size (docs cap 100; live server accepts up to 1000)")
 	fs.StringVar(&cfg.Contact, "contact",
 		layered(fc.Contact, "AT_SNAPSHOT_CONTACT", ""),
 		"Contact (bsky handle or email) appended to outgoing User-Agent — microcosm.blue requests it")

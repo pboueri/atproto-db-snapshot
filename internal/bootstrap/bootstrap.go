@@ -84,7 +84,7 @@ func Run(ctx context.Context, cfg config.Config) error {
 	deps := Deps{
 		PLC:           plc.NewHTTP(cfg.PLCEndpoint),
 		Slingshot:     slingshot.NewHTTP(cfg.SlingshotEndpoint, cfg.Contact, cfg.MicrocosmRateLimit, cfg.MicrocosmBurst),
-		Constellation: constellation.NewHTTP(cfg.ConstellationEndpoint, cfg.Contact, cfg.MicrocosmRateLimit, cfg.MicrocosmBurst),
+		Constellation: constellation.NewHTTP(cfg.ConstellationEndpoint, cfg.Contact, cfg.MicrocosmRateLimit, cfg.MicrocosmBurst, cfg.ConstellationPageSize),
 		ObjStore:      obj,
 		Now:           func() time.Time { return time.Now().UTC() },
 	}
@@ -135,6 +135,7 @@ func RunWith(ctx context.Context, cfg config.Config, deps Deps) error {
 		fetched   atomic.Int64
 		written   atomic.Int64
 		fetchErrs atomic.Int64
+		m         metrics
 	)
 
 	// Producer: PLC stream pushes DIDs not in `completed`. The PDS field on
@@ -177,7 +178,7 @@ func RunWith(ctx context.Context, cfg config.Config, deps Deps) error {
 	workersDone := make(chan struct{})
 	go func() {
 		defer close(workersDone)
-		startWorkers(ctx, cfg.Concurrency, jobs, chunks, deps, &fetched, &fetchErrs)
+		startWorkers(ctx, cfg.Concurrency, jobs, chunks, deps, &fetched, &fetchErrs, &m)
 	}()
 
 	// Writer: drain chunks until workers close the channel.
@@ -185,10 +186,12 @@ func RunWith(ctx context.Context, cfg config.Config, deps Deps) error {
 	go func() {
 		defer close(writerErr)
 		for c := range chunks {
+			t0 := time.Now()
 			if err := st.commitChunk(ctx, c); err != nil {
 				writerErr <- err
 				return
 			}
+			m.observeWriter(time.Since(t0))
 			if c.final {
 				n := written.Add(1)
 				if n%1000 == 0 {
@@ -215,7 +218,7 @@ func RunWith(ctx context.Context, cfg config.Config, deps Deps) error {
 	// stay current.
 	statsCtx, stopStats := context.WithCancel(ctx)
 	defer stopStats()
-	go statsLoop(statsCtx, cfg.StatsInterval, &fetched, &written, &fetchErrs)
+	go statsLoop(statsCtx, cfg.StatsInterval, &fetched, &written, &fetchErrs, &m)
 	go progressLoop(statsCtx, cfg.StatsInterval, pw)
 
 	// Wait for workers to finish (which closes chunks, which lets the
@@ -263,7 +266,7 @@ func RunWith(ctx context.Context, cfg config.Config, deps Deps) error {
 }
 
 // startWorkers fans out fetch goroutines; closes when all workers exit.
-func startWorkers(ctx context.Context, n int, jobs <-chan plc.Entry, chunks chan<- didChunk, deps Deps, fetched, fetchErrs *atomic.Int64) {
+func startWorkers(ctx context.Context, n int, jobs <-chan plc.Entry, chunks chan<- didChunk, deps Deps, fetched, fetchErrs *atomic.Int64, m *metrics) {
 	done := make(chan struct{}, n)
 	for i := 0; i < n; i++ {
 		go func() {
@@ -276,7 +279,11 @@ func startWorkers(ctx context.Context, n int, jobs <-chan plc.Entry, chunks chan
 					if !ok {
 						return
 					}
-					if err := fetchDID(ctx, deps, job, chunks); err != nil {
+					t0 := time.Now()
+					err := fetchDID(ctx, deps, job, chunks, m)
+					m.observeDID(time.Since(t0))
+					slog.Debug("bootstrap fetch did", "did", job.DID, "elapsed", time.Since(t0), "err", err)
+					if err != nil {
 						fetchErrs.Add(1)
 						slog.Warn("bootstrap fetch error", "did", job.DID, "err", err)
 						// Even on error, send a final chunk so the DID is
@@ -306,13 +313,15 @@ func startWorkers(ctx context.Context, n int, jobs <-chan plc.Entry, chunks chan
 // On Slingshot ErrNotFound for the profile, the actor row is still written
 // (as a minimal "DID exists, no public profile" placeholder) by the final
 // chunk's INSERT OR IGNORE.
-func fetchDID(ctx context.Context, deps Deps, job plc.Entry, chunks chan<- didChunk) error {
+func fetchDID(ctx context.Context, deps Deps, job plc.Entry, chunks chan<- didChunk, m *metrics) error {
 	now := deps.Now()
 	did := job.DID
 
 	// Profile: getRecord at rkey=self.
 	var profile *model.Profile
+	t0 := time.Now()
 	rec, err := deps.Slingshot.GetRecord(ctx, did, string(model.CollectionProfile), "self")
+	m.observeProfile(time.Since(t0))
 	switch {
 	case err == nil:
 		p, derr := atrecord.DecodeProfile(rec.Value, did, now, model.SourceBootstrap)
@@ -327,28 +336,31 @@ func fetchDID(ctx context.Context, deps Deps, job plc.Entry, chunks chan<- didCh
 		return fmt.Errorf("profile fetch: %w", err)
 	}
 
-	if err := sendChunk(ctx, chunks, didChunk{did: did, profile: profile}); err != nil {
+	if err := sendChunk(ctx, chunks, didChunk{did: did, profile: profile}, m); err != nil {
 		return err
 	}
 
 	// Follows: incoming backlinks where this DID is the target's .subject.
-	if err := streamBacklinks(ctx, deps.Constellation, did, model.CollectionFollow, now, chunks); err != nil {
+	if err := streamBacklinks(ctx, deps.Constellation, did, model.CollectionFollow, now, chunks, m); err != nil {
 		return fmt.Errorf("follow backlinks: %w", err)
 	}
-	if err := streamBacklinks(ctx, deps.Constellation, did, model.CollectionBlock, now, chunks); err != nil {
+	if err := streamBacklinks(ctx, deps.Constellation, did, model.CollectionBlock, now, chunks, m); err != nil {
 		return fmt.Errorf("block backlinks: %w", err)
 	}
 
 	// Final marker — even when there were no follows / blocks, this fires
 	// the bare-actor INSERT OR IGNORE and writes bootstrap_progress.
-	return sendChunk(ctx, chunks, didChunk{did: did, final: true})
+	return sendChunk(ctx, chunks, didChunk{did: did, final: true}, m)
 }
 
 // streamBacklinks paginates Constellation for (target=did, collection,
 // path=.subject) and flushes a chunk every chunkBatchSize rows. It does
 // NOT send the final chunk — that's the caller's responsibility so it can
 // be coordinated with the other collections.
-func streamBacklinks(ctx context.Context, c constellation.Client, did string, collection model.Collection, now time.Time, chunks chan<- didChunk) error {
+//
+// Per-page wall time is recorded in metrics so the stats logger can report
+// network latency separately from chunk-send blocking and writer time.
+func streamBacklinks(ctx context.Context, c constellation.Client, did string, collection model.Collection, now time.Time, chunks chan<- didChunk, m *metrics) error {
 	var follows []model.Follow
 	var blocks []model.Block
 
@@ -356,12 +368,13 @@ func streamBacklinks(ctx context.Context, c constellation.Client, did string, co
 		if len(follows) == 0 && len(blocks) == 0 {
 			return nil
 		}
-		err := sendChunk(ctx, chunks, didChunk{did: did, follows: follows, blocks: blocks})
+		err := sendChunk(ctx, chunks, didChunk{did: did, follows: follows, blocks: blocks}, m)
 		follows = nil
 		blocks = nil
 		return err
 	}
 
+	pageStart := time.Now()
 	err := c.GetBacklinks(ctx, did, string(collection), ".subject", func(l constellation.Link) bool {
 		switch collection {
 		case model.CollectionFollow:
@@ -369,7 +382,19 @@ func streamBacklinks(ctx context.Context, c constellation.Client, did string, co
 		case model.CollectionBlock:
 			blocks = append(blocks, atrecord.BuildBlockFromBacklink(l.DID, did, l.RKey, now, model.SourceBootstrap))
 		}
+		// We can't time individual HTTP pages from out here, but we can
+		// time per-chunk (which equals one page once chunkBatchSize is
+		// aligned with page size) — close enough for diagnosing where
+		// time goes.
 		if len(follows)+len(blocks) >= chunkBatchSize {
+			elapsed := time.Since(pageStart)
+			switch collection {
+			case model.CollectionFollow:
+				m.observeFollowPage(elapsed)
+			case model.CollectionBlock:
+				m.observeBlockPage(elapsed)
+			}
+			pageStart = time.Now()
 			if err := flush(); err != nil {
 				return false
 			}
@@ -379,15 +404,29 @@ func streamBacklinks(ctx context.Context, c constellation.Client, did string, co
 	if err != nil {
 		return err
 	}
+	// Time the trailing partial page too, if there was one.
+	if len(follows)+len(blocks) > 0 {
+		elapsed := time.Since(pageStart)
+		switch collection {
+		case model.CollectionFollow:
+			m.observeFollowPage(elapsed)
+		case model.CollectionBlock:
+			m.observeBlockPage(elapsed)
+		}
+	}
 	return flush()
 }
 
-// sendChunk forwards c to chunks while honoring context cancellation.
-func sendChunk(ctx context.Context, chunks chan<- didChunk, c didChunk) error {
+// sendChunk forwards c to chunks while honoring context cancellation. If
+// the channel is full, the caller blocks here — that wait time goes into
+// metrics so we can spot writer backpressure.
+func sendChunk(ctx context.Context, chunks chan<- didChunk, c didChunk, m *metrics) error {
+	t0 := time.Now()
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
 	case chunks <- c:
+		m.observeChunkSendBlocked(time.Since(t0))
 		return nil
 	}
 }
@@ -401,7 +440,7 @@ func uploadFile(ctx context.Context, obj objstore.Store, dst, src string) error 
 	return obj.Put(ctx, dst, f, "application/x-duckdb")
 }
 
-func statsLoop(ctx context.Context, every time.Duration, fetched, written, fetchErrs *atomic.Int64) {
+func statsLoop(ctx context.Context, every time.Duration, fetched, written, fetchErrs *atomic.Int64, m *metrics) {
 	if every <= 0 {
 		every = 30 * time.Second
 	}
@@ -416,6 +455,7 @@ func statsLoop(ctx context.Context, every time.Duration, fetched, written, fetch
 				"fetched", fetched.Load(),
 				"written", written.Load(),
 				"fetch_errors", fetchErrs.Load(),
+				"phases", m.snapshot(),
 			)
 		}
 	}

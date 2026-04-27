@@ -61,6 +61,7 @@ type fileConfig struct {
 	SlingshotEndpoint     string  `yaml:"slingshot_endpoint"`
 	MicrocosmRateLimit    float64 `yaml:"microcosm_rate_limit"`
 	MicrocosmBurst        int     `yaml:"microcosm_burst"`
+	ConstellationPageSize int     `yaml:"constellation_page_size"`
 	Contact               string  `yaml:"contact"`
 
 	// Monitor.
@@ -113,9 +114,10 @@ func (c *fileConfig) UnmarshalYAML(node *yaml.Node) error {
 		"pds_burst":              &c.PDSBurst,
 		"constellation_endpoint": &c.ConstellationEndpoint,
 		"slingshot_endpoint":     &c.SlingshotEndpoint,
-		"microcosm_rate_limit":   &c.MicrocosmRateLimit,
-		"microcosm_burst":        &c.MicrocosmBurst,
-		"contact":                &c.Contact,
+		"microcosm_rate_limit":     &c.MicrocosmRateLimit,
+		"microcosm_burst":          &c.MicrocosmBurst,
+		"constellation_page_size":  &c.ConstellationPageSize,
+		"contact":                  &c.Contact,
 		"monitor_addr":           &c.MonitorAddr,
 		"log_level":              &c.LogLevel,
 	}

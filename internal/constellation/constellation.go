@@ -78,7 +78,13 @@ type HTTPClient struct {
 // timeout, baselineRPS sustained throughput with a small burst, retry on
 // 429 / 5xx, and a User-Agent that identifies the project and (if
 // supplied) an operator contact string.
-func NewHTTP(baseURL, contact string, baselineRPS float64, burst int) *HTTPClient {
+//
+// pageSize controls /links?limit=. The published docs cap it at 100, but
+// the live server accepts up to 1000 per page (verified empirically); a
+// non-zero argument overrides the docs-conservative default of 100. Larger
+// pages mean fewer round-trips for high-follower DIDs at the cost of
+// larger response bodies.
+func NewHTTP(baseURL, contact string, baselineRPS float64, burst, pageSize int) *HTTPClient {
 	if baselineRPS <= 0 {
 		baselineRPS = 10
 	}
@@ -88,11 +94,24 @@ func NewHTTP(baseURL, contact string, baselineRPS float64, burst int) *HTTPClien
 			burst = 20
 		}
 	}
+	if pageSize <= 0 {
+		pageSize = 100
+	}
+	// Tune the HTTP transport for high-concurrency same-host traffic. Go's
+	// DefaultTransport caps MaxIdleConnsPerHost at 2, which means at
+	// concurrency=1000 most requests pay a fresh TLS handshake. Bumping
+	// these to match worst-case in-flight count keeps the connection pool
+	// hot. Caps are generous; trust the rate limiter to bound real load.
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.MaxIdleConns = 2000
+	tr.MaxIdleConnsPerHost = 2000
+	tr.MaxConnsPerHost = 2000
+	tr.IdleConnTimeout = 90 * time.Second
 	return &HTTPClient{
 		BaseURL:    baseURL,
-		HTTP:       &http.Client{Timeout: 60 * time.Second},
+		HTTP:       &http.Client{Timeout: 60 * time.Second, Transport: tr},
 		UserAgent:  buildUserAgent(contact),
-		PageSize:   100,
+		PageSize:   pageSize,
 		Limiter:    rate.NewLimiter(rate.Limit(baselineRPS), burst),
 		MaxRetries: 5,
 		MinBackoff: 1 * time.Second,

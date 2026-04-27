@@ -51,7 +51,7 @@ func TestHTTPClientPaginates(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := NewHTTP(srv.URL, "test@example.com", 100, 100)
+	c := NewHTTP(srv.URL, "test@example.com", 100, 100, 100)
 	c.HTTP = srv.Client()
 
 	var got []Link
@@ -85,7 +85,7 @@ func TestHTTPClientYieldStops(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := NewHTTP(srv.URL, "", 100, 100)
+	c := NewHTTP(srv.URL, "", 100, 100, 100)
 	c.HTTP = srv.Client()
 
 	var seen int
@@ -109,7 +109,7 @@ func TestHTTPClientUserAgent(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := NewHTTP(srv.URL, "ops@example.com", 100, 100)
+	c := NewHTTP(srv.URL, "ops@example.com", 100, 100, 100)
 	c.HTTP = srv.Client()
 	_ = c.GetBacklinks(context.Background(), "t", "c", ".s", func(Link) bool { return true })
 	if ua == "" {
@@ -135,7 +135,7 @@ func TestHTTPClientRetriesOn429(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := NewHTTP(srv.URL, "", 100, 100)
+	c := NewHTTP(srv.URL, "", 100, 100, 100)
 	c.HTTP = srv.Client()
 	c.MinBackoff = 1 * time.Millisecond
 	c.MaxBackoff = 1 * time.Millisecond

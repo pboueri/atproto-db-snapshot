@@ -68,9 +68,14 @@ func NewHTTP(baseURL, contact string, baselineRPS float64, burst int) *HTTPClien
 			burst = 20
 		}
 	}
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.MaxIdleConns = 2000
+	tr.MaxIdleConnsPerHost = 2000
+	tr.MaxConnsPerHost = 2000
+	tr.IdleConnTimeout = 90 * time.Second
 	return &HTTPClient{
 		BaseURL:    baseURL,
-		HTTP:       &http.Client{Timeout: 30 * time.Second},
+		HTTP:       &http.Client{Timeout: 30 * time.Second, Transport: tr},
 		UserAgent:  buildUserAgent(contact),
 		Limiter:    rate.NewLimiter(rate.Limit(baselineRPS), burst),
 		MaxRetries: 5,
