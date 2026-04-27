@@ -2,21 +2,46 @@
 
 ## Goal
 
-Produce a periodic, public DuckDB snapshot of the Bluesky social graph and
-post-relationship graph for low-ceremony analytics on commodity hardware. The
-snapshot is derived end-to-end from the **microcosm.blue constellation** index
-— constellation already maintains a RocksDB index of every relevant atproto
-record reference (follows, blocks, posts, replies, quote subjects, likes,
-reposts, profile records, media embeds), so we can reconstruct the graph
-without re-crawling the network.
+Produce a public DuckDB snapshot of the Bluesky social graph and post-relationship
+graph, derived end-to-end from the **microcosm.blue constellation** RocksDB
+backlinks index. Cheap, no-ceremony analytics on commodity hardware.
 
-This spec covers a **full, from-scratch build** of the snapshot. The following
-are explicit non-goals and are deferred to a future spec:
+This spec covers a **full, from-scratch build**. Out of scope (deferred):
 
-- Streaming / incremental updates (jetstream ingestion).
+- Streaming / incremental updates (jetstream).
 - Post text, profile bios, display names, alt text.
 - Media blob downloads / CDN mirroring.
-- Language / labeler filters (these return when text is back in scope).
+- Language / labeler filters (return when text is back in scope).
+
+## What constellation actually stores
+
+Constellation is a **backlinks index**, not a record store. Per
+`constellation/src/storage/rocks_store.rs` it has four column families:
+
+| CF | Key | Value | What it is |
+|---|---|---|---|
+| `did_ids` | bincode(`Did`) | bincode(`DidIdValue(DidId, active: bool)`) | DID → numeric ID + active flag. Also stores reverse: 8-byte big-endian `DidId` → bincode(`Did`). |
+| `target_ids` | bincode(`TargetKey(Target, Collection, RPath)`) | bincode(`TargetId`) | A URI/DID/blob *as referenced from a specific (collection, json-path)* → numeric ID. Also reverse 8-byte → `TargetKey`. |
+| `target_links` | bincode(`TargetId`) | bincode(`TargetLinkers(Vec<(DidId, RKey)>)`) | For a target, who linked to it (reverse index). Tombstones use `DidId(0)`. |
+| `link_targets` | bincode(`RecordLinkKey(DidId, Collection, RKey)`) | bincode(`RecordLinkTargets(Vec<(RPath, TargetId)>)`) | For a record, the targets it links to + the json-path of each link (forward index). |
+
+Implications for us:
+
+- We only see records that **contain at least one link**. A text-only post with
+  no embed / reply / quote and no engagement won't have a `link_targets` entry.
+  It might still appear as the *target* of someone else's like / reply / quote,
+  in which case the post URI shows up in `target_ids`.
+- AT-URIs encode author DID and rkey; rkeys for like / repost / follow / block
+  / post are TIDs that decode to a microsecond timestamp. So even when we only
+  know about a post via `target_ids`, we can still derive `(uri, author_did,
+  created_at)` without the forward record.
+- `app.bsky.actor.profile` rkeys are `self`, not TIDs — `created_at` is NULL.
+- Encoding is **bincode big-endian**; reverse-mapping entries inside `did_ids`
+  and `target_ids` are 8-byte keys (the IDs themselves) and must be skipped
+  when iterating those CFs (constellation's repair loop does exactly this with
+  `if raw_key.len() == 8`).
+- `target_links` uses a custom merge operator on writes. We open **read-only**,
+  so we don't need to register it.
 
 ## Mental model
 
@@ -24,12 +49,12 @@ are explicit non-goals and are deferred to a future spec:
 constellation rocksdb  ──(eat-rocks)──▶  local rocks mirror
 local rocks mirror     ──(stage)──────▶  staging parquet (per entity)
 staging parquet        ──(hydrate)────▶  snapshot.duckdb (bounded RAM)
-snapshot.duckdb + parquet  ──(publish)─▶  object store (R2 by default)
+snapshot.duckdb + parquet  ──(publish)─▶  object store (R2 default)
 ```
 
-Each stage is a single-responsibility module. The binary exposes one command
-today; the modules are wired so a future split into per-stage subcommands is
-mechanical.
+Each stage is a single-responsibility module behind a `Stage` trait. The
+binary exposes one command today; the trait split makes per-stage subcommands
+mechanical to add later.
 
 ## Final output
 
@@ -39,7 +64,8 @@ data/
     actors.parquet
     follows.parquet
     blocks.parquet
-    posts.parquet
+    posts_from_records.parquet     # rows derived from link_targets scan
+    posts_from_targets.parquet     # rows derived from target_ids scan (deduped in hydrate)
     post_media.parquet
     likes.parquet
     reposts.parquet
@@ -49,28 +75,25 @@ data/
 ```
 
 `snapshot.duckdb` is the single analytic artifact. `snapshot_metadata.json`
-captures the constellation source revision, eat-rocks revision, schema
-version, host stats, and per-table row counts.
+captures constellation source revision, eat-rocks revision, schema version,
+host stats, and per-table row counts.
 
 ## Technologies
 
-- Language: **Rust** (stable).
-- RocksDB mirror: **eat-rocks**
-  (https://tangled.org/microcosm.blue/eat-rocks), pulled in as a Cargo
-  dependency and called as a library — not shelled out to.
-- Source schema reference:
-  https://tangled.org/microcosm.blue/microcosm-rs/blob/main/constellation/src/storage/rocks_store.rs
-  — the staging stage's rocks adapter is the only module that knows this
-  layout, so when constellation's storage changes, only that file changes.
-- Analytic DB: DuckDB (via the `duckdb` crate).
-- Columnar staging: Parquet (`parquet` + `arrow` crates).
-- Object store: S3-compatible API via the `object_store` crate; **R2 default**,
-  local filesystem backend for tests.
+- **Rust** stable.
+- **eat-rocks** (https://tangled.org/microcosm.blue/eat-rocks) as a Cargo
+  dependency. eat-rocks owns the *mirror* (clone the upstream rocksdb to a
+  local directory). Our staging stage then opens that directory **read-only**
+  with the `rocksdb` crate directly using the same CF descriptors as
+  `rocks_store.rs` (no merge operator needed for read-only access).
+- `bincode` (default options + big-endian) to decode keys/values, matching
+  `_bincode_opts()` in rocks_store.rs.
+- DuckDB (`duckdb` crate), Parquet/Arrow (`parquet` + `arrow` crates).
+- `object_store` crate; **R2 default**, local FS for tests.
 
 ## CLI
 
-A single command today. Internals are split per stage so subcommands can be
-exposed later without refactoring.
+A single command today; modular internals.
 
 ```
 at-snapshot build [flags]
@@ -78,131 +101,150 @@ at-snapshot build [flags]
 
 Flags:
 
-- `--config <path>`: TOML config (preferred). All flags below can also be set
-  via config or env.
-- `--work-dir <path>`: local working directory (default `./var`).
-- `--snapshot-date <YYYY-MM-DD>`: namespace for outputs; defaults to today UTC.
-- `--memory-limit <size>`: DuckDB working-memory cap (default `4GiB`).
-- `--batch-size <n>`: rocks → parquet streaming batch size (default `100_000`).
-- `--object-store <url>`: e.g. `s3://bucket/prefix`, `r2://...`, or
-  `file:///tmp/out` for tests.
+- `--config <path>`: TOML config (preferred). Flags below also via env / CLI.
+- `--work-dir <path>`: local working dir (default `./var`).
+- `--snapshot-date <YYYY-MM-DD>`: namespace for outputs (default today UTC).
+- `--memory-limit <size>`: DuckDB memory cap (default `4GiB`).
+- `--batch-size <n>`: parquet writer batch size (default `100_000`).
+- `--object-store <url>`: e.g. `s3://bucket/prefix` or `file:///tmp/out`.
 - `--skip-mirror | --skip-stage | --skip-hydrate | --skip-publish`: per-stage
   opt-out for resumes and tests.
-- `--monitor-addr <host:port>` (optional): exposes per-stage progress as JSON
-  for external scraping. Structured INFO logs are emitted regardless so a
-  sidecar tail can display status without the server.
+- `--monitor-addr <host:port>` (optional): JSON progress endpoint.
+  Structured INFO logs are emitted regardless.
 
-Each stage is idempotent and resumable; re-running the command picks up where
-it left off.
+Each stage is idempotent and resumable.
 
 ## Stages
 
-### 1. Mirror — eat-rocks library call
+### 1. Mirror — eat-rocks
 
-- Reads the constellation source URL from config.
+- Configured with the constellation source URL.
 - Calls eat-rocks's library API to clone / refresh `./var/rocks/`.
-- Source revision / cursor is checkpointed in `./var/rocks/.cursor`. A re-run
-  is a no-op if the cursor matches; otherwise eat-rocks resumes.
+- Source revision / cursor checkpointed in `./var/rocks/.cursor`.
+- Re-running with a matching cursor is a no-op; otherwise eat-rocks resumes.
 
 ### 2. Stage — rocks → parquet
 
-- One reader per logical entity. Each reader iterates the relevant rocksdb key
-  range (per the `rocks_store.rs` schema referenced above) and emits Arrow
-  `RecordBatch`es of `--batch-size` rows.
-- Each reader writes `./var/staging/<table>.parquet` via
-  `parquet::arrow::ArrowWriter`. Writers go to a temp file and rename on
-  success, so partial runs never leave readable-but-truncated parquet.
-- Memory is bounded by batch size; we never load a full table into memory.
-- The rocks adapter (`src/rocks/schema.rs`) is the single source of truth for
-  rocks key/value layout.
+Open `./var/rocks/` read-only with the four CF descriptors above. Run three
+streaming passes; each writes via temp file + atomic rename, batched at
+`--batch-size` rows. The rocks adapter (`src/rocks/schema.rs`) is the only
+module that knows about bincode layouts.
 
-Logical entities produced at this stage map 1:1 to the parquet files listed in
-**Final output**.
+**Pass A — scan `did_ids`** (skip 8-byte reverse-mapping keys):
+- Decode `Did` (key) and `DidIdValue(DidId, active)` (value).
+- Emit `actors.parquet` with `(did_id, did, active)`.
+
+**Pass B — scan `link_targets`** (no reverse-mapping rows in this CF):
+- Decode `RecordLinkKey(did_id, collection, rkey)` and
+  `RecordLinkTargets(Vec<(rpath, target_id)>)`.
+- Compute `created_at` = TID-decode(rkey) for like / repost / follow / block /
+  post collections; NULL otherwise.
+- Resolve each `target_id` to `TargetKey(target, collection, rpath)` via point
+  lookup `db.get_cf(target_ids, id.to_be_bytes())`.
+- Multiplex into output files by collection:
+  - `app.bsky.feed.post` → `posts_from_records.parquet` row, plus 0..n
+    `post_media.parquet` rows for forward links at media RPaths
+    (`.embed.images[N].image`, `.embed.video.video`, `.embed.external.uri`,
+    `.embed.external.thumb`, `.embed.record.uri`,
+    `.embed.recordWithMedia.media.images[N].image`, etc.).
+  - `app.bsky.feed.like` → `likes.parquet`, subject from `.subject.uri`.
+  - `app.bsky.feed.repost` → `reposts.parquet`, subject from `.subject.uri`.
+  - `app.bsky.graph.follow` → `follows.parquet`, subject from `.subject`.
+  - `app.bsky.graph.block` → `blocks.parquet`, subject from `.subject`.
+  - `app.bsky.actor.profile` → no row here (we already have the actor from
+    Pass A); future text-content spec will populate fields from this record.
+  - Other collections → ignored (out of scope for this snapshot).
+
+**Pass C — scan `target_ids`** (skip 8-byte reverse-mapping keys):
+- For `TargetKey` rows whose `Target` is an AT-URI of `app.bsky.feed.post`,
+  emit a `posts_from_targets.parquet` row with `(uri, author_did, rkey,
+  created_at)` parsed from the URI / TID. This catches posts that exist in
+  the graph only as targets of likes / quotes / replies.
+
+Memory is bounded by `--batch-size`; each pass streams. Point lookups for ID
+resolution rely on RocksDB's block cache.
 
 ### 3. Hydrate — parquet → duckdb
 
-- Open `./var/snapshot.duckdb` with
-  `SET memory_limit='<flag>'; SET temp_directory='./var/duckdb_spill';`.
-- For each base table:
-  `CREATE TABLE x AS SELECT * FROM read_parquet('./var/staging/x.parquet');`
-  followed by primary-key / index creation.
-- Aggregate tables (`actor_aggs`, `post_aggs`) are computed in SQL over the
-  base tables — no manual counting in Rust.
-- Validation queries (see **Validation**) run after hydrate; failures abort
-  publish.
+Open `./var/snapshot.duckdb` with `SET memory_limit=...; SET temp_directory=...;`.
+Build tables and aggregates entirely in SQL:
+
+- `actors` ← `read_parquet('actors.parquet')`.
+- `follows`, `blocks`, `likes`, `reposts`, `post_media` ← straightforward
+  loads.
+- `posts` ← `posts_from_records UNION BY NAME posts_from_targets`, deduped on
+  `uri`, preferring rows that came from records (they have richer fields like
+  reply / quote refs).
+- `actor_aggs`, `post_aggs` ← `GROUP BY` queries over the base tables.
+
+Validation queries run after hydrate; failures abort publish.
 
 ### 4. Publish
 
-- Streams `raw/YYYY-MM-DD/*.parquet`, `snapshot/YYYY-MM-DD/snapshot.duckdb`,
-  and `snapshot_metadata.json` to the configured object store via streaming
-  multipart upload.
-- Local-filesystem backend used for tests.
+- Stream `raw/.../*.parquet`, `snapshot/.../snapshot.duckdb`, and
+  `snapshot_metadata.json` to the configured object store via multipart
+  upload.
 
 ## Data model
 
-All entities use **constellation's native numeric IDs** as primary keys (we
-do not re-intern). The mapping back to the source string is preserved in
-`actors` and `posts` so consumers can join back to DIDs and AT-URIs. A
-constellation ID mapping table can be exported separately if downstream tools
-need lookup outside `actors` / `posts`.
-
-`created_at` is **decoded from the atproto TID** in the record key (rkey), not
-from record content. This matches the data we have from constellation without
-parsing record bodies.
+Join keys are constellation's native numeric IDs (`DidId`, `TargetId`). They
+are reproducible within a snapshot but not portable across snapshots. Source
+strings are preserved alongside in `actors` and `posts` so consumers can join
+by DID / URI directly if needed.
 
 | Table | Columns |
 |---|---|
-| `actors` | `did_id PK`, `did STRING`, `profile_uri_id NULL`, `created_at` |
+| `actors` | `did_id PK`, `did STRING`, `active BOOL` |
 | `actor_aggs` | `did_id PK`, `follows`, `followers`, `blocks_out`, `blocks_in`, `posts`, `likes_out`, `likes_in`, `reposts_out`, `reposts_in`, `replies_out`, `quotes_out`, `quoted_count` |
-| `follows` | `uri_id PK`, `src_did_id`, `dst_did_id`, `created_at` |
-| `blocks` | `uri_id PK`, `src_did_id`, `dst_did_id`, `created_at` |
-| `posts` | `uri_id PK`, `uri STRING`, `author_did_id`, `created_at`, `reply_root_uri_id NULL`, `reply_parent_uri_id NULL`, `quote_uri_id NULL` |
-| `post_aggs` | `uri_id PK`, `likes`, `reposts`, `replies`, `quotes` |
-| `post_media` | `uri_id`, `ord`, `kind ENUM('image','video','external','record')`, `ref_url NULL`, `blob_cid NULL` |
-| `likes` | `uri_id PK`, `actor_did_id`, `subject_uri_id`, `created_at` |
-| `reposts` | `uri_id PK`, `actor_did_id`, `subject_uri_id`, `created_at` |
+| `follows` | `src_did_id`, `dst_did_id`, `rkey`, `created_at`, PK `(src_did_id, rkey)` |
+| `blocks` | `src_did_id`, `dst_did_id`, `rkey`, `created_at`, PK `(src_did_id, rkey)` |
+| `posts` | `uri PK`, `author_did_id`, `rkey`, `created_at`, `reply_root_uri NULL`, `reply_parent_uri NULL`, `quote_uri NULL`, `source ENUM('record','target_only')` |
+| `post_aggs` | `uri PK`, `likes`, `reposts`, `replies`, `quotes` |
+| `post_media` | `uri`, `ord`, `kind ENUM('image','video','external','record','external_thumb')`, `ref STRING` |
+| `likes` | `actor_did_id`, `subject_uri`, `rkey`, `created_at`, PK `(actor_did_id, rkey)` |
+| `reposts` | `actor_did_id`, `subject_uri`, `rkey`, `created_at`, PK `(actor_did_id, rkey)` |
 
 Notes:
 
-- Counts in `actor_aggs` and `post_aggs` are **all-time within the snapshot**
-  — there is no per-day window in this spec because no streaming data is
-  ingested. Window semantics return when streaming is back in scope.
-- Foreign-key relationships are by `*_id` columns. DuckDB does not enforce FKs
-  at insert; the hydrate stage runs orphan-rate / null-rate checks against
-  thresholds from config and fails the build if breached.
-- No post text, profile bio, display name, or alt text — those tables /
-  columns will be added by a future spec.
-
-## Operational considerations
-
-- **Idempotent**: every stage is safe to re-run. Outputs are written via
-  temp + rename; the duckdb file is built fresh per run.
-- **Bounded RAM**: configurable `memory_limit` for DuckDB, configurable
-  `batch_size` for parquet writers, streaming reads from rocks.
-- **Resumable**: mirror checkpoints constellation's cursor; stage and hydrate
-  are deterministic given the rocks state, so a re-run reproduces the same
-  outputs.
-- **Single-binary, modular internals**: each stage lives behind a `Stage`
-  trait so the future split into subcommands is mechanical.
-- **Logging**: every stage emits INFO-level structured progress events
-  (counts, bytes, batch index) so `--monitor-addr` and a log-tailing sidecar
-  can both report status.
+- `post_aggs` counts come from SQL aggregations of `likes`, `reposts`, plus
+  `posts WHERE reply_parent_uri = ?` for replies and `posts WHERE quote_uri =
+  ?` for quotes. Counts are **all-time within this snapshot** — there is no
+  per-day window in this spec because we do not ingest streaming data.
+- A nontrivial fraction of `likes.subject_uri` and `reposts.subject_uri` will
+  point to posts that aren't in `posts` (e.g. text-only posts that nobody else
+  interacted with at the time their author wrote them, or non-bsky lexicons).
+  Pass C reduces this. The hydrate stage records the orphan rate in
+  `snapshot_metadata.json` and does not treat a non-zero rate as a failure.
+- `active = false` actors are kept in the table; downstream consumers can
+  filter as needed.
 
 ## Validation
 
-A small recorded RocksDB fixture is committed under `tests/fixtures/`,
-covering each entity plus a quote chain, a reply chain, an external embed,
-and a deleted-then-recreated record. `cargo test` runs the full pipeline
-against the fixture using the local-filesystem object store and asserts
-against the same analytic queries as prior iterations of this spec:
+A small recorded RocksDB fixture lives at `tests/fixtures/constellation_mini/`
+covering each entity, a quote chain, a reply chain, an external embed, an
+inactive DID, and a tombstone (`DidId(0)`) in `target_links`. `cargo test`
+runs the full pipeline against the fixture using the local-FS object store
+and asserts:
 
-- How many people followed or blocked someone else yesterday?
-- What % of total follows were generated yesterday?
-- How many people who posted got at least one like?
-- How many posts got at least one like?
+- How many people followed or blocked someone else "yesterday"
+  (TID-derived).
+- What % of total follows were generated yesterday.
+- How many people who posted got at least one like.
+- How many posts got at least one like.
 
-Per-stage unit tests additionally cover the rocks schema decoder
+Per-stage unit tests cover the rocks schema decoder
 (`src/rocks/schema.rs`) and parquet writers in isolation.
+
+## Open questions to resolve during implementation
+
+- Confirm exactly which paths constellation indexes for media inside post
+  records (i.e. whether blob CIDs at `.embed.images[N].image` actually appear
+  as `Target`s, or only externally-resolvable URIs do). The list above
+  reflects expected atproto paths; the rocks adapter will be updated to match
+  whatever the fixture actually contains.
+- Confirm eat-rocks's library entry point and the path it produces. The spec
+  treats the rocksdb directory as the contract — whatever eat-rocks names is
+  fine as long as it's openable read-only with the four CFs above.
 
 ## Reference implementations
 
@@ -214,21 +256,16 @@ Per-stage unit tests additionally cover the rocks schema decoder
 
 ## Implementation guidance
 
-- Use `tokio` for async I/O at stage boundaries (object store, http monitor),
-  and plain threads + channels for the rocks → parquet pipeline.
+- `tokio` for async I/O at stage boundaries (object store, http monitor).
+  Plain threads + bounded channels for the rocks → parquet pipeline.
 - `anyhow` at binary edges, `thiserror` in libraries.
 - One module per stage (`mirror.rs`, `stage.rs`, `hydrate.rs`, `publish.rs`),
-  orchestrated through a single `Stage` trait.
-- Keep all rocks schema knowledge in exactly one module.
-- Red/green tests; commit each logical unit separately for a readable history.
+  orchestrated through a `Stage` trait.
+- All rocks-schema knowledge in exactly one module.
+- Red/green tests; one logical commit at a time.
 
 ## README updates
 
-Update `README.md` to be concise with:
-
-- The goal this repo solves.
-- The mental-model overview (mirror → stage → hydrate → publish).
-- The ERD in mermaid for the tables above.
-- The single CLI command and its flags.
-- A "Deferred" section listing non-goals (streaming, text, media, filters) so
-  users know what's intentionally missing.
+Update `README.md` with: goal, mental-model overview, ERD in mermaid for the
+tables above, the single CLI command + flags, and a "Deferred" section
+listing the non-goals so users know what's intentionally missing.
