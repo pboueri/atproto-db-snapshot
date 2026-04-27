@@ -19,3 +19,8 @@
 
 # Agent transcripts (Claude Code background-agent output)
 .claude/
+
+# Operator config — contains R2 / S3 credentials
+at-snapshot.yaml
+at-snapshot.yml
+*.local.yaml
