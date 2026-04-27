@@ -173,10 +173,25 @@ func RunWith(ctx context.Context, cfg config.Config, deps Deps) error {
 		}
 	}()
 
-	// Stats ticker.
+	// Sidecar progress writer. The monitor reads this file instead of
+	// opening the duckdb directly, since DuckDB's writer lock prevents any
+	// other process from opening the .duckdb file (even read-only) while
+	// bootstrap is running.
+	progressPath := filepath.Join(cfg.DataDir, "bootstrap-staging", "progress.json")
+	pw, err := newProgressWriter(progressPath, st, &fetched, &written, &fetchErrs, cfg.PLCEndpoint)
+	if err != nil {
+		return err
+	}
+	if err := pw.Tick(ctx); err != nil {
+		slog.Warn("bootstrap progress sidecar", "err", err)
+	}
+
+	// Stats ticker. Writes the sidecar at the same cadence so monitor reads
+	// stay current.
 	statsCtx, stopStats := context.WithCancel(ctx)
 	defer stopStats()
 	go statsLoop(statsCtx, cfg.StatsInterval, &fetched, &written, &fetchErrs)
+	go progressLoop(statsCtx, cfg.StatsInterval, pw)
 
 	// Wait for workers to finish (which closes bundles, which lets the
 	// writer exit), then check for errors from each stage.
@@ -191,6 +206,9 @@ func RunWith(ctx context.Context, cfg config.Config, deps Deps) error {
 
 	if err := st.MarkFinished(ctx); err != nil {
 		return err
+	}
+	if err := pw.Close(ctx); err != nil {
+		slog.Warn("bootstrap progress final write", "err", err)
 	}
 	slog.Info("bootstrap complete",
 		"fetched", fetched.Load(),
@@ -331,6 +349,25 @@ func statsLoop(ctx context.Context, every time.Duration, fetched, written, fetch
 				"written", written.Load(),
 				"fetch_errors", fetchErrs.Load(),
 			)
+		}
+	}
+}
+
+// progressLoop writes the sidecar JSON on the same cadence as stats logging.
+func progressLoop(ctx context.Context, every time.Duration, pw *progressWriter) {
+	if every <= 0 {
+		every = 30 * time.Second
+	}
+	t := time.NewTicker(every)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			if err := pw.Tick(ctx); err != nil {
+				slog.Warn("bootstrap progress tick", "err", err)
+			}
 		}
 	}
 }

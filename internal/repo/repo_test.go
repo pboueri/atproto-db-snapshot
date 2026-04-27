@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"strconv"
 	"testing"
+	"time"
 
 	"github.com/pboueri/atproto-db-snapshot/internal/model"
 )
@@ -88,6 +89,46 @@ func TestHTTPListRecordsEmptyPDS(t *testing.T) {
 	}
 	if got != nil {
 		t.Errorf("len = %d, want nil (empty pds short-circuits)", len(got))
+	}
+}
+
+func TestHTTPRetriesOn429HonoringRetryAfter(t *testing.T) {
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if calls < 3 {
+			w.Header().Set("Retry-After", "0") // immediate retry, just exercise the code path
+			http.Error(w, "slow down", http.StatusTooManyRequests)
+			return
+		}
+		json.NewEncoder(w).Encode(listRecordsResp{
+			Records: []Record{{URI: "at://x/app.bsky.graph.follow/r1", Value: json.RawMessage(`{}`)}},
+		})
+	}))
+	defer srv.Close()
+
+	c := &HTTPClient{HTTP: srv.Client(), MaxRetries: 5, MinBackoff: time.Millisecond}
+	got, err := c.ListRecords(context.Background(), srv.URL, "did:plc:x", model.CollectionFollow)
+	if err != nil {
+		t.Fatalf("ListRecords: %v", err)
+	}
+	if len(got) != 1 {
+		t.Errorf("len = %d, want 1", len(got))
+	}
+	if calls != 3 {
+		t.Errorf("calls = %d, want 3 (two 429s then 200)", calls)
+	}
+}
+
+func TestHTTPRetriesGiveUpEventually(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "still rate limited", http.StatusTooManyRequests)
+	}))
+	defer srv.Close()
+	c := &HTTPClient{HTTP: srv.Client(), MaxRetries: 2, MinBackoff: time.Millisecond}
+	_, err := c.ListRecords(context.Background(), srv.URL, "did:plc:x", model.CollectionFollow)
+	if err == nil {
+		t.Errorf("expected error after exhausting retries")
 	}
 }
 

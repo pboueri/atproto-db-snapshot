@@ -9,12 +9,17 @@
 // record, not what records a DID owns — so the bootstrap pipeline now
 // dispatches XRPC listRecords directly to each repo's PDS instead. The PDS
 // URL travels alongside the DID in plc.Entry.
+//
+// The big shared PDSes (notably bsky.social) rate-limit aggressively, so
+// HTTPClient honors 429 Retry-After and applies an exponential backoff on
+// 5xx — see do() for the policy.
 package repo
 
 import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -51,13 +56,22 @@ type HTTPClient struct {
 	HTTP *http.Client
 	// PageSize is the per-request limit; the XRPC server-side cap is 100.
 	PageSize int
+	// MaxRetries caps retry attempts on 429 / 5xx. Default 5.
+	MaxRetries int
+	// MinBackoff and MaxBackoff bracket the exponential schedule. Retry-After
+	// from the server overrides the schedule when present.
+	MinBackoff, MaxBackoff time.Duration
 }
 
-// NewHTTP returns a production HTTPClient with a sensible 30s timeout.
+// NewHTTP returns a production HTTPClient with a sensible 30s timeout and
+// retry policy tuned for shared-host rate limits (bsky.social).
 func NewHTTP() *HTTPClient {
 	return &HTTPClient{
-		HTTP:     &http.Client{Timeout: 30 * time.Second},
-		PageSize: 100,
+		HTTP:       &http.Client{Timeout: 30 * time.Second},
+		PageSize:   100,
+		MaxRetries: 5,
+		MinBackoff: 1 * time.Second,
+		MaxBackoff: 30 * time.Second,
 	}
 }
 
@@ -97,13 +111,9 @@ func (c *HTTPClient) ListRecords(ctx context.Context, pds, did string, collectio
 		}
 		u.RawQuery = q.Encode()
 
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+		resp, err := c.do(ctx, u)
 		if err != nil {
 			return nil, err
-		}
-		resp, err := c.HTTP.Do(req)
-		if err != nil {
-			return nil, fmt.Errorf("repo: GET %s: %w", u, err)
 		}
 		body := resp.Body
 		if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusGone {
@@ -153,4 +163,81 @@ func rkeyFromURI(uri string) string {
 		}
 	}
 	return ""
+}
+
+// do performs the GET with retry-on-rate-limit and retry-on-5xx. On 429 we
+// honor the Retry-After header (delta-seconds) when present; otherwise we
+// fall back to exponential backoff bounded by MinBackoff / MaxBackoff.
+//
+// We deliberately do NOT retry on connection errors or 4xx other than 429:
+// those are usually structural (DNS, TLS, deactivated repo) and the caller
+// will already have classified them.
+func (c *HTTPClient) do(ctx context.Context, u *url.URL) (*http.Response, error) {
+	maxRetries := c.MaxRetries
+	if maxRetries <= 0 {
+		maxRetries = 5
+	}
+	min := c.MinBackoff
+	if min <= 0 {
+		min = time.Second
+	}
+	max := c.MaxBackoff
+	if max <= 0 {
+		max = 30 * time.Second
+	}
+
+	backoff := min
+	for attempt := 0; ; attempt++ {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("User-Agent", "at-snapshot/1.0 (+https://github.com/pboueri/atproto-db-snapshot)")
+		resp, err := c.HTTP.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("repo: GET %s: %w", u, err)
+		}
+		retryable := resp.StatusCode == http.StatusTooManyRequests ||
+			(resp.StatusCode >= 500 && resp.StatusCode < 600)
+		if !retryable || attempt >= maxRetries {
+			return resp, nil
+		}
+
+		// Drain and close so the connection can be reused.
+		retryAfter := parseRetryAfter(resp.Header.Get("Retry-After"))
+		resp.Body.Close()
+
+		wait := retryAfter
+		if wait <= 0 {
+			wait = backoff
+			backoff *= 2
+			if backoff > max {
+				backoff = max
+			}
+		}
+		slog.Debug("repo retry", "url", u.String(), "status", resp.StatusCode, "wait", wait, "attempt", attempt+1)
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(wait):
+		}
+	}
+}
+
+// parseRetryAfter parses delta-seconds form ("30") or HTTP-date form. We
+// only handle the integer-seconds case in practice — bsky.social returns
+// numeric Retry-After — so date parsing is a one-liner fallback.
+func parseRetryAfter(h string) time.Duration {
+	if h == "" {
+		return 0
+	}
+	if n, err := strconv.Atoi(h); err == nil && n > 0 {
+		return time.Duration(n) * time.Second
+	}
+	if t, err := http.ParseTime(h); err == nil {
+		if d := time.Until(t); d > 0 {
+			return d
+		}
+	}
+	return 0
 }

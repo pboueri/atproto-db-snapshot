@@ -3,6 +3,7 @@ package monitor
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -18,23 +19,42 @@ import (
 	"github.com/pboueri/atproto-db-snapshot/internal/objstore"
 )
 
-// readBootstrap inspects the local bootstrap-staging duckdb (if present)
-// and the remote bootstrap/{date}/social_graph.duckdb upload (if present).
+// readBootstrap inspects the local bootstrap-staging state and the remote
+// bootstrap/{date}/social_graph.duckdb upload (if present).
 //
-// The function is read-only: it opens DuckDB with access_mode=read_only so
-// a concurrently-running bootstrap retains its writer lock.
+// Two paths to the local data:
+//
+//  1. progress.json sidecar — preferred while bootstrap is running. Bootstrap
+//     writes this atomically on every flush since DuckDB only allows one
+//     process to hold the writer lock and the monitor can't open the .duckdb
+//     until bootstrap exits.
+//
+//  2. social_graph.duckdb — fallback for after a finished run, since the
+//     sidecar isn't strictly required to be present.
 func readBootstrap(ctx context.Context, cfg config.Config, deps Deps) BootstrapStatus {
 	st := BootstrapStatus{}
-	dbPath := filepath.Join(cfg.DataDir, "bootstrap-staging", "social_graph.duckdb")
+	stagingDir := filepath.Join(cfg.DataDir, "bootstrap-staging")
+	sidecarPath := filepath.Join(stagingDir, "progress.json")
+	dbPath := filepath.Join(stagingDir, "social_graph.duckdb")
 
-	if _, err := os.Stat(dbPath); err == nil {
+	if filled, err := fillBootstrapFromSidecar(sidecarPath, &st); err != nil && !errors.Is(err, os.ErrNotExist) {
+		slog.Warn("monitor: read bootstrap sidecar", "path", sidecarPath, "err", err)
+	} else if filled {
 		st.Found = true
-		if err := fillBootstrapFromDB(ctx, dbPath, &st); err != nil {
-			slog.Warn("monitor: read bootstrap db", "path", dbPath, "err", err)
+	}
+
+	if !st.Found {
+		// No sidecar — try the duckdb directly. This succeeds once
+		// bootstrap has exited and released its writer lock.
+		if _, err := os.Stat(dbPath); err == nil {
+			st.Found = true
+			if err := fillBootstrapFromDB(ctx, dbPath, &st); err != nil {
+				slog.Warn("monitor: read bootstrap db", "path", dbPath, "err", err)
+				st.Error = errMessage(err)
+			}
+		} else if !errors.Is(err, os.ErrNotExist) {
 			st.Error = errMessage(err)
 		}
-	} else if !errors.Is(err, os.ErrNotExist) {
-		st.Error = errMessage(err)
 	}
 
 	if remote, err := latestBootstrapRemote(ctx, deps.ObjStore); err == nil && remote != "" {
@@ -49,6 +69,49 @@ func readBootstrap(ctx context.Context, cfg config.Config, deps Deps) BootstrapS
 	}
 
 	return st
+}
+
+// sidecarShape mirrors internal/bootstrap.Progress; we duplicate the struct
+// here rather than importing internal/bootstrap because bootstrap imports
+// objstore and we'd rather keep the monitor's import graph minimal.
+type sidecarShape struct {
+	StartedAt     time.Time  `json:"started_at"`
+	UpdatedAt     time.Time  `json:"updated_at"`
+	CompletedAt   *time.Time `json:"completed_at,omitempty"`
+	CompletedDIDs int64      `json:"completed_dids"`
+	Fetched       int64      `json:"fetched"`
+	Written       int64      `json:"written"`
+	FetchErrors   int64      `json:"fetch_errors"`
+	Actors        int64      `json:"actors"`
+	Follows       int64      `json:"follows"`
+	Blocks        int64      `json:"blocks"`
+}
+
+// fillBootstrapFromSidecar reads the JSON sidecar bootstrap writes during a
+// run. Returns (true, nil) if the file exists and decodes; (false, err) for
+// not-exist (caller checks) or decode errors.
+func fillBootstrapFromSidecar(path string, st *BootstrapStatus) (bool, error) {
+	body, err := os.ReadFile(path)
+	if err != nil {
+		return false, err
+	}
+	var s sidecarShape
+	if err := json.Unmarshal(body, &s); err != nil {
+		return false, fmt.Errorf("decode sidecar: %w", err)
+	}
+	if !s.StartedAt.IsZero() {
+		t := s.StartedAt.UTC()
+		st.StartedAt = &t
+	}
+	if s.CompletedAt != nil && !s.CompletedAt.IsZero() {
+		t := s.CompletedAt.UTC()
+		st.CompletedAt = &t
+	}
+	st.CompletedDIDs = s.CompletedDIDs
+	st.Actors = s.Actors
+	st.Follows = s.Follows
+	st.Blocks = s.Blocks
+	return true, nil
 }
 
 // fillBootstrapFromDB queries the canonical bootstrap tables. Each query

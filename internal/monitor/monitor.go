@@ -97,8 +97,14 @@ func RunWith(ctx context.Context, cfg config.Config, deps Deps) error {
 //
 // Exposed so tests (and a hypothetical embedding host) can mount the routes
 // without spinning a real listener.
+//
+// "/" routes to the HTML dashboard; "/status*" stay JSON for tooling. We use
+// Go 1.22's "/{$}" wildcard so the dashboard only catches the bare root
+// path — unmatched paths still 404 instead of falling through to the home
+// handler.
 func NewHandler(cfg config.Config, deps Deps) http.Handler {
 	mux := http.NewServeMux()
+	mux.HandleFunc("/{$}", handleHome(cfg, deps))
 	mux.HandleFunc("/healthz", handleHealth)
 	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, readStatus(r.Context(), cfg, deps))

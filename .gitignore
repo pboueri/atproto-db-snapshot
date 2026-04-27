@@ -24,3 +24,4 @@
 at-snapshot.yaml
 at-snapshot.yml
 *.local.yaml
+*.log
