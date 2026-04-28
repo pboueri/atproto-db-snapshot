@@ -96,6 +96,11 @@ image = (
             "LD_LIBRARY_PATH": "/opt/duckdb/lib",
             "RUSTFLAGS": "-C link-arg=-Wl,-rpath,/opt/duckdb/lib",
             "PATH": "/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            # tangled.org (which hosts our `eat-rocks` git dep) is flaky
+            # over libgit2; system-git's HTTPS handling rides through
+            # transient 502s much better.
+            "CARGO_NET_GIT_FETCH_WITH_CLI": "true",
+            "CARGO_NET_RETRY": "10",
         }
     )
     .add_local_dir(".", remote_path="/app", copy=True, ignore=SOURCE_IGNORE)
@@ -154,7 +159,12 @@ def _resolve_date(snapshot_date: str | None) -> str:
 
 def _rsync(src: str, dst: str, label: str) -> None:
     """Bulk-copy a directory tree. Trailing slashes matter: we use 'src/' so
-    rsync copies contents (not the parent) into 'dst/'."""
+    rsync copies contents (not the parent) into 'dst/'.
+
+    -W (--whole-file) skips rsync's block-checksum delta dance, which is
+    pure overhead when the destination is empty (our case: cold copies
+    onto a fresh ephemeral disk).
+    """
     if not os.path.exists(src):
         print(f"[rsync:{label}] skip — {src} does not exist", flush=True)
         return
@@ -163,13 +173,87 @@ def _rsync(src: str, dst: str, label: str) -> None:
     subprocess.check_call(
         [
             "rsync",
-            "-a",
+            "-aW",
             "--delete",
             "--info=stats2,progress2",
             src.rstrip("/") + "/",
             dst.rstrip("/") + "/",
         ]
     )
+
+
+def _pack_rocks(src_dir: str, dst_tar: str) -> None:
+    """Pack a rocksdb tree into one tar on the Volume.
+
+    Per Modal's dataset-ingestion guide: "Datasets made up of millions of
+    tiny files are still usually easier to ingest when grouped into
+    larger artifacts such as tar shards, WebDataset archives, Parquet
+    files, or other batched formats." Reading thousands of SST files
+    individually over FUSE is dominated by per-file metadata overhead;
+    one big tar is a single sequential read.
+
+    Idempotent: skips if the tar already exists. Writes via .tmp + rename
+    so a half-written tar from a killed run won't be picked up later.
+    """
+    if not os.path.exists(src_dir):
+        print(f"[pack] skip — {src_dir} does not exist", flush=True)
+        return
+    if os.path.exists(dst_tar):
+        sz = os.path.getsize(dst_tar)
+        print(
+            f"[pack] {dst_tar} already exists ({sz / 1e9:.1f} GB), skipping",
+            flush=True,
+        )
+        return
+    parent = os.path.dirname(src_dir.rstrip("/"))
+    name = os.path.basename(src_dir.rstrip("/"))
+    tmp = dst_tar + ".tmp"
+    print(f"[pack] {src_dir} -> {dst_tar}", flush=True)
+    t0 = time.time()
+    subprocess.check_call(["tar", "-c", "-f", tmp, "-C", parent, name])
+    os.rename(tmp, dst_tar)
+    sz = os.path.getsize(dst_tar)
+    elapsed = time.time() - t0
+    print(
+        f"[pack] {sz / 1e9:.1f} GB in {elapsed:.1f}s "
+        f"({sz / max(1, elapsed) / 1e6:.1f} MB/s)",
+        flush=True,
+    )
+
+
+def _unpack_rocks(src_tar: str, dst_parent: str) -> None:
+    """Untar src_tar into dst_parent (creates dst_parent/<inner>)."""
+    sz = os.path.getsize(src_tar)
+    os.makedirs(dst_parent, exist_ok=True)
+    print(f"[unpack] {src_tar} -> {dst_parent} ({sz / 1e9:.1f} GB)", flush=True)
+    t0 = time.time()
+    subprocess.check_call(["tar", "-x", "-f", src_tar, "-C", dst_parent])
+    elapsed = time.time() - t0
+    print(
+        f"[unpack] {sz / 1e9:.1f} GB in {elapsed:.1f}s "
+        f"({sz / max(1, elapsed) / 1e6:.1f} MB/s)",
+        flush=True,
+    )
+
+
+def _stage_rocks_to_scratch() -> None:
+    """Materialize <SCRATCH_WORK_DIR>/rocks for the stage subcommand.
+
+    Prefers the packed rocks.tar on the Volume (single sequential read);
+    falls back to per-file rsync of rocks/ if the tar isn't present yet
+    (e.g. running stage against a mirror that predates this change).
+    """
+    tar_path = f"{VOL_WORK_DIR}/rocks.tar"
+    if os.path.exists(tar_path):
+        _unpack_rocks(tar_path, SCRATCH_WORK_DIR)
+        return
+    print(
+        f"[stage-in] {tar_path} not present — falling back to per-file "
+        f"rsync of {VOL_WORK_DIR}/rocks (much slower; re-run mirror to "
+        f"create the tar).",
+        flush=True,
+    )
+    _rsync(f"{VOL_WORK_DIR}/rocks", f"{SCRATCH_WORK_DIR}/rocks", "rocks-in")
 
 
 class _PeriodicCommit:
@@ -258,8 +342,12 @@ def build(
     volume.commit()
     print("=== mirror committed ===", flush=True)
 
-    print("=== copy rocks: volume -> scratch ===", flush=True)
-    _rsync(f"{VOL_WORK_DIR}/rocks", f"{SCRATCH_WORK_DIR}/rocks", "rocks-in")
+    print("=== pack rocks tree to tar (one-time) ===", flush=True)
+    _pack_rocks(f"{VOL_WORK_DIR}/rocks", f"{VOL_WORK_DIR}/rocks.tar")
+    volume.commit()
+
+    print("=== unpack rocks: volume.tar -> scratch ===", flush=True)
+    _stage_rocks_to_scratch()
 
     print("=== phase 2/3: stage (on scratch) ===", flush=True)
     _run_subcommand("stage", common_scratch)
@@ -318,6 +406,9 @@ def single_phase(
         )
         with _PeriodicCommit(volume, interval_s=300):
             _run_subcommand("mirror", common)
+        # Pack into a tar so the next stage can pull it as one big
+        # sequential file instead of thousands of small SST reads.
+        _pack_rocks(f"{VOL_WORK_DIR}/rocks", f"{VOL_WORK_DIR}/rocks.tar")
         volume.commit()
         return
 
@@ -331,8 +422,8 @@ def single_phase(
     )
 
     if name == "stage":
-        print("=== copy rocks: volume -> scratch ===", flush=True)
-        _rsync(f"{VOL_WORK_DIR}/rocks", f"{SCRATCH_WORK_DIR}/rocks", "rocks-in")
+        print("=== unpack rocks: volume.tar -> scratch ===", flush=True)
+        _stage_rocks_to_scratch()
         _run_subcommand("stage", common_scratch)
         print("=== persist raw: scratch -> volume ===", flush=True)
         _rsync(
