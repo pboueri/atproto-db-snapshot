@@ -208,7 +208,7 @@ fn assert_validation_queries(conn: &Connection) -> Result<()> {
     // 3: distinct authors who got >=1 like
     let posters_with_likes: i64 = conn.query_row(
         "SELECT COUNT(DISTINCT p.author_did_id)
-         FROM posts p WHERE EXISTS (SELECT 1 FROM likes l WHERE l.subject_uri = p.uri)",
+         FROM posts p WHERE EXISTS (SELECT 1 FROM likes l WHERE l.subject_uri_id = p.uri_id)",
         [],
         |r| r.get(0),
     )?;
@@ -216,7 +216,7 @@ fn assert_validation_queries(conn: &Connection) -> Result<()> {
 
     // 4: posts with >=1 like
     let posts_with_likes: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM posts p WHERE EXISTS (SELECT 1 FROM likes l WHERE l.subject_uri = p.uri)",
+        "SELECT COUNT(*) FROM posts p WHERE EXISTS (SELECT 1 FROM likes l WHERE l.subject_uri_id = p.uri_id)",
         [],
         |r| r.get(0),
     )?;
