@@ -73,6 +73,8 @@ fn pass_a_actors(db: &DB, raw_dir: &std::path::Path, batch_size: usize) -> Resul
 
     let mut scanned = 0u64;
     let mut emitted = 0u64;
+    let mut bad_did_keys = 0u64;
+    let mut bad_did_values = 0u64;
     for item in iter {
         let (k, v) = item.context("iterate did_ids")?;
         scanned += 1;
@@ -83,27 +85,35 @@ fn pass_a_actors(db: &DB, raw_dir: &std::path::Path, batch_size: usize) -> Resul
         let did: Did = match rs::decode(&k) {
             Ok(d) => d,
             Err(e) => {
-                tracing::warn!(error=?e, "skipping undecodable did key");
+                if bad_did_keys == 0 {
+                    tracing::warn!(error=?e, key=?k, "first undecodable did key (further occurrences counted only)");
+                }
+                bad_did_keys += 1;
                 continue;
             }
         };
         let val: DidIdValue = match rs::decode(&v) {
             Ok(d) => d,
             Err(e) => {
-                tracing::warn!(error=?e, "skipping undecodable did value");
+                if bad_did_values == 0 {
+                    tracing::warn!(error=?e, key=?k, "first undecodable did value (further occurrences counted only)");
+                }
+                bad_did_values += 1;
                 continue;
             }
         };
         writer.push(val.0 .0, &did.0, val.1)?;
         emitted += 1;
         if emitted % 1_000_000 == 0 {
-            tracing::info!(scanned, emitted, "pass A progress");
+            tracing::info!(scanned, emitted, bad_did_keys, bad_did_values, "pass A progress");
         }
     }
     let (path, total) = writer.finish()?;
     tracing::info!(
         scanned,
         emitted = total,
+        bad_did_keys,
+        bad_did_values,
         path = %path.display(),
         "pass A complete"
     );
@@ -163,22 +173,33 @@ fn pass_b_link_targets(
     let mut target_uri_cache = lru::LruCache::<u64, (String, String, String)>::new(
         std::num::NonZeroUsize::new(200_000).unwrap(),
     );
+    let mut did_to_id_cache = lru::LruCache::<String, Option<u64>>::new(
+        std::num::NonZeroUsize::new(50_000).unwrap(),
+    );
 
     let mut scanned = 0u64;
+    let mut bad_link_keys = 0u64;
+    let mut bad_link_values = 0u64;
     for item in iter {
         let (k, v) = item.context("iterate link_targets")?;
         scanned += 1;
         let key: RecordLinkKey = match rs::decode(&k) {
             Ok(k) => k,
             Err(e) => {
-                tracing::warn!(error=?e, "skip undecodable link_targets key");
+                if bad_link_keys == 0 {
+                    tracing::warn!(error=?e, key=?k, "first undecodable link_targets key (further occurrences counted only)");
+                }
+                bad_link_keys += 1;
                 continue;
             }
         };
         let value: RecordLinkTargets = match rs::decode(&v) {
             Ok(v) => v,
             Err(e) => {
-                tracing::warn!(error=?e, "skip undecodable link_targets value");
+                if bad_link_values == 0 {
+                    tracing::warn!(error=?e, key=?k, "first undecodable link_targets value (further occurrences counted only)");
+                }
+                bad_link_values += 1;
                 continue;
             }
         };
@@ -236,7 +257,7 @@ fn pass_b_link_targets(
                     &mut target_uri_cache,
                 )? {
                     if let Some(dst_did_id) =
-                        resolve_did_to_id(db, cf_did_ids, &target)?
+                        resolve_did_to_id(db, cf_did_ids, &target, &mut did_to_id_cache)?
                     {
                         let writer = if collection == COL_FOLLOW {
                             &mut follows
@@ -260,6 +281,8 @@ fn pass_b_link_targets(
                 follows = counts.follows,
                 likes = counts.likes,
                 posts = counts.posts_from_records,
+                bad_link_keys,
+                bad_link_values,
                 "pass B progress"
             );
         }
@@ -279,6 +302,8 @@ fn pass_b_link_targets(
         reposts = counts.reposts,
         posts_from_records = counts.posts_from_records,
         post_media = counts.post_media,
+        bad_link_keys,
+        bad_link_values,
         "pass B complete"
     );
     Ok(counts)
@@ -301,6 +326,8 @@ fn pass_c_target_ids(
 
     let mut scanned = 0u64;
     let mut emitted = 0u64;
+    let mut bad_target_keys = 0u64;
+    let mut non_post_targets = 0u64;
     for item in iter {
         let (k, _v) = item.context("iterate target_ids")?;
         scanned += 1;
@@ -309,20 +336,40 @@ fn pass_c_target_ids(
         }
         let TargetKey(Target(target), _, _) = match rs::decode::<TargetKey>(&k) {
             Ok(t) => t,
-            Err(_) => continue,
+            Err(e) => {
+                if bad_target_keys == 0 {
+                    tracing::warn!(error=?e, key=?k, "first undecodable target_ids key (further occurrences counted only)");
+                }
+                bad_target_keys += 1;
+                continue;
+            }
         };
         let Some(uri) = parse_post_uri(&target) else {
+            non_post_targets += 1;
             continue;
         };
         let created = tid::decode_tid_micros(&uri.rkey);
         writer.push(&target, &uri.did, &uri.rkey, created)?;
         emitted += 1;
         if emitted % 1_000_000 == 0 {
-            tracing::info!(scanned, emitted, "pass C progress");
+            tracing::info!(
+                scanned,
+                emitted,
+                bad_target_keys,
+                non_post_targets,
+                "pass C progress"
+            );
         }
     }
     let (path, total) = writer.finish()?;
-    tracing::info!(scanned, emitted = total, path = %path.display(), "pass C complete");
+    tracing::info!(
+        scanned,
+        emitted = total,
+        bad_target_keys,
+        non_post_targets,
+        path = %path.display(),
+        "pass C complete"
+    );
     Ok(total)
 }
 
@@ -479,14 +526,21 @@ fn resolve_did_to_id(
     db: &DB,
     cf: &rocksdb::ColumnFamily,
     did_str: &str,
+    cache: &mut lru::LruCache<String, Option<u64>>,
 ) -> Result<Option<u64>> {
+    if let Some(v) = cache.get(did_str) {
+        return Ok(*v);
+    }
     let key = bincode::Options::serialize(rs::bincode_opts(), &Did(did_str.to_string()))
         .context("encode did key")?;
     let raw = db.get_cf(cf, key).context("get_cf did_ids forward")?;
-    let Some(raw) = raw else { return Ok(None) };
-    let val: DidIdValue = match rs::decode(&raw) {
-        Ok(v) => v,
-        Err(_) => return Ok(None),
+    let resolved = match raw {
+        Some(raw) => match rs::decode::<DidIdValue>(&raw) {
+            Ok(v) => Some(v.0 .0),
+            Err(_) => None,
+        },
+        None => None,
     };
-    Ok(Some(val.0 .0))
+    cache.put(did_str.to_string(), resolved);
+    Ok(resolved)
 }
