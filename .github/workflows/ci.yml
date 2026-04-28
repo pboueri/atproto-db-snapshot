@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  DUCKDB_VERSION: 1.5.2
+  DUCKDB_PREFIX: /opt/duckdb-1.5.2
+
+jobs:
+  test:
+    name: cargo build + test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install libduckdb (headers + shared library)
+        run: |
+          set -euo pipefail
+          sudo mkdir -p ${DUCKDB_PREFIX}/lib ${DUCKDB_PREFIX}/include
+          curl -fsSL -o /tmp/libduckdb.zip \
+            "https://github.com/duckdb/duckdb/releases/download/v${DUCKDB_VERSION}/libduckdb-linux-amd64.zip"
+          unzip -q /tmp/libduckdb.zip -d /tmp/libduckdb
+          sudo cp /tmp/libduckdb/libduckdb.so ${DUCKDB_PREFIX}/lib/
+          sudo cp /tmp/libduckdb/duckdb.h /tmp/libduckdb/duckdb.hpp ${DUCKDB_PREFIX}/include/
+          ls -l ${DUCKDB_PREFIX}/lib ${DUCKDB_PREFIX}/include
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: build
+          # Cache the bundled rocksdb C++ artifacts too — saves ~2 min.
+          cache-targets: true
+
+      - name: Configure cargo for system libduckdb
+        run: |
+          mkdir -p .cargo
+          cat > .cargo/config.toml <<EOF
+          [env]
+          DUCKDB_LIB_DIR     = "${DUCKDB_PREFIX}/lib"
+          DUCKDB_INCLUDE_DIR = "${DUCKDB_PREFIX}/include"
+
+          [target.x86_64-unknown-linux-gnu]
+          rustflags = ["-C", "link-arg=-Wl,-rpath,${DUCKDB_PREFIX}/lib"]
+          EOF
+          cat .cargo/config.toml
+
+      - name: cargo build
+        run: cargo build --release --tests --bin at-snapshot
+
+      - name: cargo test --lib
+        run: cargo test --release --lib
+
+      - name: cargo test --test end_to_end
+        run: cargo test --release --test end_to_end -- --nocapture
