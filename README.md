@@ -150,13 +150,20 @@ erDiagram
     actors    ||--o{ likes    : "actor_did_id"
     actors    ||--o{ reposts  : "actor_did_id"
     actors    ||--o{ posts    : "author_did_id"
-    posts     ||--o{ likes    : "subject_uri = uri"
-    posts     ||--o{ reposts  : "subject_uri = uri"
-    posts     ||--o{ post_media : "uri"
-    posts     ||--o| posts    : "reply / quote"
+    posts     ||--o{ likes    : "subject_uri_id = uri_id"
+    posts     ||--o{ reposts  : "subject_uri_id = uri_id"
+    posts     ||--o{ post_media : "uri_id"
+    posts     ||--o| posts    : "reply / quote (*_uri_id)"
     actors    ||--|| actor_aggs : did_id
-    posts     ||--|| post_aggs  : uri
+    posts     ||--|| post_aggs  : uri_id
 ```
+
+`posts` is the source of truth for post URIs: every unique URI is assigned
+a sequential `uri_id` (BIGINT). All other tables reference posts via
+`uri_id` and never store the URI string — join on `posts.uri_id` to recover
+the URI. `subject_uri_id` on `likes` / `reposts` is NULL when the subject
+isn't a post (orphan; typically a list or feed URI). Reply / quote
+references on posts are likewise `_uri_id` columns resolved via self-join.
 
 `source` on `posts` is `'record'` when we saw the post via constellation's
 `link_targets` (so reply/quote refs are present) or `'target_only'` when we

@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -20,6 +20,10 @@ pub struct Config {
     pub backup_id: Option<u64>,
     #[serde(default)]
     pub upload: Option<UploadConfig>,
+    #[serde(default = "default_rocks_block_cache")]
+    pub rocks_block_cache: String,
+    #[serde(default = "default_stage_threads")]
+    pub stage_threads: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -77,6 +81,37 @@ fn default_upload_include() -> Vec<String> {
     vec!["raw".to_string(), "snapshot".to_string()]
 }
 
+fn default_rocks_block_cache() -> String {
+    "1GiB".to_string()
+}
+
+fn default_stage_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+}
+
+pub fn parse_size(s: &str) -> Result<usize> {
+    let s = s.trim();
+    let split_at = s
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(s.len());
+    let (num, suffix) = s.split_at(split_at);
+    let n: f64 = num
+        .trim()
+        .parse()
+        .with_context(|| format!("parse size number from {s:?}"))?;
+    let mult: f64 = match suffix.trim().to_ascii_uppercase().as_str() {
+        "" | "B" => 1.0,
+        "K" | "KB" | "KIB" => 1024.0,
+        "M" | "MB" | "MIB" => 1024.0 * 1024.0,
+        "G" | "GB" | "GIB" => 1024.0 * 1024.0 * 1024.0,
+        "T" | "TB" | "TIB" => 1024.0 * 1024.0 * 1024.0 * 1024.0,
+        other => return Err(anyhow!("unknown size suffix in {s:?}: {other:?}")),
+    };
+    Ok((n * mult) as usize)
+}
+
 impl Config {
     pub fn from_toml_file(path: &std::path::Path) -> Result<Self> {
         let body = std::fs::read_to_string(path)
@@ -94,7 +129,13 @@ impl Config {
             mirror_concurrency: default_mirror_concurrency(),
             backup_id: None,
             upload: None,
+            rocks_block_cache: default_rocks_block_cache(),
+            stage_threads: default_stage_threads(),
         }
+    }
+
+    pub fn rocks_block_cache_bytes(&self) -> Result<usize> {
+        parse_size(&self.rocks_block_cache)
     }
 
     pub fn rocks_dir(&self) -> PathBuf {
