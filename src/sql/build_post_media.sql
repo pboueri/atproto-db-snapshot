@@ -1,6 +1,8 @@
 -- post_media: one row per media-rpath target on a feed.post record. `ord`
 -- is dense within each post (0..N-1) following the order the targets
--- appeared in the original RecordLinkTargets vec.
+-- appeared in the original RecordLinkTargets vec. Joins to posts via
+-- (author_did_id, rkey) — every post_media row comes from a record, and
+-- record-derived posts retain their (author_did_id, rkey) verbatim.
 
 CREATE TABLE post_media AS
 WITH media_targets AS (
@@ -29,7 +31,7 @@ WITH media_targets AS (
     )
 )
 SELECT
-  'at://' || a.did || '/' || r.collection || '/' || r.rkey AS uri,
+  p.uri_id,
   CAST(ROW_NUMBER() OVER (
     PARTITION BY m.did_id, m.rkey
     ORDER BY     m.source_ord
@@ -37,9 +39,6 @@ SELECT
   m.kind,
   m.ref
 FROM media_targets m
-JOIN link_records r
-  ON  r.did_id     = m.did_id
-  AND r.collection = m.collection
-  AND r.rkey       = m.rkey
-JOIN actors a
-  ON a.did_id = r.did_id;
+JOIN posts p
+  ON  p.author_did_id = m.did_id
+  AND p.rkey          = m.rkey;

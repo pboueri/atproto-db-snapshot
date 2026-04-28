@@ -24,11 +24,11 @@ LEFT JOIN (SELECT dst_did_id AS did_id, COUNT(*) c FROM blocks  GROUP BY 1) b_in
 LEFT JOIN (SELECT author_did_id AS did_id, COUNT(*) c FROM posts GROUP BY 1) p USING(did_id)
 LEFT JOIN (SELECT actor_did_id AS did_id, COUNT(*) c FROM likes GROUP BY 1) l_out USING(did_id)
 LEFT JOIN (SELECT p.author_did_id AS did_id, COUNT(*) c
-           FROM likes l JOIN posts p ON p.uri = l.subject_uri GROUP BY 1) l_in USING(did_id)
+           FROM likes l JOIN posts p ON p.uri_id = l.subject_uri_id GROUP BY 1) l_in USING(did_id)
 LEFT JOIN (SELECT actor_did_id AS did_id, COUNT(*) c FROM reposts GROUP BY 1) r_out USING(did_id)
 LEFT JOIN (SELECT p.author_did_id AS did_id, COUNT(*) c
-           FROM reposts r JOIN posts p ON p.uri = r.subject_uri GROUP BY 1) r_in USING(did_id)
-LEFT JOIN (SELECT author_did_id AS did_id, COUNT(*) c FROM posts WHERE reply_parent_uri IS NOT NULL GROUP BY 1) rep USING(did_id)
-LEFT JOIN (SELECT author_did_id AS did_id, COUNT(*) c FROM posts WHERE quote_uri IS NOT NULL GROUP BY 1) qo USING(did_id)
+           FROM reposts r JOIN posts p ON p.uri_id = r.subject_uri_id GROUP BY 1) r_in USING(did_id)
+LEFT JOIN (SELECT author_did_id AS did_id, COUNT(*) c FROM posts WHERE reply_parent_uri_id IS NOT NULL GROUP BY 1) rep USING(did_id)
+LEFT JOIN (SELECT author_did_id AS did_id, COUNT(*) c FROM posts WHERE quote_uri_id IS NOT NULL GROUP BY 1) qo USING(did_id)
 LEFT JOIN (SELECT p.author_did_id AS did_id, COUNT(*) c
-           FROM posts q JOIN posts p ON p.uri = q.quote_uri GROUP BY 1) qd USING(did_id);
+           FROM posts q JOIN posts p ON p.uri_id = q.quote_uri_id GROUP BY 1) qd USING(did_id);
