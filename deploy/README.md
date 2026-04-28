@@ -1,8 +1,30 @@
 # Modal driver
 
 `modal_app.py` runs the at-snapshot pipeline on a Modal container so it
-has the disk and bandwidth a full constellation backup needs (~650 GB
-download peak, ~700 GB on disk peak).
+has the disk and bandwidth a full constellation backup needs (~600 GB
+download, ~700 GB on disk peak).
+
+## Cost & persistence
+
+Compute, on Modal Standard (8 CPU + 32 GiB) — back-of-envelope:
+
+| Phase | Approx wall time |
+|---|---|
+| Mirror     | ~1 h |
+| Stage      | ~3 h |
+| Hydrate    | ~1 h |
+| **Total**  | ~5 h |
+
+At Modal's compute rates that's roughly **~$8 per build**. Volume
+storage charges (if any) depend on your Modal plan — see
+[modal.com/pricing](https://modal.com/pricing). Constellation dedups
+SSTs in `shared_checksum/`, so the second build only pulls deltas —
+leaving the rocks mirror in place is the cheap path for recurring
+snapshots.
+
+Each phase calls `volume.commit()` on success, and the mirror also
+commits in a background thread every 5 minutes, so a container crash
+mid-mirror leaves the partial state visible to the next run.
 
 ## One-time setup
 
