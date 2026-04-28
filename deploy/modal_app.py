@@ -21,17 +21,29 @@ Upload requires a Modal Secret named `r2-credentials` exposing
 `R2_ACCESS_KEY_ID` and `R2_SECRET_ACCESS_KEY`. Non-secret R2 settings
 (bucket, account_id, prefix) live in the config file the binary loads.
 """
+
 from __future__ import annotations
 
 import os
 import subprocess
 import threading
 import time
+from datetime import datetime, timezone
 from typing import Iterable
 
 import modal
 
 DUCKDB_VERSION = "1.5.2"
+
+# Persistent storage (Modal Volume, network-FUSE; slow random reads).
+# Mirror lives here forever so we don't re-download from constellation.
+VOL_WORK_DIR = "/vol/var"
+
+# Ephemeral local storage (declared via `ephemeral_disk` on each function;
+# local NVMe-class). We rsync the rocksdb mirror here before stage so the
+# random-read-heavy CF scans run against local disk, then rsync the
+# resulting parquet / duckdb back to the Volume to persist them.
+SCRATCH_WORK_DIR = "/scratch/var"
 
 # ---------------------------------------------------------------------------
 # Image: Debian + Rust + libduckdb + the source tree, compiled in release.
@@ -65,6 +77,7 @@ image = (
         "git",
         "unzip",
         "zlib1g-dev",
+        "rsync",
     )
     .run_commands(
         "curl -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal",
@@ -106,10 +119,11 @@ def _common_args(
     mirror_concurrency: int,
     memory_limit: str,
     config: str | None,
+    work_dir: str = VOL_WORK_DIR,
 ) -> list[str]:
     args = [
         "--work-dir",
-        "/vol/var",
+        work_dir,
         "--memory-limit",
         memory_limit,
         "--mirror-concurrency",
@@ -128,7 +142,34 @@ def _run_subcommand(subcommand: str, common: Iterable[str]) -> None:
     args = ["/app/target/release/at-snapshot", subcommand, *list(common)]
     env = {**os.environ, "RUST_LOG": "info,object_store=warn"}
     print("running:", " ".join(args), flush=True)
-    subprocess.check_call(args, env=env)
+    # cwd=/app so relative --config paths (e.g. deploy/at-snapshot.toml)
+    # resolve against the source tree shipped into the image.
+    subprocess.check_call(args, env=env, cwd="/app")
+
+
+def _resolve_date(snapshot_date: str | None) -> str:
+    """Mirror the binary's default of today UTC so we can name rsync paths."""
+    return snapshot_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def _rsync(src: str, dst: str, label: str) -> None:
+    """Bulk-copy a directory tree. Trailing slashes matter: we use 'src/' so
+    rsync copies contents (not the parent) into 'dst/'."""
+    if not os.path.exists(src):
+        print(f"[rsync:{label}] skip — {src} does not exist", flush=True)
+        return
+    os.makedirs(dst, exist_ok=True)
+    print(f"[rsync:{label}] {src} -> {dst}", flush=True)
+    subprocess.check_call(
+        [
+            "rsync",
+            "-a",
+            "--delete",
+            "--info=stats2,progress2",
+            src.rstrip("/") + "/",
+            dst.rstrip("/") + "/",
+        ]
+    )
 
 
 class _PeriodicCommit:
@@ -162,7 +203,10 @@ class _PeriodicCommit:
         while not self._stop.wait(self._interval):
             try:
                 self._vol.commit()
-                print(f"[commit] volume committed at {time.strftime('%H:%M:%S')}", flush=True)
+                print(
+                    f"[commit] volume committed at {time.strftime('%H:%M:%S')}",
+                    flush=True,
+                )
             except Exception as e:  # noqa: BLE001
                 print(f"[commit] background commit failed: {e}", flush=True)
 
@@ -182,28 +226,56 @@ def build(
     memory_limit: str = "8GiB",
     config: str | None = None,
 ) -> None:
-    """Run mirror + stage + hydrate as three separate subcommands."""
-    common = _common_args(
+    """Run mirror + stage + hydrate as three separate subcommands.
+
+    Mirror writes to the persistent Volume so the ~80GB rocksdb survives
+    container restarts. Stage and hydrate run against ephemeral local disk
+    (NVMe-class) instead of Volume FUSE, with rsync moving data in/out at
+    the boundaries — bulk sequential transfers are dramatically faster
+    than RocksDB's random reads against a network filesystem.
+    """
+    date = _resolve_date(snapshot_date)
+    common_vol = _common_args(
         backup_id=backup_id,
-        snapshot_date=snapshot_date,
+        snapshot_date=date,
         mirror_concurrency=mirror_concurrency,
         memory_limit=memory_limit,
         config=config,
+        work_dir=VOL_WORK_DIR,
+    )
+    common_scratch = _common_args(
+        backup_id=backup_id,
+        snapshot_date=date,
+        mirror_concurrency=mirror_concurrency,
+        memory_limit=memory_limit,
+        config=config,
+        work_dir=SCRATCH_WORK_DIR,
     )
 
     print("=== phase 1/3: mirror ===", flush=True)
     with _PeriodicCommit(volume, interval_s=300):
-        _run_subcommand("mirror", common)
+        _run_subcommand("mirror", common_vol)
     volume.commit()
     print("=== mirror committed ===", flush=True)
 
-    print("=== phase 2/3: stage ===", flush=True)
-    _run_subcommand("stage", common)
+    print("=== copy rocks: volume -> scratch ===", flush=True)
+    _rsync(f"{VOL_WORK_DIR}/rocks", f"{SCRATCH_WORK_DIR}/rocks", "rocks-in")
+
+    print("=== phase 2/3: stage (on scratch) ===", flush=True)
+    _run_subcommand("stage", common_scratch)
+    print("=== persist raw: scratch -> volume ===", flush=True)
+    _rsync(f"{SCRATCH_WORK_DIR}/raw/{date}", f"{VOL_WORK_DIR}/raw/{date}", "raw-out")
     volume.commit()
     print("=== stage committed ===", flush=True)
 
-    print("=== phase 3/3: hydrate ===", flush=True)
-    _run_subcommand("hydrate", common)
+    print("=== phase 3/3: hydrate (on scratch) ===", flush=True)
+    _run_subcommand("hydrate", common_scratch)
+    print("=== persist snapshot: scratch -> volume ===", flush=True)
+    _rsync(
+        f"{SCRATCH_WORK_DIR}/snapshot/{date}",
+        f"{VOL_WORK_DIR}/snapshot/{date}",
+        "snapshot-out",
+    )
     volume.commit()
     print("=== hydrate committed; snapshot ready ===", flush=True)
 
@@ -224,28 +296,74 @@ def single_phase(
     memory_limit: str = "8GiB",
     config: str | None = None,
 ) -> None:
-    """Run a single phase: mirror, stage, or hydrate."""
+    """Run a single phase: mirror, stage, or hydrate.
+
+    Mirror writes directly to the Volume. Stage and hydrate stage their
+    inputs onto ephemeral local disk first, run there, and rsync outputs
+    back. Each Modal call gets a fresh ephemeral filesystem, so we always
+    have to rehydrate scratch before stage / hydrate.
+    """
     if name not in {"mirror", "stage", "hydrate"}:
         raise SystemExit(f"name must be mirror/stage/hydrate, got {name!r}")
-    common = _common_args(
+    date = _resolve_date(snapshot_date)
+
+    if name == "mirror":
+        common = _common_args(
+            backup_id=backup_id,
+            snapshot_date=date,
+            mirror_concurrency=mirror_concurrency,
+            memory_limit=memory_limit,
+            config=config,
+            work_dir=VOL_WORK_DIR,
+        )
+        with _PeriodicCommit(volume, interval_s=300):
+            _run_subcommand("mirror", common)
+        volume.commit()
+        return
+
+    common_scratch = _common_args(
         backup_id=backup_id,
-        snapshot_date=snapshot_date,
+        snapshot_date=date,
         mirror_concurrency=mirror_concurrency,
         memory_limit=memory_limit,
         config=config,
+        work_dir=SCRATCH_WORK_DIR,
     )
-    if name == "mirror":
-        with _PeriodicCommit(volume, interval_s=300):
-            _run_subcommand("mirror", common)
-    else:
-        _run_subcommand(name, common)
+
+    if name == "stage":
+        print("=== copy rocks: volume -> scratch ===", flush=True)
+        _rsync(f"{VOL_WORK_DIR}/rocks", f"{SCRATCH_WORK_DIR}/rocks", "rocks-in")
+        _run_subcommand("stage", common_scratch)
+        print("=== persist raw: scratch -> volume ===", flush=True)
+        _rsync(
+            f"{SCRATCH_WORK_DIR}/raw/{date}",
+            f"{VOL_WORK_DIR}/raw/{date}",
+            "raw-out",
+        )
+        volume.commit()
+        return
+
+    # hydrate
+    print("=== copy raw: volume -> scratch ===", flush=True)
+    _rsync(
+        f"{VOL_WORK_DIR}/raw/{date}",
+        f"{SCRATCH_WORK_DIR}/raw/{date}",
+        "raw-in",
+    )
+    _run_subcommand("hydrate", common_scratch)
+    print("=== persist snapshot: scratch -> volume ===", flush=True)
+    _rsync(
+        f"{SCRATCH_WORK_DIR}/snapshot/{date}",
+        f"{VOL_WORK_DIR}/snapshot/{date}",
+        "snapshot-out",
+    )
     volume.commit()
 
 
 @app.function(
     image=image,
     volumes={"/vol": volume},
-    secrets=[modal.Secret.from_name("r2-credentials")],
+    secrets=[modal.Secret.from_name("atproto-snapshot")],
     timeout=60 * 60 * 4,
     cpu=2.0,
     memory=4 * 1024,
