@@ -9,6 +9,7 @@ use super::common::AtomicParquet;
 
 pub struct PostMediaWriter {
     inner: AtomicParquet,
+    schema: Arc<Schema>,
     batch_size: usize,
     rows: usize,
     total: u64,
@@ -21,9 +22,10 @@ pub struct PostMediaWriter {
 impl PostMediaWriter {
     pub fn create(path: PathBuf, batch_size: usize) -> Result<Self> {
         let schema = Self::schema();
-        let inner = AtomicParquet::create(path, schema)?;
+        let inner = AtomicParquet::create(path, schema.clone())?;
         Ok(Self {
             inner,
+            schema,
             batch_size,
             rows: 0,
             total: 0,
@@ -59,13 +61,24 @@ impl PostMediaWriter {
         if self.rows == 0 {
             return Ok(());
         }
+        let bs = self.batch_size;
+        let mut uri =
+            std::mem::replace(&mut self.uri, StringBuilder::with_capacity(bs, bs * 80));
+        let mut ord = std::mem::replace(&mut self.ord, Int32Builder::with_capacity(bs));
+        let mut kind =
+            std::mem::replace(&mut self.kind, StringBuilder::with_capacity(bs, bs * 8));
+        let mut reference = std::mem::replace(
+            &mut self.reference,
+            StringBuilder::with_capacity(bs, bs * 64),
+        );
         let cols: Vec<ArrayRef> = vec![
-            Arc::new(self.uri.finish()),
-            Arc::new(self.ord.finish()),
-            Arc::new(self.kind.finish()),
-            Arc::new(self.reference.finish()),
+            Arc::new(uri.finish()),
+            Arc::new(ord.finish()),
+            Arc::new(kind.finish()),
+            Arc::new(reference.finish()),
         ];
-        let batch = RecordBatch::try_new(Self::schema(), cols).context("post media batch")?;
+        let batch =
+            RecordBatch::try_new(self.schema.clone(), cols).context("post media batch")?;
         self.inner
             .writer
             .write(&batch)

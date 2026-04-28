@@ -9,6 +9,7 @@ use super::common::AtomicParquet;
 
 pub struct ActorWriter {
     inner: AtomicParquet,
+    schema: Arc<Schema>,
     batch_size: usize,
     rows: usize,
     total: u64,
@@ -20,9 +21,10 @@ pub struct ActorWriter {
 impl ActorWriter {
     pub fn create(path: PathBuf, batch_size: usize) -> Result<Self> {
         let schema = Self::schema();
-        let inner = AtomicParquet::create(path, schema)?;
+        let inner = AtomicParquet::create(path, schema.clone())?;
         Ok(ActorWriter {
             inner,
+            schema,
             batch_size,
             rows: 0,
             total: 0,
@@ -55,12 +57,19 @@ impl ActorWriter {
         if self.rows == 0 {
             return Ok(());
         }
+        let bs = self.batch_size;
+        let mut did_id =
+            std::mem::replace(&mut self.did_id, UInt64Builder::with_capacity(bs));
+        let mut did =
+            std::mem::replace(&mut self.did, StringBuilder::with_capacity(bs, bs * 32));
+        let mut active =
+            std::mem::replace(&mut self.active, BooleanBuilder::with_capacity(bs));
         let cols: Vec<ArrayRef> = vec![
-            Arc::new(self.did_id.finish()),
-            Arc::new(self.did.finish()),
-            Arc::new(self.active.finish()),
+            Arc::new(did_id.finish()),
+            Arc::new(did.finish()),
+            Arc::new(active.finish()),
         ];
-        let batch = RecordBatch::try_new(Self::schema(), cols).context("actor batch")?;
+        let batch = RecordBatch::try_new(self.schema.clone(), cols).context("actor batch")?;
         self.inner.writer.write(&batch).context("write actor batch")?;
         self.total += self.rows as u64;
         self.rows = 0;

@@ -14,6 +14,7 @@ pub type RepostWriter = ActorSubjectEdgeWriter;
 
 pub struct ActorActorEdgeWriter {
     inner: AtomicParquet,
+    schema: Arc<Schema>,
     batch_size: usize,
     rows: usize,
     total: u64,
@@ -21,8 +22,6 @@ pub struct ActorActorEdgeWriter {
     dst: UInt64Builder,
     rkey: StringBuilder,
     created_at: TimestampMicrosecondBuilder,
-    src_name: &'static str,
-    dst_name: &'static str,
 }
 
 impl ActorActorEdgeWriter {
@@ -33,9 +32,10 @@ impl ActorActorEdgeWriter {
         dst_name: &'static str,
     ) -> Result<Self> {
         let schema = Self::schema(src_name, dst_name);
-        let inner = AtomicParquet::create(path, schema)?;
+        let inner = AtomicParquet::create(path, schema.clone())?;
         Ok(Self {
             inner,
+            schema,
             batch_size,
             rows: 0,
             total: 0,
@@ -43,8 +43,6 @@ impl ActorActorEdgeWriter {
             dst: UInt64Builder::with_capacity(batch_size),
             rkey: StringBuilder::with_capacity(batch_size, batch_size * 16),
             created_at: TimestampMicrosecondBuilder::with_capacity(batch_size),
-            src_name,
-            dst_name,
         })
     }
 
@@ -80,14 +78,22 @@ impl ActorActorEdgeWriter {
         if self.rows == 0 {
             return Ok(());
         }
+        let bs = self.batch_size;
+        let mut src = std::mem::replace(&mut self.src, UInt64Builder::with_capacity(bs));
+        let mut dst = std::mem::replace(&mut self.dst, UInt64Builder::with_capacity(bs));
+        let mut rkey =
+            std::mem::replace(&mut self.rkey, StringBuilder::with_capacity(bs, bs * 16));
+        let mut created_at = std::mem::replace(
+            &mut self.created_at,
+            TimestampMicrosecondBuilder::with_capacity(bs),
+        );
         let cols: Vec<ArrayRef> = vec![
-            Arc::new(self.src.finish()),
-            Arc::new(self.dst.finish()),
-            Arc::new(self.rkey.finish()),
-            Arc::new(self.created_at.finish()),
+            Arc::new(src.finish()),
+            Arc::new(dst.finish()),
+            Arc::new(rkey.finish()),
+            Arc::new(created_at.finish()),
         ];
-        let batch = RecordBatch::try_new(Self::schema(self.src_name, self.dst_name), cols)
-            .context("edge batch")?;
+        let batch = RecordBatch::try_new(self.schema.clone(), cols).context("edge batch")?;
         self.inner.writer.write(&batch).context("write edge batch")?;
         self.total += self.rows as u64;
         self.rows = 0;
@@ -104,6 +110,7 @@ impl ActorActorEdgeWriter {
 
 pub struct ActorSubjectEdgeWriter {
     inner: AtomicParquet,
+    schema: Arc<Schema>,
     batch_size: usize,
     rows: usize,
     total: u64,
@@ -116,9 +123,10 @@ pub struct ActorSubjectEdgeWriter {
 impl ActorSubjectEdgeWriter {
     pub fn create(path: PathBuf, batch_size: usize) -> Result<Self> {
         let schema = Self::schema();
-        let inner = AtomicParquet::create(path, schema)?;
+        let inner = AtomicParquet::create(path, schema.clone())?;
         Ok(Self {
             inner,
+            schema,
             batch_size,
             rows: 0,
             total: 0,
@@ -167,13 +175,27 @@ impl ActorSubjectEdgeWriter {
         if self.rows == 0 {
             return Ok(());
         }
+        let bs = self.batch_size;
+        let mut actor =
+            std::mem::replace(&mut self.actor, UInt64Builder::with_capacity(bs));
+        let mut subject_uri = std::mem::replace(
+            &mut self.subject_uri,
+            StringBuilder::with_capacity(bs, bs * 64),
+        );
+        let mut rkey =
+            std::mem::replace(&mut self.rkey, StringBuilder::with_capacity(bs, bs * 16));
+        let mut created_at = std::mem::replace(
+            &mut self.created_at,
+            TimestampMicrosecondBuilder::with_capacity(bs),
+        );
         let cols: Vec<ArrayRef> = vec![
-            Arc::new(self.actor.finish()),
-            Arc::new(self.subject_uri.finish()),
-            Arc::new(self.rkey.finish()),
-            Arc::new(self.created_at.finish()),
+            Arc::new(actor.finish()),
+            Arc::new(subject_uri.finish()),
+            Arc::new(rkey.finish()),
+            Arc::new(created_at.finish()),
         ];
-        let batch = RecordBatch::try_new(Self::schema(), cols).context("subject edge batch")?;
+        let batch =
+            RecordBatch::try_new(self.schema.clone(), cols).context("subject edge batch")?;
         self.inner
             .writer
             .write(&batch)

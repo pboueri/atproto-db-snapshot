@@ -9,6 +9,7 @@ use super::common::AtomicParquet;
 
 pub struct PostFromRecordWriter {
     inner: AtomicParquet,
+    schema: Arc<Schema>,
     batch_size: usize,
     rows: usize,
     total: u64,
@@ -24,9 +25,10 @@ pub struct PostFromRecordWriter {
 impl PostFromRecordWriter {
     pub fn create(path: PathBuf, batch_size: usize) -> Result<Self> {
         let schema = Self::schema();
-        let inner = AtomicParquet::create(path, schema)?;
+        let inner = AtomicParquet::create(path, schema.clone())?;
         Ok(Self {
             inner,
+            schema,
             batch_size,
             rows: 0,
             total: 0,
@@ -97,16 +99,42 @@ impl PostFromRecordWriter {
         if self.rows == 0 {
             return Ok(());
         }
+        let bs = self.batch_size;
+        let mut uri =
+            std::mem::replace(&mut self.uri, StringBuilder::with_capacity(bs, bs * 80));
+        let mut author_did_id = std::mem::replace(
+            &mut self.author_did_id,
+            UInt64Builder::with_capacity(bs),
+        );
+        let mut rkey =
+            std::mem::replace(&mut self.rkey, StringBuilder::with_capacity(bs, bs * 16));
+        let mut created_at = std::mem::replace(
+            &mut self.created_at,
+            TimestampMicrosecondBuilder::with_capacity(bs),
+        );
+        let mut reply_root_uri = std::mem::replace(
+            &mut self.reply_root_uri,
+            StringBuilder::with_capacity(bs, bs * 16),
+        );
+        let mut reply_parent_uri = std::mem::replace(
+            &mut self.reply_parent_uri,
+            StringBuilder::with_capacity(bs, bs * 16),
+        );
+        let mut quote_uri = std::mem::replace(
+            &mut self.quote_uri,
+            StringBuilder::with_capacity(bs, bs * 16),
+        );
         let cols: Vec<ArrayRef> = vec![
-            Arc::new(self.uri.finish()),
-            Arc::new(self.author_did_id.finish()),
-            Arc::new(self.rkey.finish()),
-            Arc::new(self.created_at.finish()),
-            Arc::new(self.reply_root_uri.finish()),
-            Arc::new(self.reply_parent_uri.finish()),
-            Arc::new(self.quote_uri.finish()),
+            Arc::new(uri.finish()),
+            Arc::new(author_did_id.finish()),
+            Arc::new(rkey.finish()),
+            Arc::new(created_at.finish()),
+            Arc::new(reply_root_uri.finish()),
+            Arc::new(reply_parent_uri.finish()),
+            Arc::new(quote_uri.finish()),
         ];
-        let batch = RecordBatch::try_new(Self::schema(), cols).context("post-from-record batch")?;
+        let batch =
+            RecordBatch::try_new(self.schema.clone(), cols).context("post-from-record batch")?;
         self.inner
             .writer
             .write(&batch)
@@ -126,6 +154,7 @@ impl PostFromRecordWriter {
 
 pub struct PostFromTargetWriter {
     inner: AtomicParquet,
+    schema: Arc<Schema>,
     batch_size: usize,
     rows: usize,
     total: u64,
@@ -138,9 +167,10 @@ pub struct PostFromTargetWriter {
 impl PostFromTargetWriter {
     pub fn create(path: PathBuf, batch_size: usize) -> Result<Self> {
         let schema = Self::schema();
-        let inner = AtomicParquet::create(path, schema)?;
+        let inner = AtomicParquet::create(path, schema.clone())?;
         Ok(Self {
             inner,
+            schema,
             batch_size,
             rows: 0,
             total: 0,
@@ -189,13 +219,27 @@ impl PostFromTargetWriter {
         if self.rows == 0 {
             return Ok(());
         }
+        let bs = self.batch_size;
+        let mut uri =
+            std::mem::replace(&mut self.uri, StringBuilder::with_capacity(bs, bs * 80));
+        let mut author_did = std::mem::replace(
+            &mut self.author_did,
+            StringBuilder::with_capacity(bs, bs * 32),
+        );
+        let mut rkey =
+            std::mem::replace(&mut self.rkey, StringBuilder::with_capacity(bs, bs * 16));
+        let mut created_at = std::mem::replace(
+            &mut self.created_at,
+            TimestampMicrosecondBuilder::with_capacity(bs),
+        );
         let cols: Vec<ArrayRef> = vec![
-            Arc::new(self.uri.finish()),
-            Arc::new(self.author_did.finish()),
-            Arc::new(self.rkey.finish()),
-            Arc::new(self.created_at.finish()),
+            Arc::new(uri.finish()),
+            Arc::new(author_did.finish()),
+            Arc::new(rkey.finish()),
+            Arc::new(created_at.finish()),
         ];
-        let batch = RecordBatch::try_new(Self::schema(), cols).context("post-from-target batch")?;
+        let batch =
+            RecordBatch::try_new(self.schema.clone(), cols).context("post-from-target batch")?;
         self.inner
             .writer
             .write(&batch)
