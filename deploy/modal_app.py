@@ -164,8 +164,8 @@ class _PeriodicCommit:
     image=image,
     volumes={"/vol": volume},
     timeout=60 * 60 * 10,  # 10h ceiling
-    cpu=8.0,
-    memory=32 * 1024,
+    cpu=4.0,
+    memory=12 * 1024,
     ephemeral_disk=1024 * 1024,  # 1 TiB
 )
 def build(
@@ -175,7 +175,7 @@ def build(
     backup_id: int | None = None,
     snapshot_date: str | None = None,
     mirror_concurrency: int = 64,
-    memory_limit: str = "24GiB",
+    memory_limit: str = "8GiB",
 ) -> None:
     common = dict(
         backup_id=backup_id,
@@ -239,7 +239,7 @@ def main(
     backup_id: int | None = None,
     snapshot_date: str | None = None,
     mirror_concurrency: int = 64,
-    memory_limit: str = "24GiB",
+    memory_limit: str = "8GiB",
 ) -> None:
     build.remote(
         skip_mirror=skip_mirror,

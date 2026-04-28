@@ -6,7 +6,7 @@ download, ~700 GB on disk peak).
 
 ## Cost & persistence
 
-Compute, on Modal Standard (8 CPU + 32 GiB) — back-of-envelope:
+Compute, on Modal Standard (4 CPU + 12 GiB) — back-of-envelope:
 
 | Phase | Approx wall time |
 |---|---|
@@ -75,7 +75,7 @@ new SST files since the last backup.
 | `--backup-id` | latest | Pin a constellation backup id (`meta/<id>` in the bucket). |
 | `--snapshot-date` | today UTC | Output namespace. |
 | `--mirror-concurrency` | 64 | Drop to 8–16 if Tigris rate-limits. |
-| `--memory-limit` | 24GiB | DuckDB cap. |
+| `--memory-limit` | 8GiB | DuckDB cap. |
 | `--skip-{mirror,stage,hydrate}` | — | Resume mid-pipeline. |
 
 ## R2 upload
