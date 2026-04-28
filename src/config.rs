@@ -41,7 +41,7 @@ fn default_batch_size() -> usize {
 }
 
 fn default_disk_cap_bytes() -> u64 {
-    100 * 1024 * 1024 * 1024
+    150 * 1024 * 1024 * 1024
 }
 
 fn default_mirror_concurrency() -> usize {

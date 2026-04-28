@@ -34,7 +34,7 @@ at-snapshot build [flags]
 | `--source-url <url>` | `https://constellation.t3.storage.dev` | eat-rocks source. |
 | `--backup-id <u64>` | latest | Pin a specific constellation backup. |
 | `--mirror-concurrency <n>` | `32` | eat-rocks fetch concurrency. Drop to 8 if you hit timeouts. |
-| `--disk-cap-bytes <bytes>` | 100 GiB | Hard cap on `--work-dir`. The pipeline aborts if exceeded. |
+| `--disk-cap-bytes <bytes>` | 150 GiB | Hard cap on `--work-dir`. The pipeline aborts if exceeded. |
 | `--skip-mirror` | — | Reuse existing `./var/rocks/`. |
 | `--skip-stage` | — | Reuse existing `./var/raw/<date>/*.parquet`. |
 | `--skip-hydrate` | — | Stop after staging. |
