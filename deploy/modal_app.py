@@ -201,6 +201,16 @@ def _dir_has_files(path: str) -> bool:
     return False
 
 
+def _rocks_looks_complete(rocks_dir: str) -> bool:
+    """Mirror src/mirror.rs:existing_db_looks_complete: a rocks tree is
+    considered usable if both CURRENT and .cursor are present. .cursor
+    is written only after the eat-rocks restore finishes successfully,
+    so it's a reliable end-of-mirror marker."""
+    return os.path.exists(os.path.join(rocks_dir, "CURRENT")) and os.path.exists(
+        os.path.join(rocks_dir, ".cursor")
+    )
+
+
 def _copy_concurrent(
     src: str,
     dst: str,
@@ -256,6 +266,47 @@ def _copy_concurrent(
     )
 
 
+def _obtain_rocks_at_tmp(common_tmp: list[str]) -> None:
+    """Ensure /tmp/var/rocks holds a complete rocks tree, choosing the
+    cheapest path:
+
+      1. Already present at /tmp/var/rocks (e.g. mirror just ran in
+         this container) — nothing to do.
+      2. Already persisted on /vol/var/rocks from a prior run — copy
+         volume → /tmp via the parallel copier. No constellation
+         download. No /vol write.
+      3. Neither — run the binary's mirror subcommand to download from
+         constellation into /tmp, then persist /tmp → /vol.
+    """
+    if _rocks_looks_complete(f"{TMP_WORK_DIR}/rocks"):
+        print(
+            f"[mirror] {TMP_WORK_DIR}/rocks already complete; reusing in place",
+            flush=True,
+        )
+        return
+    if _rocks_looks_complete(f"{VOL_WORK_DIR}/rocks"):
+        print(
+            "[mirror] using existing rocks from volume (skipping download)",
+            flush=True,
+        )
+        _copy_concurrent(
+            f"{VOL_WORK_DIR}/rocks",
+            f"{TMP_WORK_DIR}/rocks",
+            "rocks-vol-to-tmp",
+        )
+        return
+    print(
+        "[mirror] no existing rocks; downloading from constellation to /tmp",
+        flush=True,
+    )
+    _run_subcommand("mirror", common_tmp)
+    print("[mirror] persisting fresh rocks: /tmp -> volume", flush=True)
+    _copy_concurrent(
+        f"{TMP_WORK_DIR}/rocks", f"{VOL_WORK_DIR}/rocks", "rocks-tmp-to-vol"
+    )
+    volume.commit()
+
+
 @app.function(
     image=image,
     volumes={"/vol": volume},
@@ -291,13 +342,8 @@ def build(
         work_dir=TMP_WORK_DIR,
     )
 
-    print("=== phase 1/3: mirror (downloading to /tmp) ===", flush=True)
-    _run_subcommand("mirror", common_tmp)
-    print("=== persist rocks: /tmp -> volume ===", flush=True)
-    _copy_concurrent(
-        f"{TMP_WORK_DIR}/rocks", f"{VOL_WORK_DIR}/rocks", "rocks-out"
-    )
-    volume.commit()
+    print("=== phase 1/3: mirror ===", flush=True)
+    _obtain_rocks_at_tmp(common_tmp)
     print("=== mirror committed ===", flush=True)
 
     print("=== phase 2/3: stage (on /tmp) ===", flush=True)
@@ -358,13 +404,7 @@ def single_phase(
             config=config,
             work_dir=TMP_WORK_DIR,
         )
-        print("=== mirror (downloading to /tmp) ===", flush=True)
-        _run_subcommand("mirror", common)
-        print("=== persist rocks: /tmp -> volume ===", flush=True)
-        _copy_concurrent(
-            f"{TMP_WORK_DIR}/rocks", f"{VOL_WORK_DIR}/rocks", "rocks-out"
-        )
-        volume.commit()
+        _obtain_rocks_at_tmp(common)
         return
 
     common_scratch = _common_args(
