@@ -11,17 +11,8 @@ pub struct HydrateOutcome {
     pub orphan_repost_rate: f64,
 }
 
-const SQL_MACROS: &str = include_str!("sql/macros.sql");
-const SQL_LOAD_RAW: &str = include_str!("sql/load_raw.sql");
-const SQL_BUILD_FOLLOWS: &str = include_str!("sql/build_follows.sql");
-const SQL_BUILD_BLOCKS: &str = include_str!("sql/build_blocks.sql");
-const SQL_BUILD_LIKES: &str = include_str!("sql/build_likes.sql");
-const SQL_BUILD_REPOSTS: &str = include_str!("sql/build_reposts.sql");
-const SQL_BUILD_POSTS_FROM_RECORDS: &str = include_str!("sql/build_posts_from_records.sql");
-const SQL_BUILD_POST_MEDIA: &str = include_str!("sql/build_post_media.sql");
-const SQL_BUILD_POSTS: &str = include_str!("sql/build_posts.sql");
-const SQL_BUILD_ACTOR_AGGS: &str = include_str!("sql/build_actor_aggs.sql");
-const SQL_BUILD_POST_AGGS: &str = include_str!("sql/build_post_aggs.sql");
+include!(concat!(env!("OUT_DIR"), "/sql_stages.rs"));
+
 const SQL_ORPHAN_RATE: &str = include_str!("sql/orphan_rate.sql");
 
 pub async fn run(cfg: &Config, snapshot_date: &str) -> Result<HydrateOutcome> {
@@ -52,22 +43,10 @@ pub async fn run(cfg: &Config, snapshot_date: &str) -> Result<HydrateOutcome> {
         &format!("SET temp_directory='{}/duckdb_tmp'", raw_str),
     )?;
 
-    let stages: &[(&str, &str)] = &[
-        ("macros", SQL_MACROS),
-        ("load_raw", &SQL_LOAD_RAW.replace("{RAW}", &raw_str)),
-        ("build_follows", SQL_BUILD_FOLLOWS),
-        ("build_blocks", SQL_BUILD_BLOCKS),
-        ("build_posts_from_records", SQL_BUILD_POSTS_FROM_RECORDS),
-        ("build_posts", SQL_BUILD_POSTS),
-        ("build_post_media", SQL_BUILD_POST_MEDIA),
-        ("build_likes", SQL_BUILD_LIKES),
-        ("build_reposts", SQL_BUILD_REPOSTS),
-        ("build_actor_aggs", SQL_BUILD_ACTOR_AGGS),
-        ("build_post_aggs", SQL_BUILD_POST_AGGS),
-    ];
-    for (label, sql) in stages {
+    for (label, template) in SQL_STAGES {
+        let sql = template.replace("{RAW}", &raw_str);
         tracing::info!(label, "running hydrate sql");
-        conn.execute_batch(sql)
+        conn.execute_batch(&sql)
             .with_context(|| format!("hydrate sql: {label}"))?;
     }
 
