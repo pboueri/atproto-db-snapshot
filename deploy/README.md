@@ -54,7 +54,6 @@ new SST files since the last backup.
 | `--snapshot-date` | today UTC | Output namespace. |
 | `--mirror-concurrency` | 64 | Drop to 8–16 if Tigris rate-limits. |
 | `--memory-limit` | 24GiB | DuckDB cap. |
-| `--disk-cap-gib` | 800 | Hard cap; pipeline aborts if exceeded. |
 | `--skip-{mirror,stage,hydrate}` | — | Resume mid-pipeline. |
 
 ## R2 upload

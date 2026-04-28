@@ -43,7 +43,6 @@ async fn end_to_end_synthetic_rocks() -> Result<()> {
         memory_limit: "1GiB".into(),
         batch_size: 1024,
         object_store: None,
-        disk_cap_bytes: u64::MAX,
         mirror_concurrency: 1,
         backup_id: None,
     };

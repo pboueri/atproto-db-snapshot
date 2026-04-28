@@ -16,8 +16,6 @@ pub struct Config {
     pub batch_size: usize,
     #[serde(default)]
     pub object_store: Option<String>,
-    #[serde(default = "default_disk_cap_bytes")]
-    pub disk_cap_bytes: u64,
     #[serde(default = "default_mirror_concurrency")]
     pub mirror_concurrency: usize,
     #[serde(default)]
@@ -40,10 +38,6 @@ fn default_batch_size() -> usize {
     100_000
 }
 
-fn default_disk_cap_bytes() -> u64 {
-    150 * 1024 * 1024 * 1024
-}
-
 fn default_mirror_concurrency() -> usize {
     32
 }
@@ -63,7 +57,6 @@ impl Config {
             memory_limit: default_memory_limit(),
             batch_size: default_batch_size(),
             object_store: None,
-            disk_cap_bytes: default_disk_cap_bytes(),
             mirror_concurrency: default_mirror_concurrency(),
             backup_id: None,
         }

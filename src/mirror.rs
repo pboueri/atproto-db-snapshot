@@ -16,7 +16,7 @@ pub async fn run(cfg: &Config) -> Result<MirrorOutcome> {
         .with_context(|| format!("create rocks dir {}", rocks_dir.display()))?;
 
     if existing_db_looks_complete(&rocks_dir) {
-        let bytes = crate::disk::dir_size_bytes(&rocks_dir);
+        let bytes = dir_size_bytes(&rocks_dir);
         tracing::info!(
             rocks_dir = %rocks_dir.display(),
             bytes,
@@ -27,20 +27,6 @@ pub async fn run(cfg: &Config) -> Result<MirrorOutcome> {
             backup_id: cfg.backup_id,
             bytes_on_disk: bytes,
         });
-    }
-
-    if let Some(free) = crate::disk::free_bytes_for(&rocks_dir) {
-        tracing::info!(
-            free_bytes = free,
-            cap_bytes = cfg.disk_cap_bytes,
-            "starting mirror"
-        );
-        if free < cfg.disk_cap_bytes / 2 {
-            tracing::warn!(
-                free_bytes = free,
-                "free disk is less than half the configured cap; mirror may abort"
-            );
-        }
     }
 
     let store: Arc<dyn object_store::ObjectStore> =
@@ -65,7 +51,7 @@ pub async fn run(cfg: &Config) -> Result<MirrorOutcome> {
         .await
         .context("eat_rocks::restore failed")?;
 
-    let bytes = crate::disk::dir_size_bytes(&rocks_dir);
+    let bytes = dir_size_bytes(&rocks_dir);
     let cursor_path = rocks_dir.join(".cursor");
     let body = serde_json::json!({
         "source_url": cfg.source_url,
@@ -88,4 +74,25 @@ fn existing_db_looks_complete(path: &std::path::Path) -> bool {
     let current = path.join("CURRENT");
     let cursor = path.join(".cursor");
     current.exists() && cursor.exists()
+}
+
+fn dir_size_bytes(path: &std::path::Path) -> u64 {
+    let mut total: u64 = 0;
+    if let Ok(rd) = std::fs::read_dir(path) {
+        for entry in rd.flatten() {
+            let p = entry.path();
+            match entry.file_type() {
+                Ok(ft) if ft.is_file() => {
+                    if let Ok(meta) = entry.metadata() {
+                        total += meta.len();
+                    }
+                }
+                Ok(ft) if ft.is_dir() => {
+                    total += dir_size_bytes(&p);
+                }
+                _ => {}
+            }
+        }
+    }
+    total
 }

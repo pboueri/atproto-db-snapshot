@@ -107,7 +107,6 @@ def build(
     snapshot_date: str | None = None,
     mirror_concurrency: int = 64,
     memory_limit: str = "24GiB",
-    disk_cap_gib: int = 800,
 ) -> None:
     args = [
         "/app/target/release/at-snapshot",
@@ -118,8 +117,6 @@ def build(
         memory_limit,
         "--mirror-concurrency",
         str(mirror_concurrency),
-        "--disk-cap-bytes",
-        str(disk_cap_gib * 1024 * 1024 * 1024),
     ]
     if backup_id is not None:
         args += ["--backup-id", str(backup_id)]
@@ -161,7 +158,6 @@ def main(
     snapshot_date: str | None = None,
     mirror_concurrency: int = 64,
     memory_limit: str = "24GiB",
-    disk_cap_gib: int = 800,
 ) -> None:
     build.remote(
         skip_mirror=skip_mirror,
@@ -171,5 +167,4 @@ def main(
         snapshot_date=snapshot_date,
         mirror_concurrency=mirror_concurrency,
         memory_limit=memory_limit,
-        disk_cap_gib=disk_cap_gib,
     )

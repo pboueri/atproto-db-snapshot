@@ -3,7 +3,6 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 use crate::config::Config;
-use crate::disk::DiskGuard;
 use crate::metadata::SnapshotMetadata;
 
 #[derive(Parser, Debug)]
@@ -33,8 +32,6 @@ pub struct BuildArgs {
     pub batch_size: Option<usize>,
     #[arg(long)]
     pub source_url: Option<String>,
-    #[arg(long)]
-    pub disk_cap_bytes: Option<u64>,
     #[arg(long)]
     pub mirror_concurrency: Option<usize>,
     #[arg(long)]
@@ -78,13 +75,11 @@ async fn run_build(args: BuildArgs) -> Result<()> {
 
     std::fs::create_dir_all(&cfg.work_dir)
         .with_context(|| format!("create work_dir {}", cfg.work_dir.display()))?;
-    let _disk = DiskGuard::start(cfg.work_dir.clone(), cfg.disk_cap_bytes);
 
     tracing::info!(
         snapshot_date,
         source_url = %cfg.source_url,
         work_dir = %cfg.work_dir.display(),
-        disk_cap_bytes = cfg.disk_cap_bytes,
         "build start"
     );
 
@@ -160,9 +155,6 @@ fn apply_overrides(cfg: &mut Config, args: &BuildArgs) {
     }
     if let Some(s) = &args.source_url {
         cfg.source_url = s.clone();
-    }
-    if let Some(c) = args.disk_cap_bytes {
-        cfg.disk_cap_bytes = c;
     }
     if let Some(c) = args.mirror_concurrency {
         cfg.mirror_concurrency = c;
