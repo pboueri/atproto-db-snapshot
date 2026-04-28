@@ -455,6 +455,33 @@ def single_phase(
 @app.function(
     image=image,
     volumes={"/vol": volume},
+    timeout=60 * 10,  # 10 min — open + property reads should take seconds
+    cpu=1.0,
+    memory=2 * 1024,
+)
+def inspect(
+    config: str | None = None,
+    memory_limit: str = "2GiB",
+) -> None:
+    """Cheap rocksdb inspection: opens /vol/var/rocks read-only and
+    queries per-CF estimate-num-keys / SST sizes from the manifest. No
+    scanning, no /tmp copy. Use to size pass B before kicking off a
+    long stage run.
+    """
+    common = _common_args(
+        backup_id=None,
+        snapshot_date=None,
+        mirror_concurrency=1,
+        memory_limit=memory_limit,
+        config=config,
+        work_dir=VOL_WORK_DIR,
+    )
+    _run_subcommand("inspect", common)
+
+
+@app.function(
+    image=image,
+    volumes={"/vol": volume},
     secrets=[modal.Secret.from_name("atproto-snapshot")],
     timeout=60 * 60 * 4,
     cpu=2.0,
@@ -537,9 +564,13 @@ def main(
     elif phase == "upload":
         _kick(upload, snapshot_date=snapshot_date, config=config)
         return
+    elif phase == "inspect":
+        _kick(inspect, config=config)
+        return
     else:
         raise SystemExit(
-            f"unknown phase {phase!r}; expected build/mirror/stage/hydrate/upload"
+            f"unknown phase {phase!r}; expected "
+            "build/mirror/stage/hydrate/upload/inspect"
         )
 
     if upload_after:

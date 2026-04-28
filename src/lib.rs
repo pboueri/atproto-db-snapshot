@@ -1,6 +1,7 @@
 pub mod cli;
 pub mod config;
 pub mod hydrate;
+pub mod inspect;
 pub mod metadata;
 pub mod mirror;
 pub mod rocks;
