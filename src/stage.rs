@@ -73,6 +73,8 @@ fn pass_a_actors(db: &DB, raw_dir: &std::path::Path, batch_size: usize) -> Resul
 
     let mut scanned = 0u64;
     let mut emitted = 0u64;
+    let mut bad_did_keys = 0u64;
+    let mut bad_did_values = 0u64;
     for item in iter {
         let (k, v) = item.context("iterate did_ids")?;
         scanned += 1;
@@ -83,27 +85,35 @@ fn pass_a_actors(db: &DB, raw_dir: &std::path::Path, batch_size: usize) -> Resul
         let did: Did = match rs::decode(&k) {
             Ok(d) => d,
             Err(e) => {
-                tracing::warn!(error=?e, "skipping undecodable did key");
+                if bad_did_keys == 0 {
+                    tracing::warn!(error=?e, key=?k, "first undecodable did key (further occurrences counted only)");
+                }
+                bad_did_keys += 1;
                 continue;
             }
         };
         let val: DidIdValue = match rs::decode(&v) {
             Ok(d) => d,
             Err(e) => {
-                tracing::warn!(error=?e, "skipping undecodable did value");
+                if bad_did_values == 0 {
+                    tracing::warn!(error=?e, key=?k, "first undecodable did value (further occurrences counted only)");
+                }
+                bad_did_values += 1;
                 continue;
             }
         };
         writer.push(val.0 .0, &did.0, val.1)?;
         emitted += 1;
         if emitted % 1_000_000 == 0 {
-            tracing::info!(scanned, emitted, "pass A progress");
+            tracing::info!(scanned, emitted, bad_did_keys, bad_did_values, "pass A progress");
         }
     }
     let (path, total) = writer.finish()?;
     tracing::info!(
         scanned,
         emitted = total,
+        bad_did_keys,
+        bad_did_values,
         path = %path.display(),
         "pass A complete"
     );
@@ -165,20 +175,28 @@ fn pass_b_link_targets(
     );
 
     let mut scanned = 0u64;
+    let mut bad_link_keys = 0u64;
+    let mut bad_link_values = 0u64;
     for item in iter {
         let (k, v) = item.context("iterate link_targets")?;
         scanned += 1;
         let key: RecordLinkKey = match rs::decode(&k) {
             Ok(k) => k,
             Err(e) => {
-                tracing::warn!(error=?e, "skip undecodable link_targets key");
+                if bad_link_keys == 0 {
+                    tracing::warn!(error=?e, key=?k, "first undecodable link_targets key (further occurrences counted only)");
+                }
+                bad_link_keys += 1;
                 continue;
             }
         };
         let value: RecordLinkTargets = match rs::decode(&v) {
             Ok(v) => v,
             Err(e) => {
-                tracing::warn!(error=?e, "skip undecodable link_targets value");
+                if bad_link_values == 0 {
+                    tracing::warn!(error=?e, key=?k, "first undecodable link_targets value (further occurrences counted only)");
+                }
+                bad_link_values += 1;
                 continue;
             }
         };
@@ -260,6 +278,8 @@ fn pass_b_link_targets(
                 follows = counts.follows,
                 likes = counts.likes,
                 posts = counts.posts_from_records,
+                bad_link_keys,
+                bad_link_values,
                 "pass B progress"
             );
         }
@@ -279,6 +299,8 @@ fn pass_b_link_targets(
         reposts = counts.reposts,
         posts_from_records = counts.posts_from_records,
         post_media = counts.post_media,
+        bad_link_keys,
+        bad_link_values,
         "pass B complete"
     );
     Ok(counts)
