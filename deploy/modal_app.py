@@ -39,11 +39,13 @@ DUCKDB_VERSION = "1.5.2"
 # Mirror lives here forever so we don't re-download from constellation.
 VOL_WORK_DIR = "/vol/var"
 
-# Ephemeral local storage (declared via `ephemeral_disk` on each function;
-# local NVMe-class). We rsync the rocksdb mirror here before stage so the
-# random-read-heavy CF scans run against local disk, then rsync the
-# resulting parquet / duckdb back to the Volume to persist them.
-SCRATCH_WORK_DIR = "/scratch/var"
+# Ephemeral local storage. Modal's dataset-ingestion guide explicitly
+# recommends `/tmp` for transform working dirs ("Transformations should
+# also typically be performed against /tmp/. This is because transforms
+# can be IO intensive and IO latency is lower against local SSD."). On
+# debian_slim /tmp is a regular dir on the rootfs that `ephemeral_disk`
+# expands, not tmpfs — so the full 1 TiB is available here.
+TMP_WORK_DIR = "/tmp/var"
 
 # ---------------------------------------------------------------------------
 # Image: Debian + Rust + libduckdb + the source tree, compiled in release.
@@ -237,7 +239,7 @@ def _unpack_rocks(src_tar: str, dst_parent: str) -> None:
 
 
 def _stage_rocks_to_scratch() -> None:
-    """Materialize <SCRATCH_WORK_DIR>/rocks for the stage subcommand.
+    """Materialize <TMP_WORK_DIR>/rocks for the stage subcommand.
 
     Prefers the packed rocks.tar on the Volume (single sequential read);
     falls back to per-file rsync of rocks/ if the tar isn't present yet
@@ -245,7 +247,7 @@ def _stage_rocks_to_scratch() -> None:
     """
     tar_path = f"{VOL_WORK_DIR}/rocks.tar"
     if os.path.exists(tar_path):
-        _unpack_rocks(tar_path, SCRATCH_WORK_DIR)
+        _unpack_rocks(tar_path, TMP_WORK_DIR)
         return
     print(
         f"[stage-in] {tar_path} not present — falling back to per-file "
@@ -253,7 +255,7 @@ def _stage_rocks_to_scratch() -> None:
         f"create the tar).",
         flush=True,
     )
-    _rsync(f"{VOL_WORK_DIR}/rocks", f"{SCRATCH_WORK_DIR}/rocks", "rocks-in")
+    _rsync(f"{VOL_WORK_DIR}/rocks", f"{TMP_WORK_DIR}/rocks", "rocks-in")
 
 
 class _PeriodicCommit:
@@ -333,7 +335,7 @@ def build(
         mirror_concurrency=mirror_concurrency,
         memory_limit=memory_limit,
         config=config,
-        work_dir=SCRATCH_WORK_DIR,
+        work_dir=TMP_WORK_DIR,
     )
 
     print("=== phase 1/3: mirror ===", flush=True)
@@ -352,7 +354,7 @@ def build(
     print("=== phase 2/3: stage (on scratch) ===", flush=True)
     _run_subcommand("stage", common_scratch)
     print("=== persist raw: scratch -> volume ===", flush=True)
-    _rsync(f"{SCRATCH_WORK_DIR}/raw/{date}", f"{VOL_WORK_DIR}/raw/{date}", "raw-out")
+    _rsync(f"{TMP_WORK_DIR}/raw/{date}", f"{VOL_WORK_DIR}/raw/{date}", "raw-out")
     volume.commit()
     print("=== stage committed ===", flush=True)
 
@@ -360,7 +362,7 @@ def build(
     _run_subcommand("hydrate", common_scratch)
     print("=== persist snapshot: scratch -> volume ===", flush=True)
     _rsync(
-        f"{SCRATCH_WORK_DIR}/snapshot/{date}",
+        f"{TMP_WORK_DIR}/snapshot/{date}",
         f"{VOL_WORK_DIR}/snapshot/{date}",
         "snapshot-out",
     )
@@ -418,7 +420,7 @@ def single_phase(
         mirror_concurrency=mirror_concurrency,
         memory_limit=memory_limit,
         config=config,
-        work_dir=SCRATCH_WORK_DIR,
+        work_dir=TMP_WORK_DIR,
     )
 
     if name == "stage":
@@ -427,7 +429,7 @@ def single_phase(
         _run_subcommand("stage", common_scratch)
         print("=== persist raw: scratch -> volume ===", flush=True)
         _rsync(
-            f"{SCRATCH_WORK_DIR}/raw/{date}",
+            f"{TMP_WORK_DIR}/raw/{date}",
             f"{VOL_WORK_DIR}/raw/{date}",
             "raw-out",
         )
@@ -438,13 +440,13 @@ def single_phase(
     print("=== copy raw: volume -> scratch ===", flush=True)
     _rsync(
         f"{VOL_WORK_DIR}/raw/{date}",
-        f"{SCRATCH_WORK_DIR}/raw/{date}",
+        f"{TMP_WORK_DIR}/raw/{date}",
         "raw-in",
     )
     _run_subcommand("hydrate", common_scratch)
     print("=== persist snapshot: scratch -> volume ===", flush=True)
     _rsync(
-        f"{SCRATCH_WORK_DIR}/snapshot/{date}",
+        f"{TMP_WORK_DIR}/snapshot/{date}",
         f"{VOL_WORK_DIR}/snapshot/{date}",
         "snapshot-out",
     )
