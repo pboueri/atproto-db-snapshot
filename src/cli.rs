@@ -47,6 +47,12 @@ pub struct CommonArgs {
     pub mirror_concurrency: Option<usize>,
     #[arg(long)]
     pub backup_id: Option<u64>,
+    /// RocksDB block cache size, e.g. "4GiB". Bigger = fewer disk reads in pass B.
+    #[arg(long)]
+    pub rocks_block_cache: Option<String>,
+    /// Number of worker threads for pass B (link_targets scan).
+    #[arg(long)]
+    pub stage_threads: Option<usize>,
 }
 
 pub async fn run() -> Result<()> {
@@ -114,6 +120,12 @@ fn apply_overrides(cfg: &mut Config, args: &CommonArgs) {
     }
     if let Some(b) = args.backup_id {
         cfg.backup_id = Some(b);
+    }
+    if let Some(c) = &args.rocks_block_cache {
+        cfg.rocks_block_cache = c.clone();
+    }
+    if let Some(t) = args.stage_threads {
+        cfg.stage_threads = t;
     }
 }
 

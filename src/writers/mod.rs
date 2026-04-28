@@ -1,10 +1,10 @@
 pub mod actor;
 pub mod common;
-pub mod edge;
-pub mod media;
+pub mod link;
 pub mod post;
+pub mod target;
 
 pub use actor::ActorWriter;
-pub use edge::{BlockWriter, FollowWriter, LikeWriter, RepostWriter};
-pub use media::PostMediaWriter;
-pub use post::{PostFromRecordWriter, PostFromTargetWriter};
+pub use link::{LinkRecordTargetsWriter, LinkRecordWriter};
+pub use post::PostFromTargetWriter;
+pub use target::TargetWriter;
