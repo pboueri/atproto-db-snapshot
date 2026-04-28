@@ -25,10 +25,12 @@ Upload requires a Modal Secret named `r2-credentials` exposing
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
-import threading
+import sys
 import time
 from datetime import datetime, timezone
+from multiprocessing.pool import ThreadPool
 from typing import Iterable
 
 import modal
@@ -79,7 +81,6 @@ image = (
         "git",
         "unzip",
         "zlib1g-dev",
-        "rsync",
     )
     .run_commands(
         "curl -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal",
@@ -155,146 +156,104 @@ def _run_subcommand(subcommand: str, common: Iterable[str]) -> None:
 
 
 def _resolve_date(snapshot_date: str | None) -> str:
-    """Mirror the binary's default of today UTC so we can name rsync paths."""
+    """Mirror the binary's default of today UTC so we can name copy paths."""
     return snapshot_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
-def _rsync(src: str, dst: str, label: str) -> None:
-    """Bulk-copy a directory tree. Trailing slashes matter: we use 'src/' so
-    rsync copies contents (not the parent) into 'dst/'.
+class _MultithreadedCopier:
+    """Modal's RoseTTAFold dataset example
+    (modal-examples/12_datasets/rosettafold.py): a small wrapper around a
+    ThreadPool of shutil.copy2 calls. Modal Volume FUSE has high per-op
+    latency but scales with concurrency, so 24 in-flight file copies
+    saturate it far better than single-threaded rsync/tar."""
 
-    -W (--whole-file) skips rsync's block-checksum delta dance, which is
-    pure overhead when the destination is empty (our case: cold copies
-    onto a fresh ephemeral disk).
+    def __init__(self, max_threads: int) -> None:
+        self.pool = ThreadPool(max_threads)
+        self.copy_jobs: list = []
+
+    def copy(self, source: str, dest: str) -> None:
+        res = self.pool.apply_async(
+            shutil.copy2,
+            args=(source, dest),
+            error_callback=lambda exc: print(
+                f"[copy] {source} failed: {exc}", file=sys.stderr, flush=True
+            ),
+        )
+        self.copy_jobs.append(res)
+
+    def __enter__(self) -> "_MultithreadedCopier":
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.pool.close()
+        self.pool.join()
+
+
+def _dir_has_files(path: str) -> bool:
+    """True if `path` exists and contains at least one regular file
+    anywhere in its tree. Cheap recursive check used to short-circuit
+    redundant copies."""
+    if not os.path.isdir(path):
+        return False
+    for _, _, fnames in os.walk(path):
+        if fnames:
+            return True
+    return False
+
+
+def _copy_concurrent(
+    src: str,
+    dst: str,
+    label: str,
+    max_threads: int = 24,
+    skip_if_dst_populated: bool = False,
+) -> None:
+    """Parallel directory copy. Patterned on Modal's RoseTTAFold example
+    (`copy_concurrent`); uses shutil.copytree's directory walk while
+    routing each file through a 24-thread copy pool. Significantly faster
+    than single-threaded rsync against Modal Volume FUSE because Volume IO
+    scales with concurrent ops.
+
+    skip_if_dst_populated=True turns this into a "stage in if missing"
+    primitive — used for inbound copies where /tmp may already hold the
+    artifact (e.g. mirror just wrote rocks/ to /tmp and we'd otherwise
+    re-pull from the Volume). Outbound persistence copies leave it
+    False so /vol always reflects the latest /tmp content.
     """
     if not os.path.exists(src):
-        print(f"[rsync:{label}] skip — {src} does not exist", flush=True)
+        print(f"[copy:{label}] skip — {src} does not exist", flush=True)
         return
-    os.makedirs(dst, exist_ok=True)
-    print(f"[rsync:{label}] {src} -> {dst}", flush=True)
-    subprocess.check_call(
-        [
-            "rsync",
-            "-aW",
-            "--delete",
-            "--info=stats2,progress2",
-            src.rstrip("/") + "/",
-            dst.rstrip("/") + "/",
-        ]
-    )
-
-
-def _pack_rocks(src_dir: str, dst_tar: str) -> None:
-    """Pack a rocksdb tree into one tar on the Volume.
-
-    Per Modal's dataset-ingestion guide: "Datasets made up of millions of
-    tiny files are still usually easier to ingest when grouped into
-    larger artifacts such as tar shards, WebDataset archives, Parquet
-    files, or other batched formats." Reading thousands of SST files
-    individually over FUSE is dominated by per-file metadata overhead;
-    one big tar is a single sequential read.
-
-    Idempotent: skips if the tar already exists. Writes via .tmp + rename
-    so a half-written tar from a killed run won't be picked up later.
-    """
-    if not os.path.exists(src_dir):
-        print(f"[pack] skip — {src_dir} does not exist", flush=True)
-        return
-    if os.path.exists(dst_tar):
-        sz = os.path.getsize(dst_tar)
+    if skip_if_dst_populated and _dir_has_files(dst):
         print(
-            f"[pack] {dst_tar} already exists ({sz / 1e9:.1f} GB), skipping",
+            f"[copy:{label}] skip — {dst} already populated, reusing in place",
             flush=True,
         )
         return
-    parent = os.path.dirname(src_dir.rstrip("/"))
-    name = os.path.basename(src_dir.rstrip("/"))
-    tmp = dst_tar + ".tmp"
-    print(f"[pack] {src_dir} -> {dst_tar}", flush=True)
+    os.makedirs(os.path.dirname(dst.rstrip("/")) or ".", exist_ok=True)
     t0 = time.time()
-    subprocess.check_call(["tar", "-c", "-f", tmp, "-C", parent, name])
-    os.rename(tmp, dst_tar)
-    sz = os.path.getsize(dst_tar)
-    elapsed = time.time() - t0
     print(
-        f"[pack] {sz / 1e9:.1f} GB in {elapsed:.1f}s "
-        f"({sz / max(1, elapsed) / 1e6:.1f} MB/s)",
+        f"[copy:{label}] {src} -> {dst} ({max_threads} threads)",
         flush=True,
     )
-
-
-def _unpack_rocks(src_tar: str, dst_parent: str) -> None:
-    """Untar src_tar into dst_parent (creates dst_parent/<inner>)."""
-    sz = os.path.getsize(src_tar)
-    os.makedirs(dst_parent, exist_ok=True)
-    print(f"[unpack] {src_tar} -> {dst_parent} ({sz / 1e9:.1f} GB)", flush=True)
-    t0 = time.time()
-    subprocess.check_call(["tar", "-x", "-f", src_tar, "-C", dst_parent])
-    elapsed = time.time() - t0
-    print(
-        f"[unpack] {sz / 1e9:.1f} GB in {elapsed:.1f}s "
-        f"({sz / max(1, elapsed) / 1e6:.1f} MB/s)",
-        flush=True,
-    )
-
-
-def _stage_rocks_to_scratch() -> None:
-    """Materialize <TMP_WORK_DIR>/rocks for the stage subcommand.
-
-    Prefers the packed rocks.tar on the Volume (single sequential read);
-    falls back to per-file rsync of rocks/ if the tar isn't present yet
-    (e.g. running stage against a mirror that predates this change).
-    """
-    tar_path = f"{VOL_WORK_DIR}/rocks.tar"
-    if os.path.exists(tar_path):
-        _unpack_rocks(tar_path, TMP_WORK_DIR)
-        return
-    print(
-        f"[stage-in] {tar_path} not present — falling back to per-file "
-        f"rsync of {VOL_WORK_DIR}/rocks (much slower; re-run mirror to "
-        f"create the tar).",
-        flush=True,
-    )
-    _rsync(f"{VOL_WORK_DIR}/rocks", f"{TMP_WORK_DIR}/rocks", "rocks-in")
-
-
-class _PeriodicCommit:
-    """Commit the Modal Volume every `interval_s` seconds in a thread.
-
-    Used during the long mirror so partial state survives container loss.
-    Modal Volumes already retain writes durably — this just makes those
-    writes visible to other function calls without waiting for clean
-    function exit.
-    """
-
-    def __init__(self, vol: modal.Volume, interval_s: int = 300) -> None:
-        self._vol = vol
-        self._interval = interval_s
-        self._stop = threading.Event()
-        self._thread: threading.Thread | None = None
-
-    def __enter__(self) -> "_PeriodicCommit":
-        self._thread = threading.Thread(
-            target=self._loop, name="modal-commit", daemon=True
+    with _MultithreadedCopier(max_threads=max_threads) as copier:
+        shutil.copytree(
+            src, dst, copy_function=copier.copy, dirs_exist_ok=True
         )
-        self._thread.start()
-        return self
-
-    def __exit__(self, *exc: object) -> None:
-        self._stop.set()
-        if self._thread is not None:
-            self._thread.join(timeout=30)
-
-    def _loop(self) -> None:
-        while not self._stop.wait(self._interval):
+    elapsed = time.time() - t0
+    # walk the destination once after the fact for a size readout
+    total = 0
+    for root, _, fnames in os.walk(dst):
+        for f in fnames:
             try:
-                self._vol.commit()
-                print(
-                    f"[commit] volume committed at {time.strftime('%H:%M:%S')}",
-                    flush=True,
-                )
-            except Exception as e:  # noqa: BLE001
-                print(f"[commit] background commit failed: {e}", flush=True)
+                total += os.path.getsize(os.path.join(root, f))
+            except OSError:
+                pass
+    rate = total / max(1, elapsed) / 1e6
+    print(
+        f"[copy:{label}] DONE {total / 1e9:.2f} GB in {elapsed:.1f}s "
+        f"({rate:.1f} MB/s)",
+        flush=True,
+    )
 
 
 @app.function(
@@ -312,24 +271,18 @@ def build(
     memory_limit: str = "8GiB",
     config: str | None = None,
 ) -> None:
-    """Run mirror + stage + hydrate as three separate subcommands.
+    """Run mirror + stage + hydrate end-to-end on local ephemeral disk.
 
-    Mirror writes to the persistent Volume so the ~80GB rocksdb survives
-    container restarts. Stage and hydrate run against ephemeral local disk
-    (NVMe-class) instead of Volume FUSE, with rsync moving data in/out at
-    the boundaries — bulk sequential transfers are dramatically faster
-    than RocksDB's random reads against a network filesystem.
+    Per Modal's dataset-ingestion guide: all working data lives in /tmp
+    (local NVMe-class). The Volume is touched only as the persistence
+    boundary — we _copy_concurrent the artifact at the end of each phase
+    over to /vol so it survives container loss. mirror downloads
+    directly to /tmp/var/rocks (no Volume IO during the long fetch),
+    stage and hydrate read/write entirely on /tmp, and we batch a
+    single _copy_concurrent to /vol after each phase succeeds.
     """
     date = _resolve_date(snapshot_date)
-    common_vol = _common_args(
-        backup_id=backup_id,
-        snapshot_date=date,
-        mirror_concurrency=mirror_concurrency,
-        memory_limit=memory_limit,
-        config=config,
-        work_dir=VOL_WORK_DIR,
-    )
-    common_scratch = _common_args(
+    common_tmp = _common_args(
         backup_id=backup_id,
         snapshot_date=date,
         mirror_concurrency=mirror_concurrency,
@@ -338,30 +291,28 @@ def build(
         work_dir=TMP_WORK_DIR,
     )
 
-    print("=== phase 1/3: mirror ===", flush=True)
-    with _PeriodicCommit(volume, interval_s=300):
-        _run_subcommand("mirror", common_vol)
+    print("=== phase 1/3: mirror (downloading to /tmp) ===", flush=True)
+    _run_subcommand("mirror", common_tmp)
+    print("=== persist rocks: /tmp -> volume ===", flush=True)
+    _copy_concurrent(
+        f"{TMP_WORK_DIR}/rocks", f"{VOL_WORK_DIR}/rocks", "rocks-out"
+    )
     volume.commit()
     print("=== mirror committed ===", flush=True)
 
-    print("=== pack rocks tree to tar (one-time) ===", flush=True)
-    _pack_rocks(f"{VOL_WORK_DIR}/rocks", f"{VOL_WORK_DIR}/rocks.tar")
-    volume.commit()
-
-    print("=== unpack rocks: volume.tar -> scratch ===", flush=True)
-    _stage_rocks_to_scratch()
-
-    print("=== phase 2/3: stage (on scratch) ===", flush=True)
-    _run_subcommand("stage", common_scratch)
-    print("=== persist raw: scratch -> volume ===", flush=True)
-    _rsync(f"{TMP_WORK_DIR}/raw/{date}", f"{VOL_WORK_DIR}/raw/{date}", "raw-out")
+    print("=== phase 2/3: stage (on /tmp) ===", flush=True)
+    _run_subcommand("stage", common_tmp)
+    print("=== persist raw: /tmp -> volume ===", flush=True)
+    _copy_concurrent(
+        f"{TMP_WORK_DIR}/raw/{date}", f"{VOL_WORK_DIR}/raw/{date}", "raw-out"
+    )
     volume.commit()
     print("=== stage committed ===", flush=True)
 
-    print("=== phase 3/3: hydrate (on scratch) ===", flush=True)
-    _run_subcommand("hydrate", common_scratch)
-    print("=== persist snapshot: scratch -> volume ===", flush=True)
-    _rsync(
+    print("=== phase 3/3: hydrate (on /tmp) ===", flush=True)
+    _run_subcommand("hydrate", common_tmp)
+    print("=== persist snapshot: /tmp -> volume ===", flush=True)
+    _copy_concurrent(
         f"{TMP_WORK_DIR}/snapshot/{date}",
         f"{VOL_WORK_DIR}/snapshot/{date}",
         "snapshot-out",
@@ -388,10 +339,11 @@ def single_phase(
 ) -> None:
     """Run a single phase: mirror, stage, or hydrate.
 
-    Mirror writes directly to the Volume. Stage and hydrate stage their
-    inputs onto ephemeral local disk first, run there, and rsync outputs
-    back. Each Modal call gets a fresh ephemeral filesystem, so we always
-    have to rehydrate scratch before stage / hydrate.
+    Mirror downloads to /tmp (per Modal's dataset-ingestion guide) then
+    persists rocks/ onto the Volume. Stage and hydrate stage their inputs
+    onto /tmp first via _copy_concurrent, run on local NVMe, and copy
+    outputs back to the Volume. Inbound copies short-circuit when /tmp is
+    already populated.
     """
     if name not in {"mirror", "stage", "hydrate"}:
         raise SystemExit(f"name must be mirror/stage/hydrate, got {name!r}")
@@ -404,13 +356,14 @@ def single_phase(
             mirror_concurrency=mirror_concurrency,
             memory_limit=memory_limit,
             config=config,
-            work_dir=VOL_WORK_DIR,
+            work_dir=TMP_WORK_DIR,
         )
-        with _PeriodicCommit(volume, interval_s=300):
-            _run_subcommand("mirror", common)
-        # Pack into a tar so the next stage can pull it as one big
-        # sequential file instead of thousands of small SST reads.
-        _pack_rocks(f"{VOL_WORK_DIR}/rocks", f"{VOL_WORK_DIR}/rocks.tar")
+        print("=== mirror (downloading to /tmp) ===", flush=True)
+        _run_subcommand("mirror", common)
+        print("=== persist rocks: /tmp -> volume ===", flush=True)
+        _copy_concurrent(
+            f"{TMP_WORK_DIR}/rocks", f"{VOL_WORK_DIR}/rocks", "rocks-out"
+        )
         volume.commit()
         return
 
@@ -424,11 +377,16 @@ def single_phase(
     )
 
     if name == "stage":
-        print("=== unpack rocks: volume.tar -> scratch ===", flush=True)
-        _stage_rocks_to_scratch()
+        print("=== copy rocks: volume -> /tmp ===", flush=True)
+        _copy_concurrent(
+            f"{VOL_WORK_DIR}/rocks",
+            f"{TMP_WORK_DIR}/rocks",
+            "rocks-in",
+            skip_if_dst_populated=True,
+        )
         _run_subcommand("stage", common_scratch)
-        print("=== persist raw: scratch -> volume ===", flush=True)
-        _rsync(
+        print("=== persist raw: /tmp -> volume ===", flush=True)
+        _copy_concurrent(
             f"{TMP_WORK_DIR}/raw/{date}",
             f"{VOL_WORK_DIR}/raw/{date}",
             "raw-out",
@@ -437,15 +395,16 @@ def single_phase(
         return
 
     # hydrate
-    print("=== copy raw: volume -> scratch ===", flush=True)
-    _rsync(
+    print("=== copy raw: volume -> /tmp ===", flush=True)
+    _copy_concurrent(
         f"{VOL_WORK_DIR}/raw/{date}",
         f"{TMP_WORK_DIR}/raw/{date}",
         "raw-in",
+        skip_if_dst_populated=True,
     )
     _run_subcommand("hydrate", common_scratch)
-    print("=== persist snapshot: scratch -> volume ===", flush=True)
-    _rsync(
+    print("=== persist snapshot: /tmp -> volume ===", flush=True)
+    _copy_concurrent(
         f"{TMP_WORK_DIR}/snapshot/{date}",
         f"{VOL_WORK_DIR}/snapshot/{date}",
         "snapshot-out",
