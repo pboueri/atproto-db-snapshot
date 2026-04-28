@@ -490,6 +490,7 @@ def main(
     mirror_concurrency: int = 64,
     memory_limit: str = "8GiB",
     config: str | None = None,
+    background: bool = False,
 ) -> None:
     """Local entrypoint dispatcher.
 
@@ -497,9 +498,27 @@ def main(
       phase: build | mirror | stage | hydrate | upload
       upload_after: when True and phase != upload, run upload after the
         chosen phase completes. Skipped for `upload` itself.
+      background: spawn the remote call instead of waiting on it. With
+        `modal run --detach`, plain .remote() may be cancelled when the
+        local caller disconnects; .spawn() returns a FunctionCall handle
+        that survives. Use this for long builds you want to walk away
+        from. Follow progress with: `modal app logs <fn-call-id>`.
     """
+
+    def _kick(fn, **kwargs):
+        if background:
+            call = fn.spawn(**kwargs)
+            print(
+                f"[spawn] FunctionCall {call.object_id} — "
+                f"follow with `modal app logs at-snapshot` "
+                f"or check https://modal.com/apps"
+            )
+            return call
+        return fn.remote(**kwargs)
+
     if phase == "build":
-        build.remote(
+        _kick(
+            build,
             backup_id=backup_id,
             snapshot_date=snapshot_date,
             mirror_concurrency=mirror_concurrency,
@@ -507,7 +526,8 @@ def main(
             config=config,
         )
     elif phase in {"mirror", "stage", "hydrate"}:
-        single_phase.remote(
+        _kick(
+            single_phase,
             name=phase,
             backup_id=backup_id,
             snapshot_date=snapshot_date,
@@ -516,7 +536,7 @@ def main(
             config=config,
         )
     elif phase == "upload":
-        upload.remote(snapshot_date=snapshot_date, config=config)
+        _kick(upload, snapshot_date=snapshot_date, config=config)
         return
     else:
         raise SystemExit(
@@ -524,4 +544,4 @@ def main(
         )
 
     if upload_after:
-        upload.remote(snapshot_date=snapshot_date, config=config)
+        _kick(upload, snapshot_date=snapshot_date, config=config)
