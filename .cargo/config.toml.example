@@ -1,0 +1,16 @@
+# Copy this to `.cargo/config.toml` and adjust the paths to match where you
+# extracted the official libduckdb release zip. See README.md "System
+# dependencies" for the curl + unzip recipe.
+
+[env]
+DUCKDB_LIB_DIR     = "/Users/YOU/.local/duckdb-1.5.2/lib"
+DUCKDB_INCLUDE_DIR = "/Users/YOU/.local/duckdb-1.5.2/include"
+LIBCLANG_PATH      = "/Library/Developer/CommandLineTools/usr/lib"
+
+# Embed the libduckdb path as an rpath so the binary finds the dylib at
+# runtime without DYLD_LIBRARY_PATH gymnastics.
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "link-arg=-Wl,-rpath,/Users/YOU/.local/duckdb-1.5.2/lib"]
+
+[target.x86_64-apple-darwin]
+rustflags = ["-C", "link-arg=-Wl,-rpath,/Users/YOU/.local/duckdb-1.5.2/lib"]

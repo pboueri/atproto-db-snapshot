@@ -1,0 +1,46 @@
+[package]
+name = "at-snapshot"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "at-snapshot"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+thiserror = "1"
+clap = { version = "4", features = ["derive", "env"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+bincode = "1.3"
+rocksdb = { version = "0.22", default-features = false, features = ["snappy", "lz4", "zstd"] }
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+parquet = { version = "58", default-features = false, features = ["arrow", "snap", "lz4", "zstd"] }
+arrow = { version = "58", default-features = false }
+arrow-array = "58"
+arrow-schema = "58"
+duckdb = { version = "1.10502", default-features = false }
+object_store = { version = "0.13", features = ["aws", "http"] }
+eat-rocks = { git = "https://tangled.org/microcosm.blue/eat-rocks", default-features = false, features = ["easy"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+sysinfo = "0.32"
+url = "2"
+hex = "0.4"
+lru = "0.12"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = 1
+
+[profile.dev]
+opt-level = 1

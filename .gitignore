@@ -1,0 +1,9 @@
+target/
+var/
+.claude/
+.DS_Store
+.cargo/config.toml
+__pycache__/
+*.pyc
+*.lock
+!Cargo.lock

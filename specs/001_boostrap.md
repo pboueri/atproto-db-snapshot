@@ -2,136 +2,270 @@
 
 ## Goal
 
-The goal of the AT Proto Analytics snapshot is to consume the atmosphere and publish a windowed snapshot of all posts and the follower graph for public consumption to do analytics in an easy-to-use manner without too much ceremony. This will be hosted on a public object store and backed up nightly. This will be running on commodity. The program will be described below
+Produce a public DuckDB snapshot of the Bluesky social graph and post-relationship
+graph, derived end-to-end from the **microcosm.blue constellation** RocksDB
+backlinks index. Cheap, no-ceremony analytics on commodity hardware.
 
-## Overall Flow
+This spec covers a **full, from-scratch build**. Out of scope (deferred):
 
-The way this project will work is there's an initial bootstrap which will generate the entire follower graph As a starting point, then it will start consuming from the jet stream and write posts, likes, follows, deletes, and other information incrementally from the initial bootstrap
+- Streaming / incremental updates (jetstream).
+- Post text, profile bios, display names, alt text.
+- Media blob downloads / CDN mirroring.
+- Language / labeler filters (return when text is back in scope).
 
-## Final Output
+## What constellation actually stores
 
-The final output will be the following files in object storage, with R2 being the default implementation. The fields and schema of the files are described in later sections.
+Constellation is a **backlinks index**, not a record store. Per
+`constellation/src/storage/rocks_store.rs` it has four column families:
 
+| CF | Key | Value | What it is |
+|---|---|---|---|
+| `did_ids` | bincode(`Did`) | bincode(`DidIdValue(DidId, active: bool)`) | DID → numeric ID + active flag. Also stores reverse: 8-byte big-endian `DidId` → bincode(`Did`). |
+| `target_ids` | bincode(`TargetKey(Target, Collection, RPath)`) | bincode(`TargetId`) | A URI/DID/blob *as referenced from a specific (collection, json-path)* → numeric ID. Also reverse 8-byte → `TargetKey`. |
+| `target_links` | bincode(`TargetId`) | bincode(`TargetLinkers(Vec<(DidId, RKey)>)`) | For a target, who linked to it (reverse index). Tombstones use `DidId(0)`. |
+| `link_targets` | bincode(`RecordLinkKey(DidId, Collection, RKey)`) | bincode(`RecordLinkTargets(Vec<(RPath, TargetId)>)`) | For a record, the targets it links to + the json-path of each link (forward index). |
+
+Implications for us:
+
+- We only see records that **contain at least one link**. A text-only post with
+  no embed / reply / quote and no engagement won't have a `link_targets` entry.
+  It might still appear as the *target* of someone else's like / reply / quote,
+  in which case the post URI shows up in `target_ids`.
+- AT-URIs encode author DID and rkey; rkeys for like / repost / follow / block
+  / post are TIDs that decode to a microsecond timestamp. So even when we only
+  know about a post via `target_ids`, we can still derive `(uri, author_did,
+  created_at)` without the forward record.
+- `app.bsky.actor.profile` rkeys are `self`, not TIDs — `created_at` is NULL.
+- Encoding is **bincode big-endian**; reverse-mapping entries inside `did_ids`
+  and `target_ids` are 8-byte keys (the IDs themselves) and must be skipped
+  when iterating those CFs (constellation's repair loop does exactly this with
+  `if raw_key.len() == 8`).
+- `target_links` uses a custom merge operator on writes. We open **read-only**,
+  so we don't need to register it.
+
+## Mental model
+
+```
+constellation rocksdb  ──(eat-rocks)──▶  local rocks mirror
+local rocks mirror     ──(stage)──────▶  staging parquet (per entity)
+staging parquet        ──(hydrate)────▶  snapshot.duckdb (bounded RAM)
+snapshot.duckdb + parquet  ──(publish)─▶  object store (R2 default)
+```
+
+Each stage is a single-responsibility module behind a `Stage` trait. The
+binary exposes one command today; the trait split makes per-stage subcommands
+mechanical to add later.
+
+## Final output
+
+```
 data/
-- bootstrap/YYYY-MM-DD/
-  - social_graph.duckdb # Written once for bootstrap; never overwritten
-- raw/YYYY-MM-DD/{posts, post_media, likes, reposts, follows, blocks, profiles}.parquet
-  # post_media is derived from post record embeds, not a separate firehose collection
-- snapshot/
-  - current_all.duckdb
-  - current_graph.duckdb
-  - snapshot_metadata.json  
+  raw/YYYY-MM-DD/
+    actors.parquet
+    follows.parquet
+    blocks.parquet
+    posts_from_records.parquet     # rows derived from link_targets scan
+    posts_from_targets.parquet     # rows derived from target_ids scan (deduped in hydrate)
+    post_media.parquet
+    likes.parquet
+    reposts.parquet
+  snapshot/YYYY-MM-DD/
+    snapshot.duckdb
+    snapshot_metadata.json
+```
 
-## Technologies to use:
+`snapshot.duckdb` is the single analytic artifact. `snapshot_metadata.json`
+captures constellation source revision, eat-rocks revision, schema version,
+host stats, and per-table row counts.
 
-- Programming language: Go
-- Data storage:
-  - local_staging: sqlite or json for cursor metadata -- use the local filesystem for any working data.
-  - date partitioned raw_records for backfill: parquet -- written to object storage and a buffer kept locally
-    - example data/YYYY-MM-DD/{likes, follows, profiles, posts}.parquet
-    - All the data generated just on that day
-  - analytic_database: duckdb
-    - The final output that is snapshotted with N days of history, generated from raw_records (default 30)
-    - current_all.duckdb: The full social graph + posts
-    - current_graph.duckdb: The social graph no posts
+## Technologies
 
-## Workflow + CLI commands
+- **Rust** stable.
+- **eat-rocks** (https://tangled.org/microcosm.blue/eat-rocks) as a Cargo
+  dependency. eat-rocks owns the *mirror* (clone the upstream rocksdb to a
+  local directory). Our staging stage then opens that directory **read-only**
+  with the `rocksdb` crate directly using the same CF descriptors as
+  `rocks_store.rs` (no merge operator needed for read-only access).
+- `bincode` (default options + big-endian) to decode keys/values, matching
+  `_bincode_opts()` in rocks_store.rs.
+- DuckDB (`duckdb` crate), Parquet/Arrow (`parquet` + `arrow` crates).
+- `object_store` crate; **R2 default**, local FS for tests.
 
-### at-snapshot bootstrap
-This command bootstraps the social graph from historicals and writes it once to `bootstrap/YYYY-MM-DD/social_graph.duckdb`. The file is never overwritten after a successful bootstrap; subsequent `snapshot` runs read it as the baseline and apply deltas from `raw/`. If interrupted it resumes from the in-progress `social_graph.duckdb` and assumes any DIDs already present are complete. It generates the following tables:
-  - Actors / Follows / Blocks
-Profile, follow, and block records are pulled from constellation per DID. It does not backfill posts, likes, or reposts -- doing so would 10x the requirements. Post engagement aggregates exist only for the window of data in the snapshot.
+## CLI
 
-### at-snapshot run
-This command is a long running process to read from the jetstream and write out the parquet files and upload them to the object storage. It's meant to be fault tolerant and persistent. It keeps RAM requirements low by flushing to disk and cleaning up old parquet files beyond a buffer once they have been written to object storage. Data is written to the data of the UTC of the timestamp, which means there may be multiple active at once based on the firehose. Those that are > 2 days in the future or past are ignored.
+A single command today; modular internals.
 
-The jetstream cursor is checkpointed to local sqlite and mirrored to object storage. Only one jetstream connection is active at a time, with failover across the configured endpoints. On resume, if the persisted cursor is too old for jetstream to replay, the process logs a warning and reconnects at "now," accepting the gap.
+```
+at-snapshot build [flags]
+```
 
-### at-snapshot snapshot
-This command reads from object storage the past N days of data in duckdb to compute aggregates to materialize the duckdb schema required for current_all.duckdb and current_graph.duckdb. It is typically scheduled as a cron on the host machine. It's important to constrain the duckdb's working memory so as not to overwhelm the machine with a configurable limit. It should not rely on local files, instead only rely on reading from object storage.
+Flags:
 
-Semantics:
-- The social graph (Actors / Follows / Blocks in `current_graph.duckdb`) is *current state*: the bootstrap baseline plus all follow/block creates and deletes observed in `raw/` since bootstrap. It is not bounded by the lookback window.
-- Post-related entities (Posts / Likes / Reposts / post_media / post_aggs) and per-actor engagement aggregates *are* bounded by the N-day window. Window-bounded fields are named with an `_in_window` suffix (e.g. `total_posts_in_window`, `likes_in_window`) so consumers don't confuse them with all-time totals.
+- `--config <path>`: TOML config (preferred). Flags below also via env / CLI.
+- `--work-dir <path>`: local working dir (default `./var`).
+- `--snapshot-date <YYYY-MM-DD>`: namespace for outputs (default today UTC).
+- `--memory-limit <size>`: DuckDB memory cap (default `4GiB`).
+- `--batch-size <n>`: parquet writer batch size (default `100_000`).
+- `--object-store <url>`: e.g. `s3://bucket/prefix` or `file:///tmp/out`.
+- `--skip-mirror | --skip-stage | --skip-hydrate | --skip-publish`: per-stage
+  opt-out for resumes and tests.
+- `--monitor-addr <host:port>` (optional): JSON progress endpoint.
+  Structured INFO logs are emitted regardless.
 
-### at-snapshot monitor
-This is a lightweight http server that reads the logs from the jobs and outputs the current status and if the process is healhty for remote monitoring. It is pointed at the output directory where all the logs and files are and outputs useful views that someone would want to know to confirm that the following commands are working well:
-  - boostrap
-  - run
-  - snapshot
+Each stage is idempotent and resumable.
 
-### For all commands
-- Periodic statistics about where it is in the job (# of records etc) are output at the INFO level such that it can be parsed by the monitor
-- They can be started again and check for data in this order to resume:
-  - locally
-  - object storage
-  - rebuild from scratch
-- Ensure there are end to end tests with mocks for each workflow in addition to unit tests so that they are flexed all together. This means running a `bootstrap -> run -> snapshot + monitor` work with simulate data from sources to verify they all work together and write to object storage. The object sotrage and sources should be mocked but everything else in the program should be real. We should verify they can be interrupted and be picked up from where they left off too
+## Stages
 
-### Configurations
-- The object storage bucket, url, and access keys (env var) -- assume s3 compatible API with R2 as default and a local filesystem for testing
-- The output data directory where everything writes to
-- The snapshot lookback window (default 30 days)
-- The filters for raw records (default lang: en and bsky moderation). Filters apply only to record types that carry the relevant metadata (posts). Engagement records (likes, follows, reposts, blocks) are kept regardless, since they don't carry language or moderation metadata themselves.
+### 1. Mirror — eat-rocks
 
-## Sources of data:
+- Configured with the constellation source URL.
+- Calls eat-rocks's library API to clone / refresh `./var/rocks/`.
+- Source revision / cursor checkpointed in `./var/rocks/.cursor`.
+- Re-running with a matching cursor is a no-op; otherwise eat-rocks resumes.
 
-It is critical to use the right sources of data in order to work efficiently. The wrong endpoint can mean that things take 100x as long as they should.
-- getting all dids: plc.directory/export -- prefer reimplementing the export pull in pure Go, or importing `goat` as a library if its packages are clean. Avoid shelling out to a binary.
-- getting follow / block / profile records during bootstrap: https://constellation.microcosm.blue/ -- using listRecords for the relevant collection for a given DID or batch of DIDs
-- getting live ATProto records: wss://jetstream{1,2}.{us-east,us-west}.bsky.network/subscribe
-  - one active connection at a time with failover across endpoints
-  - it should be configurable to filter to ONLY the record types we want and we can subset based on language (default: en) and labelers (default bsky moderation) on records that carry those fields
+### 2. Stage — rocks → parquet
+
+Open `./var/rocks/` read-only with the four CF descriptors above. Run three
+streaming passes; each writes via temp file + atomic rename, batched at
+`--batch-size` rows. The rocks adapter (`src/rocks/schema.rs`) is the only
+module that knows about bincode layouts.
+
+**Pass A — scan `did_ids`** (skip 8-byte reverse-mapping keys):
+- Decode `Did` (key) and `DidIdValue(DidId, active)` (value).
+- Emit `actors.parquet` with `(did_id, did, active)`.
+
+**Pass B — scan `link_targets`** (no reverse-mapping rows in this CF):
+- Decode `RecordLinkKey(did_id, collection, rkey)` and
+  `RecordLinkTargets(Vec<(rpath, target_id)>)`.
+- Compute `created_at` = TID-decode(rkey) for like / repost / follow / block /
+  post collections; NULL otherwise.
+- Resolve each `target_id` to `TargetKey(target, collection, rpath)` via point
+  lookup `db.get_cf(target_ids, id.to_be_bytes())`.
+- Multiplex into output files by collection:
+  - `app.bsky.feed.post` → `posts_from_records.parquet` row, plus 0..n
+    `post_media.parquet` rows for forward links at media RPaths
+    (`.embed.images[N].image`, `.embed.video.video`, `.embed.external.uri`,
+    `.embed.external.thumb`, `.embed.record.uri`,
+    `.embed.recordWithMedia.media.images[N].image`, etc.).
+  - `app.bsky.feed.like` → `likes.parquet`, subject from `.subject.uri`.
+  - `app.bsky.feed.repost` → `reposts.parquet`, subject from `.subject.uri`.
+  - `app.bsky.graph.follow` → `follows.parquet`, subject from `.subject`.
+  - `app.bsky.graph.block` → `blocks.parquet`, subject from `.subject`.
+  - `app.bsky.actor.profile` → no row here (we already have the actor from
+    Pass A); future text-content spec will populate fields from this record.
+  - Other collections → ignored (out of scope for this snapshot).
+
+**Pass C — scan `target_ids`** (skip 8-byte reverse-mapping keys):
+- For `TargetKey` rows whose `Target` is an AT-URI of `app.bsky.feed.post`,
+  emit a `posts_from_targets.parquet` row with `(uri, author_did, rkey,
+  created_at)` parsed from the URI / TID. This catches posts that exist in
+  the graph only as targets of likes / quotes / replies.
+
+Memory is bounded by `--batch-size`; each pass streams. Point lookups for ID
+resolution rely on RocksDB's block cache.
+
+### 3. Hydrate — parquet → duckdb
+
+Open `./var/snapshot.duckdb` with `SET memory_limit=...; SET temp_directory=...;`.
+Build tables and aggregates entirely in SQL:
+
+- `actors` ← `read_parquet('actors.parquet')`.
+- `follows`, `blocks`, `likes`, `reposts`, `post_media` ← straightforward
+  loads.
+- `posts` ← `posts_from_records UNION BY NAME posts_from_targets`, deduped on
+  `uri`, preferring rows that came from records (they have richer fields like
+  reply / quote refs).
+- `actor_aggs`, `post_aggs` ← `GROUP BY` queries over the base tables.
+
+Validation queries run after hydrate; failures abort publish.
+
+### 4. Publish
+
+- Stream `raw/.../*.parquet`, `snapshot/.../snapshot.duckdb`, and
+  `snapshot_metadata.json` to the configured object store via multipart
+  upload.
 
 ## Data model
 
-The entities we are interested in are the following. 
-Social Graph:
-- Actor: app.bsky.actor.profile (we want a current snapshot of the actors, with their bios, create time)
-  - actor_aggs: current followers / follows / blocks (all-time, derived from the current-state graph) plus posts / likes / quotes / replies *within the snapshot window*. Window-scoped fields use the `_in_window` suffix to keep the scope explicit.
-- Follows: app.bsky.graph.follow
-  - we care about src_id and dest_id of the interned DIDs and timestamp
-- Blocks: app.bsky.graph.block
-  - we care about src_id and dest_id of the interned DIDs and timestamp
-Posts: 
-- Posts: app.bsky.feed.post
-  - the initial immutable post and accompanying information (we care about the content, timestsamp, actor, reply_parent, quote_parent)
-  - post_media in a separate table (we dont care about alt text or the actual content, just the links, type, and timestamps)
-  - post_aggs in a separate table (likes / retweets) -- updated over time to reflect the current aggregates from likes / reposts / posts for the current snapshot
-- Likes: app.bsky.feed.like (we care about the actor, post, and timestamp)
-- Reposts: app.bsky.feed.repost
+Join keys are constellation's native numeric IDs (`DidId`, `TargetId`). They
+are reproducible within a snapshot but not portable across snapshots. Source
+strings are preserved alongside in `actors` and `posts` so consumers can join
+by DID / URI directly if needed.
 
-Additionally to keep the tables memory efficient we will intern the following fields to reduce their footprint small:
-- URI: post URIs are long and will have an id that can be referenced for likes, aggs, and media
-- DIDs: Profiles will have their DIDs interned
-- We will use bigints for all of these to ensure we can reach sufficient scale
-- Interning is done by deterministic 64-bit hash (e.g. xxhash64) of the source string, so no central ID allocator or shared state is needed across `bootstrap` / `run` / `snapshot`. The original strings are preserved alongside the id in the `actors` and `posts` tables, so collisions can be detected and reported at snapshot time.
+| Table | Columns |
+|---|---|
+| `actors` | `did_id PK`, `did STRING`, `active BOOL` |
+| `actor_aggs` | `did_id PK`, `follows`, `followers`, `blocks_out`, `blocks_in`, `posts`, `likes_out`, `likes_in`, `reposts_out`, `reposts_in`, `replies_out`, `quotes_out`, `quoted_count` |
+| `follows` | `src_did_id`, `dst_did_id`, `rkey`, `created_at`, PK `(src_did_id, rkey)` |
+| `blocks` | `src_did_id`, `dst_did_id`, `rkey`, `created_at`, PK `(src_did_id, rkey)` |
+| `posts` | `uri PK`, `author_did_id`, `rkey`, `created_at`, `reply_root_uri NULL`, `reply_parent_uri NULL`, `quote_uri NULL`, `source ENUM('record','target_only')` |
+| `post_aggs` | `uri PK`, `likes`, `reposts`, `replies`, `quotes` |
+| `post_media` | `uri`, `ord`, `kind ENUM('image','video','external','record','external_thumb')`, `ref STRING` |
+| `likes` | `actor_did_id`, `subject_uri`, `rkey`, `created_at`, PK `(actor_did_id, rkey)` |
+| `reposts` | `actor_did_id`, `subject_uri`, `rkey`, `created_at`, PK `(actor_did_id, rkey)` |
 
-## Operational Considerations
+Notes:
 
-- Idempotent: As a good data engineering practice all the operations should be idempotent so that running them multiple times after failure does not cause a different state 
-- Checkpointed: Since this will be streaming live data and hang-ups may occur or machines may reboot It's important to checkpoint work both in the local file disk as well as remotely when it makes sense to. The job should resume from the most recent checkpoint if available 
-- Simple: The implementation should be simple and use Go strengths with coroutines, channels, and buffers in order to parallelize work as much as possible while keeping the footprint small
+- `post_aggs` counts come from SQL aggregations of `likes`, `reposts`, plus
+  `posts WHERE reply_parent_uri = ?` for replies and `posts WHERE quote_uri =
+  ?` for quotes. Counts are **all-time within this snapshot** — there is no
+  per-day window in this spec because we do not ingest streaming data.
+- A nontrivial fraction of `likes.subject_uri` and `reposts.subject_uri` will
+  point to posts that aren't in `posts` (e.g. text-only posts that nobody else
+  interacted with at the time their author wrote them, or non-bsky lexicons).
+  Pass C reduces this. The hydrate stage records the orphan rate in
+  `snapshot_metadata.json` and does not treat a non-zero rate as a failure.
+- `active = false` actors are kept in the table; downstream consumers can
+  filter as needed.
 
-## Additional Notes
-- Update the README.md to be concise with the following
-  - The goal this repo solves
-  - A mental model overview at the beginning
-  - the ERD in mermaid of the result 
-  - The CLI commands 
+## Validation
 
-## Reference implementations to look at:
-- https://docs.bsky.app/blog/introducing-tap
-- https://github.com/blacksky-algorithms/rsky/tree/main/rsky-wintermute
-- https://tangled.org/microcosm.blue/microcosm-rs/blob/main/constellation/readme.md
+A small recorded RocksDB fixture lives at `tests/fixtures/constellation_mini/`
+covering each entity, a quote chain, a reply chain, an external embed, an
+inactive DID, and a tombstone (`DidId(0)`) in `target_links`. `cargo test`
+runs the full pipeline against the fixture using the local-FS object store
+and asserts:
 
-## Implementation Guidance:
-- Use Agents where there are clear well defined steps to parallelize work and preserve context windows
-- Use Red/Green tests to build up to the end state. Wire and end to end test with mocks to start as well as a skeleton
-- Incrementally commit logical isolated units to create a linear history that's understandable
-- Validate the end result by running a subset of DIDs locally and validating everything generates. The test should be that you can run analytic queries like:
-  - How many people followed or blocked someone else yesterday
-  - What % of total follows were generated yesterday
-  - How many people who posted got 1 like
-  - How many posts got at least one like
-- If the implementation is no good we will wipe eveyrthing and restart with updated guidelines. Try to be as self consistent, logical, DRY, and use Go best practices as much as possible.
+- How many people followed or blocked someone else "yesterday"
+  (TID-derived).
+- What % of total follows were generated yesterday.
+- How many people who posted got at least one like.
+- How many posts got at least one like.
+
+Per-stage unit tests cover the rocks schema decoder
+(`src/rocks/schema.rs`) and parquet writers in isolation.
+
+## Open questions to resolve during implementation
+
+- Confirm exactly which paths constellation indexes for media inside post
+  records (i.e. whether blob CIDs at `.embed.images[N].image` actually appear
+  as `Target`s, or only externally-resolvable URIs do). The list above
+  reflects expected atproto paths; the rocks adapter will be updated to match
+  whatever the fixture actually contains.
+- Confirm eat-rocks's library entry point and the path it produces. The spec
+  treats the rocksdb directory as the contract — whatever eat-rocks names is
+  fine as long as it's openable read-only with the four CFs above.
+
+## Reference implementations
+
+- Constellation: https://tangled.org/microcosm.blue/microcosm-rs
+- RocksDB schema:
+  https://tangled.org/microcosm.blue/microcosm-rs/blob/main/constellation/src/storage/rocks_store.rs
+- eat-rocks: https://tangled.org/microcosm.blue/eat-rocks
+- Prior art: https://docs.bsky.app/blog/introducing-tap
+
+## Implementation guidance
+
+- `tokio` for async I/O at stage boundaries (object store, http monitor).
+  Plain threads + bounded channels for the rocks → parquet pipeline.
+- `anyhow` at binary edges, `thiserror` in libraries.
+- One module per stage (`mirror.rs`, `stage.rs`, `hydrate.rs`, `publish.rs`),
+  orchestrated through a `Stage` trait.
+- All rocks-schema knowledge in exactly one module.
+- Red/green tests; one logical commit at a time.
+
+## README updates
+
+Update `README.md` with: goal, mental-model overview, ERD in mermaid for the
+tables above, the single CLI command + flags, and a "Deferred" section
+listing the non-goals so users know what's intentionally missing.
