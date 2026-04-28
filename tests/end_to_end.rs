@@ -42,9 +42,9 @@ async fn end_to_end_synthetic_rocks() -> Result<()> {
         snapshot_date: Some("2026-04-27".into()),
         memory_limit: "1GiB".into(),
         batch_size: 1024,
-        object_store: None,
         mirror_concurrency: 1,
         backup_id: None,
+        upload: None,
     };
 
     let stage = at_snapshot::stage::run(&cfg, "2026-04-27").await?;

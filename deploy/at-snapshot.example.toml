@@ -1,0 +1,23 @@
+# Example at-snapshot config for the Modal deploy.
+# Copy to `deploy/at-snapshot.toml`, fill in your R2 details, and pass
+# `--config /app/deploy/at-snapshot.toml` when running the upload phase.
+#
+# Secrets (R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY) come from the
+# `r2-credentials` Modal Secret — do NOT put them here.
+
+source_url = "https://constellation.t3.storage.dev"
+work_dir   = "/vol/var"
+memory_limit = "8GiB"
+batch_size = 100000
+mirror_concurrency = 64
+
+[upload]
+kind       = "r2"
+bucket     = "atproto-snapshots"
+# Either provide an explicit endpoint:
+# endpoint = "https://<account-id>.r2.cloudflarestorage.com"
+# ...or just the account id and we'll synthesize the endpoint.
+account_id = "REPLACE_WITH_YOUR_R2_ACCOUNT_ID"
+prefix     = "atproto-snapshot"
+concurrency = 8
+include    = ["raw", "snapshot"]

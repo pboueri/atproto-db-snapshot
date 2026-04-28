@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 use crate::config::Config;
-use crate::metadata::SnapshotMetadata;
+use crate::metadata::{self, UploadStats};
 
 #[derive(Parser, Debug)]
 #[command(name = "at-snapshot", about = "ATProto analytic snapshot pipeline")]
@@ -14,12 +14,23 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Cmd {
-    /// Run the full pipeline: mirror, stage, hydrate (publish skipped).
-    Build(BuildArgs),
+    /// Run the full pipeline: mirror, then stage, then hydrate.
+    Build(CommonArgs),
+    /// Mirror the constellation rocksdb backup to local disk.
+    Mirror(CommonArgs),
+    /// Convert the local rocks mirror into per-entity parquet files.
+    Stage(CommonArgs),
+    /// Build snapshot.duckdb from the staged parquet files.
+    Hydrate(CommonArgs),
+    /// Upload raw + snapshot artifacts to the configured object store.
+    Upload(CommonArgs),
 }
 
-#[derive(Parser, Debug)]
-pub struct BuildArgs {
+/// Flags shared by every subcommand. Each subcommand uses the subset
+/// that applies to it; unused flags are silently ignored so a single
+/// `at-snapshot --config foo.toml ...` invocation works for any phase.
+#[derive(Parser, Debug, Clone)]
+pub struct CommonArgs {
     #[arg(long)]
     pub config: Option<PathBuf>,
     #[arg(long)]
@@ -36,12 +47,6 @@ pub struct BuildArgs {
     pub mirror_concurrency: Option<usize>,
     #[arg(long)]
     pub backup_id: Option<u64>,
-    #[arg(long)]
-    pub skip_mirror: bool,
-    #[arg(long)]
-    pub skip_stage: bool,
-    #[arg(long)]
-    pub skip_hydrate: bool,
 }
 
 pub async fn run() -> Result<()> {
@@ -49,6 +54,10 @@ pub async fn run() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Build(args) => run_build(args).await,
+        Cmd::Mirror(args) => run_mirror(args).await,
+        Cmd::Stage(args) => run_stage(args).await,
+        Cmd::Hydrate(args) => run_hydrate(args).await,
+        Cmd::Upload(args) => run_upload(args).await,
     }
 }
 
@@ -61,12 +70,17 @@ fn init_tracing() {
         .init();
 }
 
-async fn run_build(args: BuildArgs) -> Result<()> {
+struct Prepared {
+    cfg: Config,
+    snapshot_date: String,
+}
+
+fn prepare(args: &CommonArgs) -> Result<Prepared> {
     let mut cfg = match &args.config {
         Some(p) => Config::from_toml_file(p)?,
         None => Config::defaults(),
     };
-    apply_overrides(&mut cfg, &args);
+    apply_overrides(&mut cfg, args);
 
     let snapshot_date = cfg
         .snapshot_date
@@ -76,71 +90,10 @@ async fn run_build(args: BuildArgs) -> Result<()> {
     std::fs::create_dir_all(&cfg.work_dir)
         .with_context(|| format!("create work_dir {}", cfg.work_dir.display()))?;
 
-    tracing::info!(
-        snapshot_date,
-        source_url = %cfg.source_url,
-        work_dir = %cfg.work_dir.display(),
-        "build start"
-    );
-
-    let mut mirror_bytes = 0u64;
-    let mut stage_counts: Vec<(String, u64)> = Vec::new();
-    let mut hydrate = None;
-
-    if !args.skip_mirror {
-        let m = crate::mirror::run(&cfg).await?;
-        mirror_bytes = m.bytes_on_disk;
-    } else {
-        tracing::info!("skipping mirror stage");
-    }
-
-    if !args.skip_stage {
-        let s = crate::stage::run(&cfg, &snapshot_date).await?;
-        stage_counts = s.counts.clone();
-        tracing::info!(?stage_counts, "stage complete");
-    } else {
-        tracing::info!("skipping stage");
-    }
-
-    if !args.skip_hydrate {
-        let h = crate::hydrate::run(&cfg, &snapshot_date).await?;
-        tracing::info!(counts = ?h.row_counts, orphan_like = h.orphan_like_rate, orphan_repost = h.orphan_repost_rate, "hydrate complete");
-        hydrate = Some(h);
-    } else {
-        tracing::info!("skipping hydrate");
-    }
-
-    let meta = SnapshotMetadata {
-        snapshot_date: snapshot_date.clone(),
-        source_url: cfg.source_url.clone(),
-        backup_id: cfg.backup_id,
-        mirror_bytes,
-        stage_counts,
-        hydrate_counts: hydrate
-            .as_ref()
-            .map(|h| h.row_counts.clone())
-            .unwrap_or_default(),
-        orphan_like_rate: hydrate.as_ref().map(|h| h.orphan_like_rate).unwrap_or(0.0),
-        orphan_repost_rate: hydrate.as_ref().map(|h| h.orphan_repost_rate).unwrap_or(0.0),
-        generated_at: chrono::Utc::now().to_rfc3339(),
-        schema_version: 1,
-    };
-    let meta_path = cfg
-        .snapshot_dir(&snapshot_date)
-        .join("snapshot_metadata.json");
-    crate::metadata::write(&meta_path, &meta)?;
-    tracing::info!(path = %meta_path.display(), "wrote snapshot metadata");
-    if let Some(h) = hydrate.as_ref() {
-        tracing::info!(
-            duckdb = %h.duckdb_path.display(),
-            "snapshot ready; query with: duckdb {}",
-            h.duckdb_path.display()
-        );
-    }
-    Ok(())
+    Ok(Prepared { cfg, snapshot_date })
 }
 
-fn apply_overrides(cfg: &mut Config, args: &BuildArgs) {
+fn apply_overrides(cfg: &mut Config, args: &CommonArgs) {
     if let Some(d) = &args.work_dir {
         cfg.work_dir = d.clone();
     }
@@ -162,4 +115,105 @@ fn apply_overrides(cfg: &mut Config, args: &BuildArgs) {
     if let Some(b) = args.backup_id {
         cfg.backup_id = Some(b);
     }
+}
+
+async fn run_build(args: CommonArgs) -> Result<()> {
+    let p = prepare(&args)?;
+    tracing::info!(
+        snapshot_date = p.snapshot_date,
+        source_url = %p.cfg.source_url,
+        work_dir = %p.cfg.work_dir.display(),
+        "build start"
+    );
+
+    do_mirror(&p).await?;
+    do_stage(&p).await?;
+    do_hydrate(&p).await?;
+
+    Ok(())
+}
+
+async fn run_mirror(args: CommonArgs) -> Result<()> {
+    let p = prepare(&args)?;
+    do_mirror(&p).await?;
+    Ok(())
+}
+
+async fn run_stage(args: CommonArgs) -> Result<()> {
+    let p = prepare(&args)?;
+    do_stage(&p).await?;
+    Ok(())
+}
+
+async fn run_hydrate(args: CommonArgs) -> Result<()> {
+    let p = prepare(&args)?;
+    do_hydrate(&p).await?;
+    Ok(())
+}
+
+async fn run_upload(args: CommonArgs) -> Result<()> {
+    let p = prepare(&args)?;
+    do_upload(&p).await?;
+    Ok(())
+}
+
+async fn do_mirror(p: &Prepared) -> Result<()> {
+    let m = crate::mirror::run(&p.cfg).await?;
+    let path = metadata::update(&p.cfg, &p.snapshot_date, |meta| {
+        meta.mirror_bytes = m.bytes_on_disk;
+    })?;
+    tracing::info!(path = %path.display(), bytes = m.bytes_on_disk, "mirror complete; metadata updated");
+    Ok(())
+}
+
+async fn do_stage(p: &Prepared) -> Result<()> {
+    let s = crate::stage::run(&p.cfg, &p.snapshot_date).await?;
+    let path = metadata::update(&p.cfg, &p.snapshot_date, |meta| {
+        meta.stage_counts = s.counts.clone();
+    })?;
+    tracing::info!(path = %path.display(), counts = ?s.counts, "stage complete; metadata updated");
+    Ok(())
+}
+
+async fn do_hydrate(p: &Prepared) -> Result<()> {
+    let h = crate::hydrate::run(&p.cfg, &p.snapshot_date).await?;
+    let path = metadata::update(&p.cfg, &p.snapshot_date, |meta| {
+        meta.hydrate_counts = h.row_counts.clone();
+        meta.orphan_like_rate = h.orphan_like_rate;
+        meta.orphan_repost_rate = h.orphan_repost_rate;
+    })?;
+    tracing::info!(
+        duckdb = %h.duckdb_path.display(),
+        metadata = %path.display(),
+        counts = ?h.row_counts,
+        orphan_like = h.orphan_like_rate,
+        orphan_repost = h.orphan_repost_rate,
+        "hydrate complete; query with: duckdb {}",
+        h.duckdb_path.display()
+    );
+    Ok(())
+}
+
+async fn do_upload(p: &Prepared) -> Result<()> {
+    let outcome = crate::upload::run(&p.cfg, &p.snapshot_date).await?;
+    let stats = UploadStats {
+        kind: outcome.kind.clone(),
+        bucket: outcome.bucket.clone(),
+        prefix: outcome.prefix.clone(),
+        files: outcome.files,
+        bytes: outcome.bytes,
+        completed_at: chrono::Utc::now().to_rfc3339(),
+    };
+    let path = metadata::update(&p.cfg, &p.snapshot_date, |meta| {
+        meta.upload = Some(stats);
+    })?;
+    tracing::info!(
+        bucket = outcome.bucket,
+        prefix = outcome.prefix,
+        files = outcome.files,
+        bytes = outcome.bytes,
+        metadata = %path.display(),
+        "upload complete; metadata updated"
+    );
+    Ok(())
 }
