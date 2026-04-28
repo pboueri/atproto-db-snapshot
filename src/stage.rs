@@ -5,15 +5,12 @@ use std::path::PathBuf;
 use crate::config::Config;
 use crate::rocks::open::open_readonly;
 use crate::rocks::schema::{
-    self as rs, AtUri, Collection, Did, DidId, DidIdValue, RKey, RPath, RecordLinkKey,
+    self as rs, Collection, Did, DidId, DidIdValue, RKey, RPath, RecordLinkKey,
     RecordLinkTargets, Target, TargetId, TargetKey,
 };
 use crate::tid;
-use crate::writers::{
-    ActorWriter, LinkRecordTargetsWriter, LinkRecordWriter, PostFromTargetWriter, TargetWriter,
-};
+use crate::writers::{ActorWriter, LinkRecordTargetsWriter, LinkRecordWriter, TargetWriter};
 
-const COL_POST: &str = "app.bsky.feed.post";
 const COL_PROFILE: &str = "app.bsky.actor.profile";
 
 pub struct StageOutcome {
@@ -36,14 +33,13 @@ pub async fn run(cfg: &Config, snapshot_date: &str) -> Result<StageOutcome> {
 
     let actors_count = pass_a_actors(&db, &raw_dir, cfg.batch_size)?;
     let link = pass_b_link_targets(&db, &raw_dir, cfg.batch_size)?;
-    let target = pass_c_targets(&db, &raw_dir, cfg.batch_size)?;
+    let targets_count = pass_c_targets(&db, &raw_dir, cfg.batch_size)?;
 
     let counts = vec![
         ("actors".to_string(), actors_count),
         ("link_records".to_string(), link.records),
         ("link_record_targets".to_string(), link.targets),
-        ("targets".to_string(), target.targets),
-        ("posts_from_targets".to_string(), target.posts_from_targets),
+        ("targets".to_string(), targets_count),
     ];
     Ok(StageOutcome { raw_dir, counts })
 }
@@ -206,38 +202,27 @@ fn pass_b_link_targets(
     Ok(counts)
 }
 
-#[derive(Default)]
-struct PassCCounts {
-    targets: u64,
-    posts_from_targets: u64,
-}
-
 /// Pass C: scan `target_ids` *reverse* map (8-byte target_id → TargetKey).
 /// We use the reverse side because constellation may assign multiple
-/// target_ids to the same (target, collection, rpath) triple, in which case
-/// the forward map only retains the last writer; the reverse map keeps
-/// every id. Emits one row per target_id to `targets.parquet`, plus a
-/// post-shaped row to `posts_from_targets.parquet` when the target is an
-/// AT-URI of a post (preserves TID-decoded created_at for posts that only
-/// exist as targets of other records).
+/// target_ids to the same (target, collection, rpath) triple; the forward
+/// map only retains the last writer, while the reverse map keeps every
+/// id. Emits one row per target_id to `targets.parquet`. Hydrate filters
+/// this to AT-URIs of posts to recover target-only posts.
 fn pass_c_targets(
     db: &DB,
     raw_dir: &std::path::Path,
     batch_size: usize,
-) -> Result<PassCCounts> {
+) -> Result<u64> {
     let cf = db
         .cf_handle(rs::CF_TARGET_IDS)
         .context("missing target_ids cf")?;
     let mut targets = TargetWriter::create(raw_dir.join("targets.parquet"), batch_size)?;
-    let mut posts =
-        PostFromTargetWriter::create(raw_dir.join("posts_from_targets.parquet"), batch_size)?;
 
     let mut read_opts = ReadOptions::default();
     read_opts.set_verify_checksums(false);
     let iter = db.iterator_cf_opt(cf, read_opts, IteratorMode::Start);
 
-    let mut counts = PassCCounts::default();
-    let bad_target_ids = 0u64;
+    let mut emitted = 0u64;
     let mut bad_target_values = 0u64;
     for item in iter {
         let (k, v) = item.context("iterate target_ids")?;
@@ -260,45 +245,18 @@ fn pass_c_targets(
                 }
             };
         targets.push(target_id, &target, &coll, &path)?;
-        counts.targets += 1;
+        emitted += 1;
 
-        if let Some(uri) = parse_post_uri(&target) {
-            let created = tid::decode_tid_micros(&uri.rkey);
-            posts.push(&target, &uri.did, &uri.rkey, created)?;
-            counts.posts_from_targets += 1;
-        }
-
-        if counts.targets % 1_000_000 == 0 {
-            tracing::info!(
-                targets = counts.targets,
-                posts_from_targets = counts.posts_from_targets,
-                bad_target_ids,
-                bad_target_values,
-                "pass C progress"
-            );
+        if emitted % 1_000_000 == 0 {
+            tracing::info!(emitted, bad_target_values, "pass C progress");
         }
     }
-    let (targets_path, targets_total) = targets.finish()?;
-    let (posts_path, posts_total) = posts.finish()?;
+    let (path, total) = targets.finish()?;
     tracing::info!(
-        targets = targets_total,
-        posts_from_targets = posts_total,
-        bad_target_ids,
+        emitted = total,
         bad_target_values,
-        targets_path = %targets_path.display(),
-        posts_path = %posts_path.display(),
+        path = %path.display(),
         "pass C complete"
     );
-    counts.targets = targets_total;
-    counts.posts_from_targets = posts_total;
-    Ok(counts)
-}
-
-fn parse_post_uri(s: &str) -> Option<AtUri> {
-    let uri = rs::parse_at_uri(s)?;
-    if uri.collection == COL_POST {
-        Some(uri)
-    } else {
-        None
-    }
+    Ok(total)
 }

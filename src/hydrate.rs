@@ -11,6 +11,7 @@ pub struct HydrateOutcome {
     pub orphan_repost_rate: f64,
 }
 
+const SQL_MACROS: &str = include_str!("sql/macros.sql");
 const SQL_LOAD_RAW: &str = include_str!("sql/load_raw.sql");
 const SQL_BUILD_FOLLOWS: &str = include_str!("sql/build_follows.sql");
 const SQL_BUILD_BLOCKS: &str = include_str!("sql/build_blocks.sql");
@@ -52,6 +53,7 @@ pub async fn run(cfg: &Config, snapshot_date: &str) -> Result<HydrateOutcome> {
     )?;
 
     let stages: &[(&str, &str)] = &[
+        ("macros", SQL_MACROS),
         ("load_raw", &SQL_LOAD_RAW.replace("{RAW}", &raw_str)),
         ("build_follows", SQL_BUILD_FOLLOWS),
         ("build_blocks", SQL_BUILD_BLOCKS),

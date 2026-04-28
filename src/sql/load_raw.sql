@@ -12,6 +12,3 @@ SELECT * FROM read_parquet('{RAW}/link_record_targets.parquet');
 
 CREATE TABLE targets AS
 SELECT * FROM read_parquet('{RAW}/targets.parquet');
-
-CREATE TABLE posts_from_targets AS
-SELECT * FROM read_parquet('{RAW}/posts_from_targets.parquet');
