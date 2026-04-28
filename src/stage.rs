@@ -31,9 +31,28 @@ pub async fn run(cfg: &Config, snapshot_date: &str) -> Result<StageOutcome> {
     let cache_bytes = cfg.rocks_block_cache_bytes()?;
     let db = open_readonly(&rocks_dir, cache_bytes)?;
 
-    let actors_count = pass_a_actors(&db, &raw_dir, cfg.batch_size)?;
-    let link = pass_b_link_targets(&db, &raw_dir, cfg.batch_size)?;
-    let targets_count = pass_c_targets(&db, &raw_dir, cfg.batch_size)?;
+    // Pass A/B/C scan disjoint column families and write to disjoint
+    // parquet files, so they parallelize cleanly across OS threads. The
+    // single shared DB handle is fine — RocksDB iterators are independent
+    // per-CF.
+    let raw_dir_ref: &std::path::Path = &raw_dir;
+    let batch_size = cfg.batch_size;
+    let (actors_count, link, targets_count) =
+        std::thread::scope(|s| -> Result<(u64, PassBCounts, u64)> {
+            let a = s.spawn(|| pass_a_actors(&db, raw_dir_ref, batch_size));
+            let b = s.spawn(|| pass_b_link_targets(&db, raw_dir_ref, batch_size));
+            let c = s.spawn(|| pass_c_targets(&db, raw_dir_ref, batch_size));
+            let actors = a
+                .join()
+                .map_err(|_| anyhow::anyhow!("pass A panicked"))??;
+            let link = b
+                .join()
+                .map_err(|_| anyhow::anyhow!("pass B panicked"))??;
+            let targets = c
+                .join()
+                .map_err(|_| anyhow::anyhow!("pass C panicked"))??;
+            Ok((actors, link, targets))
+        })?;
 
     let counts = vec![
         ("actors".to_string(), actors_count),
@@ -44,15 +63,26 @@ pub async fn run(cfg: &Config, snapshot_date: &str) -> Result<StageOutcome> {
     Ok(StageOutcome { raw_dir, counts })
 }
 
+/// Sequential-scan readahead. Default rocksdb iterator reads ~32KiB at
+/// a time; pumping that to 8MiB converts pass A/B/C into bulk sequential
+/// I/O and makes a meaningful difference even on local NVMe (page-cache
+/// prefetch alignment) — and a much bigger one over network FS.
+const SCAN_READAHEAD_BYTES: usize = 8 * 1024 * 1024;
+
+fn scan_read_opts() -> ReadOptions {
+    let mut opts = ReadOptions::default();
+    opts.set_verify_checksums(false);
+    opts.set_readahead_size(SCAN_READAHEAD_BYTES);
+    opts
+}
+
 fn pass_a_actors(db: &DB, raw_dir: &std::path::Path, batch_size: usize) -> Result<u64> {
     let cf = db
         .cf_handle(rs::CF_DID_IDS)
         .context("missing did_ids cf")?;
     let mut writer = ActorWriter::create(raw_dir.join("actors.parquet"), batch_size)?;
 
-    let mut read_opts = ReadOptions::default();
-    read_opts.set_verify_checksums(false);
-    let iter = db.iterator_cf_opt(cf, read_opts, IteratorMode::Start);
+    let iter = db.iterator_cf_opt(cf, scan_read_opts(), IteratorMode::Start);
 
     let mut scanned = 0u64;
     let mut emitted = 0u64;
@@ -129,9 +159,7 @@ fn pass_b_link_targets(
         batch_size,
     )?;
 
-    let mut read_opts = ReadOptions::default();
-    read_opts.set_verify_checksums(false);
-    let iter = db.iterator_cf_opt(cf, read_opts, IteratorMode::Start);
+    let iter = db.iterator_cf_opt(cf, scan_read_opts(), IteratorMode::Start);
 
     let mut counts = PassBCounts::default();
     let mut bad_link_keys = 0u64;
@@ -218,9 +246,7 @@ fn pass_c_targets(
         .context("missing target_ids cf")?;
     let mut targets = TargetWriter::create(raw_dir.join("targets.parquet"), batch_size)?;
 
-    let mut read_opts = ReadOptions::default();
-    read_opts.set_verify_checksums(false);
-    let iter = db.iterator_cf_opt(cf, read_opts, IteratorMode::Start);
+    let iter = db.iterator_cf_opt(cf, scan_read_opts(), IteratorMode::Start);
 
     let mut emitted = 0u64;
     let mut bad_target_values = 0u64;
