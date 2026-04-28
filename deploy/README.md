@@ -33,14 +33,29 @@ pip install modal
 modal token new
 ```
 
+For uploads, also create a Modal Secret with R2 credentials:
+
+```sh
+modal secret create r2-credentials \
+  R2_ACCESS_KEY_ID=... \
+  R2_SECRET_ACCESS_KEY=...
+```
+
 ## Build a snapshot
+
+Full pipeline (mirror → stage → hydrate):
 
 ```sh
 modal run deploy/modal_app.py
 ```
 
-This calls the `build` function with defaults: latest backup, today's
-date, 64 concurrent fetches, 24 GiB DuckDB memory, 800 GiB disk cap.
+Run a single phase against the persistent volume:
+
+```sh
+modal run deploy/modal_app.py --phase mirror
+modal run deploy/modal_app.py --phase stage
+modal run deploy/modal_app.py --phase hydrate
+```
 
 Pinned backup + date:
 
@@ -48,11 +63,25 @@ Pinned backup + date:
 modal run deploy/modal_app.py --backup-id 679 --snapshot-date 2026-04-27
 ```
 
-Skip flags resume mid-pipeline against the persisted volume:
+## Upload to R2
+
+After a build completes, push raw + snapshot to R2:
 
 ```sh
-modal run deploy/modal_app.py --skip-mirror --skip-stage   # only re-run hydrate
+modal run deploy/modal_app.py --phase upload --snapshot-date 2026-04-27 \
+  --config /app/deploy/at-snapshot.toml
 ```
+
+Or do it in one shot after a fresh build:
+
+```sh
+modal run deploy/modal_app.py --upload-after --config /app/deploy/at-snapshot.toml
+```
+
+The config file lives inside the image (added via `add_local_dir`), so
+reference it by its `/app/...` path. R2 credentials come from the
+`r2-credentials` Modal Secret; everything else (bucket, account_id,
+prefix) is in the config.
 
 ## Volume layout
 
@@ -72,13 +101,10 @@ new SST files since the last backup.
 
 | Flag | Default | Notes |
 |---|---|---|
+| `--phase` | `build` | `build`, `mirror`, `stage`, `hydrate`, or `upload`. |
+| `--upload-after` | `false` | When set and `--phase` ≠ `upload`, run upload after the chosen phase. |
 | `--backup-id` | latest | Pin a constellation backup id (`meta/<id>` in the bucket). |
 | `--snapshot-date` | today UTC | Output namespace. |
 | `--mirror-concurrency` | 64 | Drop to 8–16 if Tigris rate-limits. |
 | `--memory-limit` | 8GiB | DuckDB cap. |
-| `--skip-{mirror,stage,hydrate}` | — | Resume mid-pipeline. |
-
-## R2 upload
-
-The `upload_to_r2` function is a stub today — wire up rclone or boto3
-with a Modal Secret holding R2 credentials when you're ready to publish.
+| `--config` | — | Path to a config TOML inside the image (e.g. `/app/deploy/at-snapshot.toml`). Required for upload. |

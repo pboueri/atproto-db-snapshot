@@ -6,4 +6,5 @@ pub mod mirror;
 pub mod rocks;
 pub mod stage;
 pub mod tid;
+pub mod upload;
 pub mod writers;

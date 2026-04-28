@@ -1,16 +1,25 @@
 """Modal driver for at-snapshot.
 
-Runs the full pipeline (mirror + stage + hydrate) on a Modal container
-with enough disk to hold constellation's full backup. Outputs land on a
-persistent Modal Volume.
+Drives the at-snapshot pipeline on a Modal container with enough disk to
+hold constellation's full backup. Outputs land on a persistent Modal
+Volume.
+
+Pipeline phases map 1:1 to at-snapshot subcommands:
 
   modal run deploy/modal_app.py                            # full build
-  modal run deploy/modal_app.py --skip-mirror              # resume
-  modal run deploy/modal_app.py --backup-id 679
+  modal run deploy/modal_app.py --phase mirror             # just mirror
+  modal run deploy/modal_app.py --phase stage              # just stage
+  modal run deploy/modal_app.py --phase hydrate            # just hydrate
+  modal run deploy/modal_app.py --phase build --upload     # build + upload
+  modal run deploy/modal_app.py --phase upload             # upload only
 
 Each phase commits the Volume on success so a later container can resume
 from the last good state. The mirror also commits in the background
 every five minutes during the long download.
+
+Upload requires a Modal Secret named `r2-credentials` exposing
+`R2_ACCESS_KEY_ID` and `R2_SECRET_ACCESS_KEY`. Non-secret R2 settings
+(bucket, account_id, prefix) live in the config file the binary loads.
 """
 from __future__ import annotations
 
@@ -18,6 +27,7 @@ import os
 import subprocess
 import threading
 import time
+from typing import Iterable
 
 import modal
 
@@ -89,19 +99,15 @@ volume = modal.Volume.from_name("at-snapshot-data", create_if_missing=True)
 app = modal.App("at-snapshot")
 
 
-def _run_at_snapshot(
+def _common_args(
     *,
-    skip_mirror: bool,
-    skip_stage: bool,
-    skip_hydrate: bool,
     backup_id: int | None,
     snapshot_date: str | None,
     mirror_concurrency: int,
     memory_limit: str,
-) -> None:
+    config: str | None,
+) -> list[str]:
     args = [
-        "/app/target/release/at-snapshot",
-        "build",
         "--work-dir",
         "/vol/var",
         "--memory-limit",
@@ -113,12 +119,13 @@ def _run_at_snapshot(
         args += ["--backup-id", str(backup_id)]
     if snapshot_date:
         args += ["--snapshot-date", snapshot_date]
-    if skip_mirror:
-        args.append("--skip-mirror")
-    if skip_stage:
-        args.append("--skip-stage")
-    if skip_hydrate:
-        args.append("--skip-hydrate")
+    if config:
+        args += ["--config", config]
+    return args
+
+
+def _run_subcommand(subcommand: str, common: Iterable[str]) -> None:
+    args = ["/app/target/release/at-snapshot", subcommand, *list(common)]
     env = {**os.environ, "RUST_LOG": "info,object_store=warn"}
     print("running:", " ".join(args), flush=True)
     subprocess.check_call(args, env=env)
@@ -169,84 +176,141 @@ class _PeriodicCommit:
     ephemeral_disk=1024 * 1024,  # 1 TiB
 )
 def build(
-    skip_mirror: bool = False,
-    skip_stage: bool = False,
-    skip_hydrate: bool = False,
     backup_id: int | None = None,
     snapshot_date: str | None = None,
     mirror_concurrency: int = 64,
     memory_limit: str = "8GiB",
+    config: str | None = None,
 ) -> None:
-    common = dict(
+    """Run mirror + stage + hydrate as three separate subcommands."""
+    common = _common_args(
         backup_id=backup_id,
         snapshot_date=snapshot_date,
         mirror_concurrency=mirror_concurrency,
         memory_limit=memory_limit,
+        config=config,
     )
 
-    if not skip_mirror:
-        print("=== phase 1/3: mirror ===", flush=True)
+    print("=== phase 1/3: mirror ===", flush=True)
+    with _PeriodicCommit(volume, interval_s=300):
+        _run_subcommand("mirror", common)
+    volume.commit()
+    print("=== mirror committed ===", flush=True)
+
+    print("=== phase 2/3: stage ===", flush=True)
+    _run_subcommand("stage", common)
+    volume.commit()
+    print("=== stage committed ===", flush=True)
+
+    print("=== phase 3/3: hydrate ===", flush=True)
+    _run_subcommand("hydrate", common)
+    volume.commit()
+    print("=== hydrate committed; snapshot ready ===", flush=True)
+
+
+@app.function(
+    image=image,
+    volumes={"/vol": volume},
+    timeout=60 * 60 * 10,
+    cpu=4.0,
+    memory=12 * 1024,
+    ephemeral_disk=1024 * 1024,
+)
+def single_phase(
+    name: str,
+    backup_id: int | None = None,
+    snapshot_date: str | None = None,
+    mirror_concurrency: int = 64,
+    memory_limit: str = "8GiB",
+    config: str | None = None,
+) -> None:
+    """Run a single phase: mirror, stage, or hydrate."""
+    if name not in {"mirror", "stage", "hydrate"}:
+        raise SystemExit(f"name must be mirror/stage/hydrate, got {name!r}")
+    common = _common_args(
+        backup_id=backup_id,
+        snapshot_date=snapshot_date,
+        mirror_concurrency=mirror_concurrency,
+        memory_limit=memory_limit,
+        config=config,
+    )
+    if name == "mirror":
         with _PeriodicCommit(volume, interval_s=300):
-            _run_at_snapshot(
-                skip_mirror=False,
-                skip_stage=True,
-                skip_hydrate=True,
-                **common,
-            )
-        volume.commit()
-        print("=== mirror committed ===", flush=True)
-
-    if not skip_stage:
-        print("=== phase 2/3: stage ===", flush=True)
-        _run_at_snapshot(
-            skip_mirror=True,
-            skip_stage=False,
-            skip_hydrate=True,
-            **common,
-        )
-        volume.commit()
-        print("=== stage committed ===", flush=True)
-
-    if not skip_hydrate:
-        print("=== phase 3/3: hydrate ===", flush=True)
-        _run_at_snapshot(
-            skip_mirror=True,
-            skip_stage=True,
-            skip_hydrate=False,
-            **common,
-        )
-        volume.commit()
-        print("=== hydrate committed; snapshot ready ===", flush=True)
+            _run_subcommand("mirror", common)
+    else:
+        _run_subcommand(name, common)
+    volume.commit()
 
 
-@app.function(image=image, volumes={"/vol": volume}, timeout=60 * 60)
-def upload_to_r2(snapshot_date: str) -> None:
-    """Push raw/<date> + snapshot/<date> to R2."""
-    src_raw = f"/vol/var/raw/{snapshot_date}"
-    src_snap = f"/vol/var/snapshot/{snapshot_date}"
-    if not os.path.isdir(src_raw) or not os.path.isdir(src_snap):
-        raise SystemExit(f"missing snapshot artifacts for {snapshot_date}")
-    raise NotImplementedError(
-        "wire up rclone or boto3 with a Modal Secret for R2 before enabling"
+@app.function(
+    image=image,
+    volumes={"/vol": volume},
+    secrets=[modal.Secret.from_name("r2-credentials")],
+    timeout=60 * 60 * 4,
+    cpu=2.0,
+    memory=4 * 1024,
+)
+def upload(
+    snapshot_date: str | None = None,
+    config: str | None = None,
+) -> None:
+    """Push raw/<date> + snapshot/<date> to the configured object store.
+
+    Reads R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY from the
+    `r2-credentials` Modal Secret. All other settings (bucket,
+    account_id, prefix) come from the at-snapshot config file.
+    """
+    common = _common_args(
+        backup_id=None,
+        snapshot_date=snapshot_date,
+        mirror_concurrency=64,
+        memory_limit="2GiB",
+        config=config,
     )
+    _run_subcommand("upload", common)
 
 
 @app.local_entrypoint()
 def main(
-    skip_mirror: bool = False,
-    skip_stage: bool = False,
-    skip_hydrate: bool = False,
+    phase: str = "build",
+    upload_after: bool = False,
     backup_id: int | None = None,
     snapshot_date: str | None = None,
     mirror_concurrency: int = 64,
     memory_limit: str = "8GiB",
+    config: str | None = None,
 ) -> None:
-    build.remote(
-        skip_mirror=skip_mirror,
-        skip_stage=skip_stage,
-        skip_hydrate=skip_hydrate,
-        backup_id=backup_id,
-        snapshot_date=snapshot_date,
-        mirror_concurrency=mirror_concurrency,
-        memory_limit=memory_limit,
-    )
+    """Local entrypoint dispatcher.
+
+    Args:
+      phase: build | mirror | stage | hydrate | upload
+      upload_after: when True and phase != upload, run upload after the
+        chosen phase completes. Skipped for `upload` itself.
+    """
+    if phase == "build":
+        build.remote(
+            backup_id=backup_id,
+            snapshot_date=snapshot_date,
+            mirror_concurrency=mirror_concurrency,
+            memory_limit=memory_limit,
+            config=config,
+        )
+    elif phase in {"mirror", "stage", "hydrate"}:
+        single_phase.remote(
+            name=phase,
+            backup_id=backup_id,
+            snapshot_date=snapshot_date,
+            mirror_concurrency=mirror_concurrency,
+            memory_limit=memory_limit,
+            config=config,
+        )
+    elif phase == "upload":
+        upload.remote(snapshot_date=snapshot_date, config=config)
+        return
+    else:
+        raise SystemExit(
+            f"unknown phase {phase!r}; expected build/mirror/stage/hydrate/upload"
+        )
+
+    if upload_after:
+        upload.remote(snapshot_date=snapshot_date, config=config)

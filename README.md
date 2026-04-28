@@ -11,18 +11,32 @@ RocksDB backlinks index. Cheap, no-ceremony analytics on commodity hardware.
 constellation rocksdb  --(eat-rocks)-->  local rocks mirror
 local rocks mirror     --(stage)----->  staging parquet (per entity)
 staging parquet        --(hydrate)--->  snapshot.duckdb
-snapshot.duckdb        --(publish)--->  object store  [deferred]
+snapshot.duckdb        --(upload)---->  object store (R2)
 ```
 
-Each stage is a single-responsibility module. The CLI exposes one
-`build` command today; `--skip-{mirror,stage,hydrate}` lets you resume
-mid-pipeline.
+Each stage is a single-responsibility module with its own CLI
+subcommand. `build` runs all three in sequence; you can also invoke
+each phase on its own to resume mid-pipeline against an existing work
+directory.
 
 ## CLI
 
 ```
-at-snapshot build [flags]
+at-snapshot <subcommand> [flags]
 ```
+
+Subcommands:
+
+| Subcommand | What it does |
+|---|---|
+| `build`   | Run mirror → stage → hydrate. |
+| `mirror`  | Mirror the constellation rocksdb to `./var/rocks/`. |
+| `stage`   | Convert the rocks mirror into per-entity parquet under `./var/raw/<date>/`. |
+| `hydrate` | Build `./var/snapshot/<date>/snapshot.duckdb` from the parquet. |
+| `upload`  | Push `raw/<date>` + `snapshot/<date>` to a configured object store. |
+
+Every subcommand accepts the same flags (unused flags are silently
+ignored, so a single config file + flag set drives any phase):
 
 | Flag | Default | Notes |
 |---|---|---|
@@ -34,9 +48,31 @@ at-snapshot build [flags]
 | `--source-url <url>` | `https://constellation.t3.storage.dev` | eat-rocks source. |
 | `--backup-id <u64>` | latest | Pin a specific constellation backup. |
 | `--mirror-concurrency <n>` | `32` | eat-rocks fetch concurrency. Drop to 8 if you hit timeouts. |
-| `--skip-mirror` | — | Reuse existing `./var/rocks/`. |
-| `--skip-stage` | — | Reuse existing `./var/raw/<date>/*.parquet`. |
-| `--skip-hydrate` | — | Stop after staging. |
+
+### Upload (R2)
+
+`at-snapshot upload` pushes the staged + hydrated artifacts to an
+S3-compatible object store. Cloudflare R2 is the only built-in backend
+today; the abstraction is generic so other S3-compatible stores can be
+added.
+
+Secrets come from env. Everything else lives in the config TOML:
+
+```toml
+[upload]
+kind       = "r2"
+bucket     = "atproto-snapshots"
+account_id = "abc123..."        # endpoint derived from this
+prefix     = "atproto-snapshot" # path prefix in bucket
+concurrency = 8
+include    = ["raw", "snapshot"]
+```
+
+```sh
+export R2_ACCESS_KEY_ID=...
+export R2_SECRET_ACCESS_KEY=...
+at-snapshot upload --config at-snapshot.toml --snapshot-date 2026-04-27
+```
 
 ## System dependencies
 
@@ -137,8 +173,6 @@ prefers `record` rows when deduping by `uri`.
 - Media blob downloads / CDN mirroring.
 - Language / labeler filters (will return when text is back in scope).
 - Lists, feeds and feed generators, threadgates, starter packs.
-- Publish to R2 / object store. The `publish` stage is wired into the
-  module layout but not enabled — local artifacts only for now.
 
 ## Takedown requests
 
