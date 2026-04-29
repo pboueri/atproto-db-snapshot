@@ -23,6 +23,7 @@ target_only AS (
     split_part(substring(u.uri, 6), '/', 3) AS rkey
   FROM target_post_uris u
   WHERE NOT EXISTS (SELECT 1 FROM posts_from_records r WHERE r.uri = u.uri)
+    {TID_WINDOW}
 ),
 unioned AS (
   SELECT

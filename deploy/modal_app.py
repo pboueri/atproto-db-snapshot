@@ -269,6 +269,7 @@ def _copy_concurrent(
             with state_lock:
                 state["bytes"] += size
                 state["files"] += 1
+
         return _cb
 
     def err_cb(exc):
@@ -326,6 +327,43 @@ def _copy_concurrent(
     )
 
 
+def _raw_outputs_complete(raw_dir: str) -> bool:
+    """True iff `raw_dir` (typically `/vol-out/var/raw/<date>`) holds
+    the four parquet files a successful stage run produces. Used by
+    `build` to short-circuit mirror+stage when a previous run already
+    persisted raw — common after a hydrate cancellation."""
+    expected = (
+        "actors.parquet",
+        "link_records.parquet",
+        "link_record_targets.parquet",
+        "targets.parquet",
+    )
+    for name in expected:
+        p = os.path.join(raw_dir, name)
+        if not os.path.isfile(p) or os.path.getsize(p) == 0:
+            return False
+    return True
+
+
+def _drop_local_rocks() -> None:
+    """Remove /tmp/var/rocks once stage is done.
+
+    Stage is the only phase that reads rocks; hydrate consumes raw
+    parquet only. Dropping rocks before the raw-out copy reclaims ~650 GB
+    on the worker's local disk so the outbound copy's Modal-Volume FUSE
+    write buffer (which stages on the same disk) has headroom. Without
+    this, rocks (~650 GB) + raw (~400 GB) + buffered FUSE writes (~400 GB
+    while the copy runs) all compete on /tmp.
+    """
+    rocks_local = f"{TMP_WORK_DIR}/rocks"
+    if not os.path.isdir(rocks_local):
+        return
+    print(f"[free] rmtree {rocks_local}", flush=True)
+    t0 = time.time()
+    shutil.rmtree(rocks_local)
+    print(f"[free] done in {time.time() - t0:.1f}s", flush=True)
+
+
 def _obtain_rocks_at_tmp(common_tmp: list[str]) -> None:
     """Ensure /tmp/var/rocks holds a complete rocks tree, choosing the
     cheapest path:
@@ -373,16 +411,23 @@ def _obtain_rocks_at_tmp(common_tmp: list[str]) -> None:
         "/vol-rocks": volume_rocks,
         "/vol-out": volume_out,
     },
-    timeout=60 * 60 * 10,  # 10h ceiling
+    timeout=60 * 60 * 12,  # 10h ceiling
     cpu=4.0,
-    memory=12 * 1024,
+    memory=8 * 1024,
+    # Sized for the hydrate-resume path: raw on /tmp (~410 GB) +
+    # snapshot.duckdb (~150 GB) + FUSE buffers + overhead fits in 1 TiB.
+    # A *cold* full build (rocks ~650 GB + raw ~400 GB on /tmp) will not
+    # fit here — bump back to 2 TiB before running mirror+stage from
+    # scratch. Modal also clamps the worker memory class to the disk
+    # tier, so 2 TiB lands on a ~100 GiB-RAM worker (expensive); 1 TiB
+    # lands on a smaller class.
     ephemeral_disk=1024 * 1024,  # 1 TiB
 )
 def build(
     backup_id: int | None = None,
     snapshot_date: str | None = None,
     mirror_concurrency: int = 64,
-    memory_limit: str = "8GiB",
+    memory_limit: str = "auto",
     config: str | None = None,
 ) -> None:
     """Run mirror + stage + hydrate end-to-end on local ephemeral disk.
@@ -403,18 +448,35 @@ def build(
         work_dir=TMP_WORK_DIR,
     )
 
-    print("=== phase 1/3: mirror ===", flush=True)
-    _obtain_rocks_at_tmp(common_tmp)
-    print("=== mirror committed ===", flush=True)
+    raw_on_vol = f"{OUT_VOL_DIR}/raw/{date}"
+    if _raw_outputs_complete(raw_on_vol):
+        # Resume path: a previous run already produced raw on /vol-out
+        # (typical after a hydrate-time cancellation). Skip mirror+stage
+        # — including the 600+ GB rocks copy — and hydrate against the
+        # persisted parquet directly.
+        print(
+            f"=== skip mirror+stage: {raw_on_vol} already complete ===",
+            flush=True,
+        )
+        print("=== copy raw: output volume -> /tmp ===", flush=True)
+        _copy_concurrent(
+            raw_on_vol,
+            f"{TMP_WORK_DIR}/raw/{date}",
+            "raw-in",
+            skip_if_dst_populated=True,
+        )
+    else:
+        print("=== phase 1/3: mirror ===", flush=True)
+        _obtain_rocks_at_tmp(common_tmp)
+        print("=== mirror committed ===", flush=True)
 
-    print("=== phase 2/3: stage (on /tmp) ===", flush=True)
-    _run_subcommand("stage", common_tmp)
-    print("=== persist raw: /tmp -> output volume ===", flush=True)
-    _copy_concurrent(
-        f"{TMP_WORK_DIR}/raw/{date}", f"{OUT_VOL_DIR}/raw/{date}", "raw-out"
-    )
-    volume_out.commit()
-    print("=== stage committed ===", flush=True)
+        print("=== phase 2/3: stage (on /tmp) ===", flush=True)
+        _run_subcommand("stage", common_tmp)
+        _drop_local_rocks()
+        print("=== persist raw: /tmp -> output volume ===", flush=True)
+        _copy_concurrent(f"{TMP_WORK_DIR}/raw/{date}", raw_on_vol, "raw-out")
+        volume_out.commit()
+        print("=== stage committed ===", flush=True)
 
     print("=== phase 3/3: hydrate (on /tmp) ===", flush=True)
     _run_subcommand("hydrate", common_tmp)
@@ -436,15 +498,17 @@ def build(
     },
     timeout=60 * 60 * 10,
     cpu=4.0,
-    memory=12 * 1024,
-    ephemeral_disk=1024 * 1024,
+    memory=8 * 1024,
+    # See sizing note on `build`. Single-phase stage runs the same /tmp
+    # peak (rocks + raw) as build, so use the same ceiling.
+    ephemeral_disk=2 * 1024 * 1024,  # 2 TiB
 )
 def single_phase(
     name: str,
     backup_id: int | None = None,
     snapshot_date: str | None = None,
     mirror_concurrency: int = 64,
-    memory_limit: str = "8GiB",
+    memory_limit: str = "auto",
     config: str | None = None,
 ) -> None:
     """Run a single phase: mirror, stage, or hydrate.
@@ -489,6 +553,7 @@ def single_phase(
             skip_if_dst_populated=True,
         )
         _run_subcommand("stage", common_scratch)
+        _drop_local_rocks()
         print("=== persist raw: /tmp -> output volume ===", flush=True)
         _copy_concurrent(
             f"{TMP_WORK_DIR}/raw/{date}",
@@ -521,7 +586,7 @@ def single_phase(
     volumes={"/vol-rocks": volume_rocks},
     timeout=60 * 10,  # 10 min — open + property reads should take seconds
     cpu=1.0,
-    memory=2 * 1024,
+    memory=8 * 1024,
 )
 def inspect(
     config: str | None = None,
@@ -549,7 +614,7 @@ def inspect(
     secrets=[modal.Secret.from_name("atproto-snapshot")],
     timeout=60 * 60 * 4,
     cpu=2.0,
-    memory=4 * 1024,
+    memory=8 * 1024,
 )
 def upload(
     snapshot_date: str | None = None,
@@ -580,7 +645,7 @@ def main(
     backup_id: int | None = None,
     snapshot_date: str | None = None,
     mirror_concurrency: int = 64,
-    memory_limit: str = "8GiB",
+    memory_limit: str = "auto",
     config: str | None = None,
     background: bool = False,
 ) -> None:

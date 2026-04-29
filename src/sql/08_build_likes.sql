@@ -18,4 +18,5 @@ JOIN targets t
   ON t.target_id = lt.target_id
 LEFT JOIN posts p
   ON p.uri = t.target
-WHERE r.collection = 'app.bsky.feed.like';
+WHERE r.collection = 'app.bsky.feed.like'
+  {REC_WINDOW};

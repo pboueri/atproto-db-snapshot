@@ -1,0 +1,21 @@
+source_url = "https://constellation.t3.storage.dev"
+work_dir   = "/vol/var"
+# "auto" -> 80% of whatever RAM the platform actually grants the
+# container at runtime. Modal overprovisions RAM when ephemeral_disk is
+# large, so we want to consume the headroom rather than cap at 8 GiB.
+memory_limit = "auto"
+batch_size = 100000
+mirror_concurrency = 64
+# Time window (in days, relative to snapshot_date) applied to likes,
+# reposts, and posts. Follows/blocks remain full. Remove the line to
+# disable windowing. 90 trims the DuckDB build's working set enough that
+# /tmp fits on a 1 TiB ephemeral disk.
+hydrate_window_days = 90
+
+[upload]
+kind       = "r2"
+bucket     = "bluesky-post-data"
+account_id = "ab31f700baccad8ae8dae6c8a71459d0"
+prefix     = "atproto-snapshot"
+concurrency = 8
+include    = ["snapshot"]

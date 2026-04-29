@@ -24,6 +24,13 @@ pub struct Config {
     pub rocks_block_cache: String,
     #[serde(default = "default_stage_threads")]
     pub stage_threads: usize,
+    /// When set, restrict high-volume collections (likes, reposts, posts
+    /// and post_media derived from them) to records whose created_at is
+    /// within `hydrate_window_days` of the snapshot date. Follows and
+    /// blocks are always materialized in full so the social graph stays
+    /// complete. None = no windowing.
+    #[serde(default)]
+    pub hydrate_window_days: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -131,11 +138,37 @@ impl Config {
             upload: None,
             rocks_block_cache: default_rocks_block_cache(),
             stage_threads: default_stage_threads(),
+            hydrate_window_days: None,
         }
     }
 
     pub fn rocks_block_cache_bytes(&self) -> Result<usize> {
         parse_size(&self.rocks_block_cache)
+    }
+
+    /// Resolve `memory_limit` to a concrete size string DuckDB will
+    /// accept. The literal "auto" (case-insensitive) is replaced with
+    /// 80% of the total RAM the OS reports for this process; on Linux
+    /// containers sysinfo respects cgroup limits, so this picks up
+    /// whatever the platform actually grants — handy on Modal where
+    /// requesting a large ephemeral_disk overprovisions RAM well past
+    /// the declared `memory=` value. Any other value is passed through
+    /// unchanged so `8GiB` etc. still work.
+    pub fn resolved_memory_limit(&self) -> Result<String> {
+        if !self.memory_limit.eq_ignore_ascii_case("auto") {
+            return Ok(self.memory_limit.clone());
+        }
+        let mut sys = sysinfo::System::new();
+        sys.refresh_memory();
+        let total_bytes = sys.total_memory();
+        if total_bytes == 0 {
+            return Err(anyhow!(
+                "memory_limit=auto but sysinfo reported 0 total memory"
+            ));
+        }
+        let target = (total_bytes as f64 * 0.8) as u64;
+        let mib = (target / (1024 * 1024)).max(1);
+        Ok(format!("{mib}MiB"))
     }
 
     pub fn rocks_dir(&self) -> PathBuf {

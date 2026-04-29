@@ -44,4 +44,5 @@ LEFT JOIN target_at qrwm
   AND qrwm.collection = r.collection
   AND qrwm.rkey       = r.rkey
   AND qrwm.rpath      = '.embed.recordWithMedia.record.record.uri'
-WHERE r.collection = 'app.bsky.feed.post';
+WHERE r.collection = 'app.bsky.feed.post'
+  {REC_WINDOW};
