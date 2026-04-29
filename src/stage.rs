@@ -76,12 +76,34 @@ fn scan_read_opts() -> ReadOptions {
     opts
 }
 
+/// Read rocksdb's `estimate-num-keys` for a CF. Approximate but sub-
+/// millisecond — used as the denominator for pass progress %.
+fn estimate_keys(db: &DB, cf_name: &str) -> u64 {
+    let Some(cf) = db.cf_handle(cf_name) else {
+        return 0;
+    };
+    db.property_int_value_cf(&cf, "rocksdb.estimate-num-keys")
+        .ok()
+        .flatten()
+        .unwrap_or(0)
+}
+
+fn pct_str(scanned: u64, total: u64) -> String {
+    if total == 0 {
+        "?".to_string()
+    } else {
+        format!("{:.1}", 100.0 * scanned as f64 / total as f64)
+    }
+}
+
 fn pass_a_actors(db: &DB, raw_dir: &std::path::Path, batch_size: usize) -> Result<u64> {
     let cf = db
         .cf_handle(rs::CF_DID_IDS)
         .context("missing did_ids cf")?;
     let mut writer = ActorWriter::create(raw_dir.join("actors.parquet"), batch_size)?;
 
+    let estimate_total = estimate_keys(db, rs::CF_DID_IDS);
+    tracing::info!(estimate_total, "pass A starting");
     let iter = db.iterator_cf_opt(cf, scan_read_opts(), IteratorMode::Start);
 
     let mut scanned = 0u64;
@@ -118,7 +140,14 @@ fn pass_a_actors(db: &DB, raw_dir: &std::path::Path, batch_size: usize) -> Resul
         writer.push(val.0 .0, &did.0, val.1)?;
         emitted += 1;
         if emitted % 1_000_000 == 0 {
-            tracing::info!(scanned, emitted, bad_did_keys, bad_did_values, "pass A progress");
+            tracing::info!(
+                scanned,
+                emitted,
+                bad_did_keys,
+                bad_did_values,
+                pct = pct_str(scanned, estimate_total),
+                "pass A progress"
+            );
         }
     }
     let (path, total) = writer.finish()?;
@@ -159,13 +188,17 @@ fn pass_b_link_targets(
         batch_size,
     )?;
 
+    let estimate_total = estimate_keys(db, rs::CF_LINK_TARGETS);
+    tracing::info!(estimate_total, "pass B starting");
     let iter = db.iterator_cf_opt(cf, scan_read_opts(), IteratorMode::Start);
 
     let mut counts = PassBCounts::default();
+    let mut scanned = 0u64;
     let mut bad_link_keys = 0u64;
     let mut bad_link_values = 0u64;
     for item in iter {
         let (k, v) = item.context("iterate link_targets")?;
+        scanned += 1;
         let key: RecordLinkKey = match rs::decode(&k) {
             Ok(k) => k,
             Err(e) => {
@@ -205,10 +238,12 @@ fn pass_b_link_targets(
 
         if counts.records % 1_000_000 == 0 {
             tracing::info!(
+                scanned,
                 records = counts.records,
                 targets = counts.targets,
                 bad_link_keys,
                 bad_link_values,
+                pct = pct_str(scanned, estimate_total),
                 "pass B progress"
             );
         }
@@ -246,12 +281,16 @@ fn pass_c_targets(
         .context("missing target_ids cf")?;
     let mut targets = TargetWriter::create(raw_dir.join("targets.parquet"), batch_size)?;
 
+    let estimate_total = estimate_keys(db, rs::CF_TARGET_IDS);
+    tracing::info!(estimate_total, "pass C starting");
     let iter = db.iterator_cf_opt(cf, scan_read_opts(), IteratorMode::Start);
 
+    let mut scanned = 0u64;
     let mut emitted = 0u64;
     let mut bad_target_values = 0u64;
     for item in iter {
         let (k, v) = item.context("iterate target_ids")?;
+        scanned += 1;
         if k.len() != 8 {
             // forward-mapping entry: skip; we only want reverse rows
             continue;
@@ -274,7 +313,13 @@ fn pass_c_targets(
         emitted += 1;
 
         if emitted % 1_000_000 == 0 {
-            tracing::info!(emitted, bad_target_values, "pass C progress");
+            tracing::info!(
+                scanned,
+                emitted,
+                bad_target_values,
+                pct = pct_str(scanned, estimate_total),
+                "pass C progress"
+            );
         }
     }
     let (path, total) = targets.finish()?;
