@@ -8,6 +8,11 @@ pub fn open_readonly(path: &Path, block_cache_bytes: usize) -> Result<DB> {
     let mut db_opts = Options::default();
     db_opts.create_if_missing(false);
     db_opts.create_missing_column_families(false);
+    // -1 = keep all SST file handles open. Default in rocksdb-rust today,
+    // but pinning it documents intent and guards against an upstream
+    // change re-introducing an LRU FD cache that would thrash on a
+    // multi-thousand-SST DB during scan.
+    db_opts.set_max_open_files(-1);
 
     let cache_bytes = block_cache_bytes.max(8 * 1024 * 1024);
     let cache = Cache::new_lru_cache(cache_bytes);

@@ -36,7 +36,7 @@ modal token new
 For uploads, also create a Modal Secret with R2 credentials:
 
 ```sh
-modal secret create r2-credentials \
+modal secret create atproto-snapshot \
   R2_ACCESS_KEY_ID=... \
   R2_SECRET_ACCESS_KEY=...
 ```

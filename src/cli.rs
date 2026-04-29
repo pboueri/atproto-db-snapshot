@@ -24,6 +24,10 @@ pub enum Cmd {
     Hydrate(CommonArgs),
     /// Upload raw + snapshot artifacts to the configured object store.
     Upload(CommonArgs),
+    /// Cheap read-only metadata snapshot of the rocks mirror — per-CF
+    /// estimate-num-keys / SST sizes, no scanning. Use to size pass B
+    /// before kicking off stage.
+    Inspect(CommonArgs),
 }
 
 /// Flags shared by every subcommand. Each subcommand uses the subset
@@ -64,6 +68,7 @@ pub async fn run() -> Result<()> {
         Cmd::Stage(args) => run_stage(args).await,
         Cmd::Hydrate(args) => run_hydrate(args).await,
         Cmd::Upload(args) => run_upload(args).await,
+        Cmd::Inspect(args) => run_inspect(args).await,
     }
 }
 
@@ -166,6 +171,21 @@ async fn run_hydrate(args: CommonArgs) -> Result<()> {
 async fn run_upload(args: CommonArgs) -> Result<()> {
     let p = prepare(&args)?;
     do_upload(&p).await?;
+    Ok(())
+}
+
+async fn run_inspect(args: CommonArgs) -> Result<()> {
+    let p = prepare(&args)?;
+    let rocks_dir = p.cfg.rocks_dir();
+    let cache_bytes = p.cfg.rocks_block_cache_bytes()?;
+    let outcome = crate::inspect::run(&rocks_dir, cache_bytes)?;
+    let total_keys: u64 = outcome.per_cf.iter().map(|s| s.estimate_num_keys).sum();
+    let total_sst: u64 = outcome.per_cf.iter().map(|s| s.live_sst_files_size).sum();
+    tracing::info!(
+        total_estimate_num_keys = total_keys,
+        total_live_sst_size_gb = format!("{:.2}", total_sst as f64 / 1e9),
+        "inspect complete"
+    );
     Ok(())
 }
 
