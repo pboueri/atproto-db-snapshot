@@ -375,33 +375,24 @@ def _drop_local_rocks() -> None:
     print(f"[free] done in {time.time() - t0:.1f}s", flush=True)
 
 
-def _obtain_rocks_at_tmp(common_tmp: list[str]) -> None:
-    """Ensure /tmp/var/rocks holds a complete rocks tree, choosing the
-    cheapest path:
+def _ensure_rocks_on_volume(common_tmp: list[str]) -> None:
+    """Ensure /vol-rocks/var/rocks holds a complete rocks tree.
 
-      1. Already present at /tmp/var/rocks (e.g. mirror just ran in
-         this container) — nothing to do.
-      2. Already persisted on the rocks volume — copy
-         /vol-rocks → /tmp via the parallel copier. No constellation
-         download. No volume write.
-      3. Neither — run the binary's mirror subcommand to download from
-         constellation into /tmp, then persist /tmp → rocks volume.
+    Mirror runs in its own container; the next phase (stage) is the one
+    that actually reads rocks at /tmp. So mirror only needs to leave
+    rocks on the volume — copying it to /tmp here would be 650 GB of
+    pure waste, since the ephemeral disk vanishes when this container
+    exits.
+
+      1. Already persisted on the rocks volume — done. No copy.
+      2. Otherwise — run the binary's mirror subcommand to download
+         from constellation into /tmp, then persist /tmp → rocks
+         volume.
     """
-    if _rocks_looks_complete(f"{TMP_WORK_DIR}/rocks"):
-        print(
-            f"[mirror] {TMP_WORK_DIR}/rocks already complete; reusing in place",
-            flush=True,
-        )
-        return
     if _rocks_looks_complete(f"{ROCKS_VOL_DIR}/rocks"):
         print(
-            "[mirror] using existing rocks from volume (skipping download)",
+            "[mirror] rocks already on volume; nothing to do",
             flush=True,
-        )
-        _copy_concurrent(
-            f"{ROCKS_VOL_DIR}/rocks",
-            f"{TMP_WORK_DIR}/rocks",
-            "rocks-vol-to-tmp",
         )
         return
     print(
@@ -473,7 +464,7 @@ def mirror_phase(
         config=config,
         work_dir=TMP_WORK_DIR,
     )
-    _obtain_rocks_at_tmp(common)
+    _ensure_rocks_on_volume(common)
 
 
 @app.function(
