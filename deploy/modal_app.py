@@ -610,7 +610,12 @@ def hydrate_phase(
     timeout=60 * 60 * 24,
     cpu=0.5,
     memory=1 * 1024,
-    ephemeral_disk=8 * 1024,  # 8 GiB — orchestrator does no I/O
+    # Modal enforces a 512 GiB minimum on ephemeral_disk; we don't
+    # actually use it (the orchestrator does no local I/O) but we
+    # have to allocate at least that. The disk is per-container and
+    # ephemeral, so it's free if unused — billing is on what's
+    # actually written.
+    ephemeral_disk=512 * 1024,  # 512 GiB (Modal minimum)
     retries=0,
 )
 def build(
