@@ -422,6 +422,12 @@ def _obtain_rocks_at_tmp(common_tmp: list[str]) -> None:
     # tier, so 2 TiB lands on a ~100 GiB-RAM worker (expensive); 1 TiB
     # lands on a smaller class.
     ephemeral_disk=1024 * 1024,  # 1 TiB
+    # No auto-retry. A SIGSEGV / OOM here means the whole pipeline (raw
+    # copy + follows + blocks + ...) replays from scratch — easily an
+    # hour of wall time per attempt at full data sizes. Make crashes
+    # surface immediately so the SQL/config can be fixed before the
+    # next run.
+    retries=0,
 )
 def build(
     backup_id: int | None = None,

@@ -1,8 +1,12 @@
 source_url = "https://constellation.t3.storage.dev"
 work_dir   = "/vol/var"
-# "auto" -> 80% of whatever RAM the platform actually grants the
-# container at runtime. Modal overprovisions RAM when ephemeral_disk is
-# large, so we want to consume the headroom rather than cap at 8 GiB.
+# "auto" -> min(80% of cgroup-or-sysinfo, 128 GiB hard cap in
+# config.rs). Modal over-reports container RAM (sysinfo sees host, not
+# cgroup), so we also probe /sys/fs/cgroup directly and take the
+# smaller. The 128 GiB ceiling keeps DuckDB from monopolizing the
+# worker on the heavy joins; pick a value with headroom for
+# buffer-pool buildup across stages (a tight cap will SIGSEGV later
+# chunks that need a fresh hash table).
 memory_limit = "auto"
 batch_size = 100000
 mirror_concurrency = 64
@@ -11,6 +15,18 @@ mirror_concurrency = 64
 # disable windowing. 90 trims the DuckDB build's working set enough that
 # /tmp fits on a 1 TiB ephemeral disk.
 hydrate_window_days = 90
+# Run chunked stages (follows / blocks / posts_from_records /
+# post_media / likes / reposts / actor_aggs / post_aggs) as N
+# modulo-bucketed passes on the partition key (did_id or uri_id). Each
+# pass joins ~1/N of the heavy tables; parquet inputs get re-scanned N
+# times. Tune for the dataset: 8 for normal full runs.
+#
+# Dry-run mode: set hydrate_chunk_dry_run = true and bump
+# hydrate_chunk_buckets to 100 to validate end-to-end on a 1% slice
+# (~1/100 the cost). Output snapshot is partial — flip both back for a
+# real run.
+hydrate_chunk_buckets = 100
+hydrate_chunk_dry_run  = true
 
 [upload]
 kind       = "r2"

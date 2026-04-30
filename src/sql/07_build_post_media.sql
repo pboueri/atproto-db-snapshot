@@ -1,10 +1,12 @@
--- post_media: one row per media-rpath target on a feed.post record. `ord`
--- is dense within each post (0..N-1) following the order the targets
--- appeared in the original RecordLinkTargets vec. Joins to posts via
--- (author_did_id, rkey) — every post_media row comes from a record, and
--- record-derived posts retain their (author_did_id, rkey) verbatim.
+-- post_media: one row per media-rpath target on a feed.post record.
+-- `ord` is dense within each post (0..N-1) following the order the
+-- targets appeared in the original RecordLinkTargets vec. Joins to
+-- posts via (author_did_id, rkey).
+--
+-- SELECT body — chunked on did_id (the post author). The chunk
+-- predicate is applied to media_targets and to the posts join, so each
+-- pass hashes only 1/N of posts.
 
-CREATE TABLE post_media AS
 WITH media_targets AS (
   SELECT
     lt.did_id,
@@ -22,6 +24,7 @@ WITH media_targets AS (
   FROM link_record_targets lt
   JOIN targets t ON t.target_id = lt.target_id
   WHERE lt.collection = 'app.bsky.feed.post'
+    AND lt.did_id % {CHUNK_N} = {CHUNK_K}
     AND (
          lt.rpath LIKE '.embed.images%'
       OR lt.rpath = '.embed.video.video'
@@ -41,4 +44,5 @@ SELECT
 FROM media_targets m
 JOIN posts p
   ON  p.author_did_id = m.did_id
-  AND p.rkey          = m.rkey;
+  AND p.rkey          = m.rkey
+WHERE p.author_did_id % {CHUNK_N} = {CHUNK_K}

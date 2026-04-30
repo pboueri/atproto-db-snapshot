@@ -1,19 +1,26 @@
--- blocks: same shape as follows.
+-- blocks: same shape as follows. SELECT-body convention identical to
+-- 03_build_follows.sql — hydrate.rs wraps it in CREATE TABLE / chunked
+-- INSERT. {CHUNK_PRED} expands to `AND r.did_id % N = k` or empty.
 
-CREATE TABLE blocks AS
+WITH lt_block AS (
+  SELECT did_id, rkey, target_id
+  FROM link_record_targets
+  WHERE collection = 'app.bsky.graph.block'
+    AND rpath      = '.subject'
+    {CHUNK_PRED_LT}
+)
 SELECT
   r.did_id           AS src_did_id,
   a.did_id           AS dst_did_id,
   r.rkey,
   r.created_at
 FROM link_records r
-JOIN link_record_targets lt
-  ON  lt.did_id     = r.did_id
-  AND lt.collection = r.collection
-  AND lt.rkey       = r.rkey
-  AND lt.rpath      = '.subject'
+JOIN lt_block lt
+  ON  lt.did_id = r.did_id
+  AND lt.rkey   = r.rkey
 JOIN targets t
   ON t.target_id = lt.target_id
 JOIN actors a
   ON a.did = t.target
-WHERE r.collection = 'app.bsky.graph.block';
+WHERE r.collection = 'app.bsky.graph.block'
+  {CHUNK_PRED}

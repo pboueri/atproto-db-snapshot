@@ -6,9 +6,14 @@
 --
 -- Each unique uri gets a sequential uri_id. posts is the source of truth
 -- for uri ↔ uri_id; every other table references posts via uri_id and
--- never stores a post URI string. Reply / quote self-references are
--- resolved via a self-join on uri (NULL when the referenced post is not
--- present, which should be rare since constellation indexes back-links).
+-- never stores a post URI string.
+--
+-- Self-references (reply_root / reply_parent / quote) are resolved
+-- against `ranked` itself. The naive shape — three independent LEFT
+-- JOINs on `ranked` — builds three full-post hash tables. Instead we
+-- stack the three reference columns into `ref_pairs`, do a single LEFT
+-- JOIN against `ranked` to translate uri → uri_id, and pivot the result
+-- back into three columns. One hash table on `ranked` instead of three.
 
 CREATE TABLE posts AS
 WITH target_post_uris AS (
@@ -49,6 +54,27 @@ ranked AS (
     *,
     CAST(ROW_NUMBER() OVER (ORDER BY uri) AS BIGINT) AS uri_id
   FROM unioned
+),
+ref_pairs AS (
+  SELECT uri_id, 'root'   AS k, reply_root_uri   AS u FROM ranked WHERE reply_root_uri   IS NOT NULL
+  UNION ALL
+  SELECT uri_id, 'parent' AS k, reply_parent_uri AS u FROM ranked WHERE reply_parent_uri IS NOT NULL
+  UNION ALL
+  SELECT uri_id, 'quote'  AS k, quote_uri        AS u FROM ranked WHERE quote_uri        IS NOT NULL
+),
+resolved AS (
+  SELECT rp.uri_id, rp.k, l.uri_id AS ref_id
+  FROM ref_pairs rp
+  LEFT JOIN ranked l ON l.uri = rp.u
+),
+pivoted AS (
+  SELECT
+    uri_id,
+    MAX(CASE WHEN k = 'root'   THEN ref_id END) AS reply_root_uri_id,
+    MAX(CASE WHEN k = 'parent' THEN ref_id END) AS reply_parent_uri_id,
+    MAX(CASE WHEN k = 'quote'  THEN ref_id END) AS quote_uri_id
+  FROM resolved
+  GROUP BY 1
 )
 SELECT
   r.uri_id,
@@ -56,11 +82,9 @@ SELECT
   r.author_did_id,
   r.rkey,
   r.created_at,
-  rr.uri_id AS reply_root_uri_id,
-  rp.uri_id AS reply_parent_uri_id,
-  q.uri_id  AS quote_uri_id,
+  p.reply_root_uri_id,
+  p.reply_parent_uri_id,
+  p.quote_uri_id,
   r.source
 FROM ranked r
-LEFT JOIN ranked rr ON rr.uri = r.reply_root_uri
-LEFT JOIN ranked rp ON rp.uri = r.reply_parent_uri
-LEFT JOIN ranked q  ON q.uri  = r.quote_uri;
+LEFT JOIN pivoted p USING (uri_id);

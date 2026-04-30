@@ -2,6 +2,7 @@ use anyhow::{anyhow, Context, Result};
 use chrono::{NaiveDate, Utc};
 use duckdb::{params, Connection};
 use std::path::PathBuf;
+use std::time::Instant;
 
 use crate::config::Config;
 
@@ -49,27 +50,113 @@ pub async fn run(cfg: &Config, snapshot_date: &str) -> Result<HydrateOutcome> {
         &conn,
         &format!("SET temp_directory='{}/duckdb_tmp'", raw_str),
     )?;
+    // Tell DuckDB an explicit spill budget. Default is 90% of *remaining*
+    // disk on the temp_directory drive, which on Modal lands well past
+    // what /tmp can actually give once raw parquet (~410 GB) and the
+    // growing snapshot.duckdb (~150 GB) are accounted for. 400 GiB
+    // leaves headroom for both.
+    pragma(&conn, "SET max_temp_directory_size='400GiB'")?;
 
     let window = resolve_window(cfg, snapshot_date)?;
     if let Some(days) = cfg.hydrate_window_days {
-        tracing::info!(window_days = days, "applying hydrate window filter");
+        tracing::info!(
+            window_days = days,
+            cutoff = window
+                .cutoff
+                .map(|d| d.format("%Y-%m-%d").to_string())
+                .as_deref(),
+            "applying hydrate window filter"
+        );
+    } else {
+        tracing::info!("no hydrate window filter (full materialization)");
+    }
+    let chunk_buckets = cfg.hydrate_chunk_buckets.unwrap_or(1).max(1);
+    let dry_run = cfg.hydrate_chunk_dry_run.unwrap_or(false);
+    if chunk_buckets > 1 {
+        tracing::info!(
+            chunk_buckets,
+            dry_run,
+            "chunking enabled for chunked stages"
+        );
+    } else {
+        tracing::info!("chunking disabled (single-shot)");
     }
 
+    let stages_t0 = Instant::now();
     for (label, template) in SQL_STAGES {
-        let sql = template
+        let body = template
             .replace("{RAW}", &raw_str)
             .replace("{REC_WINDOW}", &window.rec_clause)
             .replace("{TID_WINDOW}", &window.tid_clause);
-        tracing::info!(label, "running hydrate sql");
-        conn.execute_batch(&sql)
-            .with_context(|| format!("hydrate sql: {label}"))?;
+        let stage_t0 = Instant::now();
+        tracing::info!(label, "stage start");
+        match *label {
+            "build_follows" => {
+                run_chunked_table(&conn, label, "follows", &body, chunk_buckets, dry_run)?
+            }
+            "build_blocks" => {
+                run_chunked_table(&conn, label, "blocks", &body, chunk_buckets, dry_run)?
+            }
+            "build_posts_from_records" => run_chunked_table(
+                &conn,
+                label,
+                "posts_from_records",
+                &body,
+                chunk_buckets,
+                dry_run,
+            )?,
+            "build_post_media" => {
+                run_chunked_table(&conn, label, "post_media", &body, chunk_buckets, dry_run)?
+            }
+            "build_likes" => {
+                run_chunked_table(&conn, label, "likes", &body, chunk_buckets, dry_run)?
+            }
+            "build_reposts" => {
+                run_chunked_table(&conn, label, "reposts", &body, chunk_buckets, dry_run)?
+            }
+            "build_actor_aggs" => {
+                run_chunked_table(&conn, label, "actor_aggs", &body, chunk_buckets, dry_run)?
+            }
+            "build_post_aggs" => {
+                run_chunked_table(&conn, label, "post_aggs", &body, chunk_buckets, dry_run)?
+            }
+            _ => {
+                // Non-chunked path: strip {CHUNK_*} placeholders so SQL
+                // files that mention them still parse. K=0, N=1 →
+                // `col % 1 = 0` is always true and DuckDB folds it away.
+                let stripped = body
+                    .replace("{CHUNK_PRED}", "")
+                    .replace("{CHUNK_PRED_LT}", "")
+                    .replace("{CHUNK_N}", "1")
+                    .replace("{CHUNK_K}", "0");
+                conn.execute_batch(&stripped)
+                    .with_context(|| format!("hydrate sql: {label}"))?
+            }
+        }
+        tracing::info!(
+            label,
+            elapsed_secs = stage_t0.elapsed().as_secs_f64(),
+            "stage done"
+        );
     }
+    tracing::info!(
+        elapsed_secs = stages_t0.elapsed().as_secs_f64(),
+        "all sql stages complete"
+    );
 
     write_snapshot_metadata(&conn, cfg, snapshot_date, &memory_limit, &window)
         .context("write snapshot_metadata")?;
 
     let counts = collect_counts(&conn)?;
     let (orphan_like, orphan_repost) = collect_orphan_rates(&conn)?;
+    for (table, n) in &counts {
+        tracing::info!(table, rows = *n, "row count");
+    }
+    tracing::info!(
+        orphan_like_rate = orphan_like,
+        orphan_repost_rate = orphan_repost,
+        "orphan rates"
+    );
     drop(conn);
 
     Ok(HydrateOutcome {
@@ -83,6 +170,85 @@ pub async fn run(cfg: &Config, snapshot_date: &str) -> Result<HydrateOutcome> {
 fn pragma(conn: &Connection, sql: &str) -> Result<()> {
     conn.execute_batch(sql)
         .with_context(|| format!("pragma: {sql}"))
+}
+
+/// Materialize a SELECT-body into `table` either in one shot
+/// (`n_chunks <= 1`) or as N independent passes partitioned on
+/// `r.did_id % N`. The first pass uses `CREATE TABLE … AS` to lock in
+/// the schema; subsequent passes `INSERT INTO …`. Each pass executes
+/// independently, so DuckDB can free the chunk's hash tables between
+/// iterations and the spill ceiling is the largest single chunk rather
+/// than the whole join.
+fn run_chunked_table(
+    conn: &Connection,
+    label: &str,
+    table: &str,
+    body: &str,
+    n_chunks: u32,
+    dry_run: bool,
+) -> Result<()> {
+    let n = n_chunks.max(1);
+    // Dry-run executes only the first chunk so the resulting snapshot
+    // is a 1/N sample of the full output — used to validate SQL shape
+    // end-to-end on Modal before committing to a full run. The CREATE
+    // TABLE still happens (k=0 path), so downstream stages see a
+    // populated, just-smaller table.
+    let last = if dry_run { 1.min(n) } else { n };
+    if dry_run && n > 1 {
+        tracing::warn!(
+            label,
+            chunks_total = n,
+            chunks_to_run = last,
+            "dry_run: only first chunk will execute"
+        );
+    }
+    let mut prev_total: i64 = 0;
+    for k in 0..last {
+        let (pred, pred_lt) = if n == 1 {
+            (String::new(), String::new())
+        } else {
+            (
+                format!("AND r.did_id % {n} = {k}"),
+                format!("AND did_id % {n} = {k}"),
+            )
+        };
+        // {CHUNK_K} / {CHUNK_N} let SQL files write modulo predicates
+        // on whatever column they want to partition on (uri_id,
+        // author_did_id, etc.). When n=1 the expression evaluates to
+        // `<col> % 1 = 0` (always true) and DuckDB folds it away.
+        let select = body
+            .replace("{CHUNK_PRED}", &pred)
+            .replace("{CHUNK_PRED_LT}", &pred_lt)
+            .replace("{CHUNK_N}", &n.to_string())
+            .replace("{CHUNK_K}", &k.to_string());
+        let stmt = if k == 0 {
+            format!("CREATE TABLE {table} AS {select}")
+        } else {
+            format!("INSERT INTO {table} {select}")
+        };
+        if n > 1 {
+            tracing::info!(label, chunk = k + 1, chunks = n, "chunk start");
+        }
+        let chunk_t0 = Instant::now();
+        conn.execute_batch(&stmt)
+            .with_context(|| format!("hydrate sql: {label} chunk {}/{n}", k + 1))?;
+        if n > 1 {
+            let total: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .with_context(|| format!("count {table} after chunk {}/{n}", k + 1))?;
+            tracing::info!(
+                label,
+                chunk = k + 1,
+                chunks = n,
+                rows_added = total - prev_total,
+                rows_total = total,
+                elapsed_secs = chunk_t0.elapsed().as_secs_f64(),
+                "chunk done"
+            );
+            prev_total = total;
+        }
+    }
+    Ok(())
 }
 
 struct WindowSpec {
@@ -182,6 +348,17 @@ fn write_snapshot_metadata(
         ],
     )
     .context("insert snapshot_metadata row")?;
+    tracing::info!(
+        snapshot_date,
+        source_url = %cfg.source_url,
+        backup_id = ?cfg.backup_id,
+        built_at = %built_at,
+        window_days = ?cfg.hydrate_window_days,
+        window_cutoff = window_cutoff.as_deref(),
+        at_snapshot_version = env!("CARGO_PKG_VERSION"),
+        duckdb_memory_limit,
+        "snapshot_metadata written"
+    );
     Ok(())
 }
 
