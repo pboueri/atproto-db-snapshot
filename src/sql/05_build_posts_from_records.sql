@@ -32,10 +32,10 @@
 -- the windowed × chunked × 4-rpath subset), and the targets join
 -- then has only one viable build side, the small one.
 WITH windowed_posts AS MATERIALIZED (
-  SELECT did_id, rkey, created_at
-  FROM link_records
-  WHERE collection = 'app.bsky.feed.post'
-    AND did_id % {CHUNK_N} = {CHUNK_K}
+  SELECT r.did_id, r.rkey, r.created_at
+  FROM link_records r
+  WHERE r.collection = 'app.bsky.feed.post'
+    AND r.did_id % {CHUNK_N} = {CHUNK_K}
     {REC_WINDOW}
 ),
 post_lt AS MATERIALIZED (
