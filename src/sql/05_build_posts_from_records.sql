@@ -24,14 +24,21 @@
 -- (did_id, rkey) using conditional aggregation — replacing what used
 -- to be five LEFT JOINs against the same CTE.
 
-WITH windowed_posts AS (
+-- MATERIALIZED on windowed_posts and post_lt is load-bearing: without
+-- it DuckDB inlines the CTE bodies into one plan tree and is free to
+-- pick `targets` (the global URI dictionary, ~10B rows) as the hash
+-- build side of the targets join, which OOMs the runner even on a 1%
+-- dry-run. MATERIALIZED forces post_lt to be computed first (small —
+-- the windowed × chunked × 4-rpath subset), and the targets join
+-- then has only one viable build side, the small one.
+WITH windowed_posts AS MATERIALIZED (
   SELECT did_id, rkey, created_at
   FROM link_records
   WHERE collection = 'app.bsky.feed.post'
     AND did_id % {CHUNK_N} = {CHUNK_K}
     {REC_WINDOW}
 ),
-post_lt AS (
+post_lt AS MATERIALIZED (
   SELECT lt.did_id, lt.rkey, lt.rpath, lt.target_id
   FROM link_record_targets lt
   WHERE lt.collection = 'app.bsky.feed.post'
