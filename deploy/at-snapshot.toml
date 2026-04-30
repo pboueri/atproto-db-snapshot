@@ -10,16 +10,9 @@ work_dir   = "/vol/var"
 memory_limit = "auto"
 batch_size = 100000
 mirror_concurrency = 64
-# Time window (in days, relative to snapshot_date) applied to likes,
-# reposts, and posts. Follows/blocks remain full. Remove the line to
-# disable windowing. 90 trims the DuckDB build's working set enough that
-# /tmp fits on a 1 TiB ephemeral disk.
-hydrate_window_days = 90
-# Run chunked stages (follows / blocks / posts_from_records /
-# post_media / likes / reposts / actor_aggs / post_aggs) as N
-# modulo-bucketed passes on the partition key (did_id or uri_id). Each
-# pass joins ~1/N of the heavy tables; parquet inputs get re-scanned N
-# times. Tune for the dataset: 8 for normal full runs.
+# Run chunked stages (actor_aggs / post_aggs) as N modulo-bucketed
+# passes. Each pass joins ~1/N of the heavy tables; parquet inputs get
+# re-scanned N times. Tune for the dataset: 8 for normal full runs.
 #
 # Dry-run mode: set hydrate_chunk_dry_run = true and bump
 # hydrate_chunk_buckets to 100 to validate end-to-end on a 1% slice

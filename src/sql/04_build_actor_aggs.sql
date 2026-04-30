@@ -1,9 +1,12 @@
--- actor_aggs: per-actor counts. Pulled directly from the resolved
--- relationship tables (follows / blocks / posts / likes / reposts).
+-- actor_aggs: per-actor counts, derived from the entity tables. All
+-- inputs are now small u64-only tables emitted by stage, so no
+-- chunking is strictly required, but the chunk predicate is preserved
+-- so heavy-RAM hosts can opt out (CHUNK_N=1) and tight ones can
+-- partition.
 --
 -- SELECT body — chunked on actors.did_id. Each inner subquery filters
--- its respective key by the same modulo so every per-chunk hash agg
--- only sees 1/N of its source table.
+-- its key by the same modulo so per-chunk hash agg only sees 1/N of
+-- the source.
 
 WITH posts_by_author AS (
   SELECT

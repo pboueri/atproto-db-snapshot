@@ -1,8 +1,8 @@
 pub mod actor;
 pub mod common;
-pub mod link;
-pub mod target;
+pub mod post;
+pub mod scratch;
 
 pub use actor::ActorWriter;
-pub use link::{LinkRecordTargetsWriter, LinkRecordWriter};
-pub use target::TargetWriter;
+pub use post::PostsWriter;
+pub use scratch::{LtKeyedWriter, LtPostRecordsWriter, LtPostRefsWriter, U64PairWriter};

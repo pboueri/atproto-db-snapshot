@@ -47,7 +47,6 @@ async fn end_to_end_synthetic_rocks() -> Result<()> {
         upload: None,
         rocks_block_cache: "64MiB".into(),
         stage_threads: 1,
-        hydrate_window_days: None,
         hydrate_chunk_buckets: Some(4),
         hydrate_chunk_dry_run: None,
     };
@@ -176,21 +175,18 @@ fn assert_counts(counts: &[(String, u64)]) {
     assert_eq!(get("reposts"), 1, "expected 1 repost");
     // post_a, post_b, post_c, post_e from records + post_d from target-only = 5
     assert_eq!(get("posts"), 5, "expected 5 distinct posts");
-    assert_eq!(get("post_media"), 2, "expected 2 media (image + external)");
 }
 
 fn assert_metadata(conn: &Connection, snapshot_date: &str, cfg: &Config) -> Result<()> {
     let n: i64 = conn.query_row("SELECT COUNT(*) FROM snapshot_metadata", [], |r| r.get(0))?;
     assert_eq!(n, 1, "expected exactly one snapshot_metadata row");
-    let (date_str, source_url, window_days): (String, String, Option<i32>) = conn.query_row(
-        "SELECT CAST(snapshot_date AS VARCHAR), source_url, hydrate_window_days
-         FROM snapshot_metadata",
+    let (date_str, source_url): (String, String) = conn.query_row(
+        "SELECT CAST(snapshot_date AS VARCHAR), source_url FROM snapshot_metadata",
         [],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
     assert_eq!(date_str, snapshot_date);
     assert_eq!(source_url, cfg.source_url);
-    assert_eq!(window_days, None, "expected no window for this fixture");
     Ok(())
 }
 

@@ -1,5 +1,6 @@
 pub mod cli;
 pub mod config;
+pub mod hash;
 pub mod hydrate;
 pub mod inspect;
 pub mod metadata;

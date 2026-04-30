@@ -24,17 +24,12 @@ pub struct Config {
     pub rocks_block_cache: String,
     #[serde(default = "default_stage_threads")]
     pub stage_threads: usize,
-    /// When set, restrict high-volume collections (likes, reposts, posts
-    /// and post_media derived from them) to records whose created_at is
-    /// within `hydrate_window_days` of the snapshot date. Follows and
-    /// blocks are always materialized in full so the social graph stays
-    /// complete. None = no windowing.
-    #[serde(default)]
-    pub hydrate_window_days: Option<u32>,
     /// When set to N>1, chunked stages are run as N modulo-bucketed
     /// passes and the rows are concatenated. Hash tables shrink ~N×
     /// per pass at the cost of re-scanning the input parquet N times.
-    /// None or Some(1) disables chunking.
+    /// None or Some(1) disables chunking. Stage v2 only chunks the
+    /// aggregate stages (`actor_aggs` / `post_aggs`); entity tables
+    /// are emitted directly by stage and don't need chunking.
     #[serde(default)]
     pub hydrate_chunk_buckets: Option<u32>,
     /// Dry-run sanity check: when set, chunked stages execute only the
@@ -182,7 +177,6 @@ impl Config {
             upload: None,
             rocks_block_cache: default_rocks_block_cache(),
             stage_threads: default_stage_threads(),
-            hydrate_window_days: None,
             hydrate_chunk_buckets: None,
             hydrate_chunk_dry_run: None,
         }
