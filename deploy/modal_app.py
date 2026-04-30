@@ -63,9 +63,19 @@ TMP_WORK_DIR = "/tmp/var"
 # ---------------------------------------------------------------------------
 
 # Anything matching these globs is excluded when shipping the repo into
-# the image. `target/` is huge build output, `var/` may hold an in-progress
-# rocks mirror, `.cargo/config.toml` has macOS-only paths that would
-# override the image's env block.
+# the image. `target/` is huge build output, `var/` may hold an
+# in-progress rocks mirror, `.cargo/config.toml` has macOS-only paths
+# that would override the image's env block.
+#
+# `deploy/modal_app.py` is excluded deliberately: the script lives in
+# this same directory and is normally part of `.`, so any tweak to a
+# function decorator (cpu / memory / disk / timeout) would invalidate
+# the image hash and trigger a full Rust rebuild. The script never
+# runs inside the image — Modal imports it locally to discover
+# functions, then ships only the function bodies + image to remote
+# workers — so excluding it from the build context is safe. Runtime
+# config (`deploy/at-snapshot.toml`) stays in because the binary reads
+# it via `--config`.
 SOURCE_IGNORE = [
     "target",
     "var",
@@ -76,6 +86,7 @@ SOURCE_IGNORE = [
     "*.pyc",
     "*.parquet",
     ".DS_Store",
+    "deploy/modal_app.py",
 ]
 
 image = (
