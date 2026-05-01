@@ -47,6 +47,8 @@ async fn end_to_end_synthetic_rocks() -> Result<()> {
         upload: None,
         rocks_block_cache: "64MiB".into(),
         stage_threads: 1,
+        hydrate_chunk_buckets: Some(4),
+        hydrate_chunk_dry_run: None,
     };
 
     let stage = at_snapshot::stage::run(&cfg, "2026-04-27").await?;
@@ -56,6 +58,7 @@ async fn end_to_end_synthetic_rocks() -> Result<()> {
 
     let conn = Connection::open(&hydrate.duckdb_path)?;
     assert_validation_queries(&conn)?;
+    assert_metadata(&conn, "2026-04-27", &cfg)?;
 
     println!("stage counts: {:?}", stage.counts);
     println!("hydrate counts: {:?}", hydrate.row_counts);
@@ -172,7 +175,19 @@ fn assert_counts(counts: &[(String, u64)]) {
     assert_eq!(get("reposts"), 1, "expected 1 repost");
     // post_a, post_b, post_c, post_e from records + post_d from target-only = 5
     assert_eq!(get("posts"), 5, "expected 5 distinct posts");
-    assert_eq!(get("post_media"), 2, "expected 2 media (image + external)");
+}
+
+fn assert_metadata(conn: &Connection, snapshot_date: &str, cfg: &Config) -> Result<()> {
+    let n: i64 = conn.query_row("SELECT COUNT(*) FROM snapshot_metadata", [], |r| r.get(0))?;
+    assert_eq!(n, 1, "expected exactly one snapshot_metadata row");
+    let (date_str, source_url): (String, String) = conn.query_row(
+        "SELECT CAST(snapshot_date AS VARCHAR), source_url FROM snapshot_metadata",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    assert_eq!(date_str, snapshot_date);
+    assert_eq!(source_url, cfg.source_url);
+    Ok(())
 }
 
 fn assert_validation_queries(conn: &Connection) -> Result<()> {

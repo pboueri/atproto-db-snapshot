@@ -1,0 +1,30 @@
+source_url = "https://constellation.t3.storage.dev"
+work_dir   = "/vol/var"
+# "auto" -> min(80% of cgroup-or-sysinfo, 128 GiB hard cap in
+# config.rs). Modal over-reports container RAM (sysinfo sees host, not
+# cgroup), so we also probe /sys/fs/cgroup directly and take the
+# smaller. The 128 GiB ceiling keeps DuckDB from monopolizing the
+# worker on the heavy joins; pick a value with headroom for
+# buffer-pool buildup across stages (a tight cap will SIGSEGV later
+# chunks that need a fresh hash table).
+memory_limit = "auto"
+batch_size = 100000
+mirror_concurrency = 64
+# Run chunked stages (actor_aggs / post_aggs) as N modulo-bucketed
+# passes. Each pass joins ~1/N of the heavy tables; parquet inputs get
+# re-scanned N times. Tune for the dataset: 8 for normal full runs.
+#
+# Dry-run mode: set hydrate_chunk_dry_run = true and bump
+# hydrate_chunk_buckets to 100 to validate end-to-end on a 1% slice
+# (~1/100 the cost). Output snapshot is partial — flip both back for a
+# real run.
+hydrate_chunk_buckets = 100
+hydrate_chunk_dry_run  = true
+
+[upload]
+kind       = "r2"
+bucket     = "bluesky-post-data"
+account_id = "ab31f700baccad8ae8dae6c8a71459d0"
+prefix     = "atproto-snapshot"
+concurrency = 8
+include    = ["snapshot"]

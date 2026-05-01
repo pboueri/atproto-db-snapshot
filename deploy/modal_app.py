@@ -63,9 +63,19 @@ TMP_WORK_DIR = "/tmp/var"
 # ---------------------------------------------------------------------------
 
 # Anything matching these globs is excluded when shipping the repo into
-# the image. `target/` is huge build output, `var/` may hold an in-progress
-# rocks mirror, `.cargo/config.toml` has macOS-only paths that would
-# override the image's env block.
+# the image. `target/` is huge build output, `var/` may hold an
+# in-progress rocks mirror, `.cargo/config.toml` has macOS-only paths
+# that would override the image's env block.
+#
+# `deploy/modal_app.py` is excluded deliberately: the script lives in
+# this same directory and is normally part of `.`, so any tweak to a
+# function decorator (cpu / memory / disk / timeout) would invalidate
+# the image hash and trigger a full Rust rebuild. The script never
+# runs inside the image — Modal imports it locally to discover
+# functions, then ships only the function bodies + image to remote
+# workers — so excluding it from the build context is safe. Runtime
+# config (`deploy/at-snapshot.toml`) stays in because the binary reads
+# it via `--config`.
 SOURCE_IGNORE = [
     "target",
     "var",
@@ -76,6 +86,7 @@ SOURCE_IGNORE = [
     "*.pyc",
     "*.parquet",
     ".DS_Store",
+    "deploy/modal_app.py",
 ]
 
 image = (
@@ -269,6 +280,7 @@ def _copy_concurrent(
             with state_lock:
                 state["bytes"] += size
                 state["files"] += 1
+
         return _cb
 
     def err_cb(exc):
@@ -326,33 +338,61 @@ def _copy_concurrent(
     )
 
 
-def _obtain_rocks_at_tmp(common_tmp: list[str]) -> None:
-    """Ensure /tmp/var/rocks holds a complete rocks tree, choosing the
-    cheapest path:
+def _raw_outputs_complete(raw_dir: str) -> bool:
+    """True iff `raw_dir` (typically `/vol-out/var/raw/<date>`) holds
+    the four parquet files a successful stage run produces. Used by
+    `build` to short-circuit mirror+stage when a previous run already
+    persisted raw — common after a hydrate cancellation."""
+    expected = (
+        "actors.parquet",
+        "link_records.parquet",
+        "link_record_targets.parquet",
+        "targets.parquet",
+    )
+    for name in expected:
+        p = os.path.join(raw_dir, name)
+        if not os.path.isfile(p) or os.path.getsize(p) == 0:
+            return False
+    return True
 
-      1. Already present at /tmp/var/rocks (e.g. mirror just ran in
-         this container) — nothing to do.
-      2. Already persisted on the rocks volume — copy
-         /vol-rocks → /tmp via the parallel copier. No constellation
-         download. No volume write.
-      3. Neither — run the binary's mirror subcommand to download from
-         constellation into /tmp, then persist /tmp → rocks volume.
+
+def _drop_local_rocks() -> None:
+    """Remove /tmp/var/rocks once stage is done.
+
+    Stage is the only phase that reads rocks; hydrate consumes raw
+    parquet only. Dropping rocks before the raw-out copy reclaims ~650 GB
+    on the worker's local disk so the outbound copy's Modal-Volume FUSE
+    write buffer (which stages on the same disk) has headroom. Without
+    this, rocks (~650 GB) + raw (~400 GB) + buffered FUSE writes (~400 GB
+    while the copy runs) all compete on /tmp.
     """
-    if _rocks_looks_complete(f"{TMP_WORK_DIR}/rocks"):
-        print(
-            f"[mirror] {TMP_WORK_DIR}/rocks already complete; reusing in place",
-            flush=True,
-        )
+    rocks_local = f"{TMP_WORK_DIR}/rocks"
+    if not os.path.isdir(rocks_local):
         return
+    print(f"[free] rmtree {rocks_local}", flush=True)
+    t0 = time.time()
+    shutil.rmtree(rocks_local)
+    print(f"[free] done in {time.time() - t0:.1f}s", flush=True)
+
+
+def _ensure_rocks_on_volume(common_tmp: list[str]) -> None:
+    """Ensure /vol-rocks/var/rocks holds a complete rocks tree.
+
+    Mirror runs in its own container; the next phase (stage) is the one
+    that actually reads rocks at /tmp. So mirror only needs to leave
+    rocks on the volume — copying it to /tmp here would be 650 GB of
+    pure waste, since the ephemeral disk vanishes when this container
+    exits.
+
+      1. Already persisted on the rocks volume — done. No copy.
+      2. Otherwise — run the binary's mirror subcommand to download
+         from constellation into /tmp, then persist /tmp → rocks
+         volume.
+    """
     if _rocks_looks_complete(f"{ROCKS_VOL_DIR}/rocks"):
         print(
-            "[mirror] using existing rocks from volume (skipping download)",
+            "[mirror] rocks already on volume; nothing to do",
             flush=True,
-        )
-        _copy_concurrent(
-            f"{ROCKS_VOL_DIR}/rocks",
-            f"{TMP_WORK_DIR}/rocks",
-            "rocks-vol-to-tmp",
         )
         return
     print(
@@ -367,65 +407,64 @@ def _obtain_rocks_at_tmp(common_tmp: list[str]) -> None:
     volume_rocks.commit()
 
 
+# =====================================================================
+# Per-phase Modal functions
+#
+# Each phase has its own resource shape because the workloads diverge:
+# - mirror: network-bound, low CPU/RAM, big disk for rocks
+# - stage:  rocks scan + DuckDB sort-merge — needs RAM for the actor
+#           map (~16-20 GB at full scale) and 8 CPU for parallel passes
+# - hydrate: pure DuckDB on entity parquets — RAM-hungry for aggregates,
+#           no rocks needed (so smaller disk than stage)
+#
+# `build()` orchestrates by calling each phase function via `.remote()`,
+# which lands each on its own tailored container. Don't run the whole
+# pipeline on a single container sized for the worst phase; that
+# over-provisions the easy phases and the cheap mirror downloads pay
+# for stage's RAM and hydrate's DuckDB headroom too.
+# =====================================================================
+
+
 @app.function(
     image=image,
     volumes={
         "/vol-rocks": volume_rocks,
-        "/vol-out": volume_out,
     },
-    timeout=60 * 60 * 10,  # 10h ceiling
-    cpu=4.0,
-    memory=12 * 1024,
+    # eat-rocks streams ~80 GB compressed → ~650 GB SSTs over the
+    # network; latency variability dominates wall time. 8h covers a
+    # slow link with margin.
+    timeout=60 * 60 * 8,
+    cpu=2.0,
+    # Mirror is I/O bound. 4 GiB is plenty for eat-rocks + a small
+    # restore buffer; we don't open the DB or run any analytic work.
+    memory=4 * 1024,
+    # Rocks lands at ~650 GB on /tmp; eat-rocks may need transient
+    # download scratch on top. 1 TiB has comfortable headroom.
     ephemeral_disk=1024 * 1024,  # 1 TiB
+    retries=0,
 )
-def build(
+def mirror_phase(
     backup_id: int | None = None,
     snapshot_date: str | None = None,
     mirror_concurrency: int = 64,
-    memory_limit: str = "8GiB",
     config: str | None = None,
 ) -> None:
-    """Run mirror + stage + hydrate end-to-end on local ephemeral disk.
+    """Mirror phase: pull constellation rocks to /vol-rocks.
 
-    Per Modal's dataset-ingestion guide: all working data lives in /tmp
-    (local NVMe-class). Volumes are touched only at the persistence
-    boundaries — rocks goes to the rocks volume, raw + snapshot go to
-    the output volume, each via a single _copy_concurrent at the end of
-    its phase.
+    Resume-aware: if a complete rocks tree already exists on /tmp or
+    /vol-rocks, this is a near-no-op. Otherwise, eat-rocks downloads
+    into /tmp and we persist via _copy_concurrent at the end.
     """
     date = _resolve_date(snapshot_date)
-    common_tmp = _common_args(
+    common = _common_args(
         backup_id=backup_id,
         snapshot_date=date,
         mirror_concurrency=mirror_concurrency,
-        memory_limit=memory_limit,
+        memory_limit="2GiB",  # mirror itself doesn't open duckdb
         config=config,
         work_dir=TMP_WORK_DIR,
     )
-
-    print("=== phase 1/3: mirror ===", flush=True)
-    _obtain_rocks_at_tmp(common_tmp)
-    print("=== mirror committed ===", flush=True)
-
-    print("=== phase 2/3: stage (on /tmp) ===", flush=True)
-    _run_subcommand("stage", common_tmp)
-    print("=== persist raw: /tmp -> output volume ===", flush=True)
-    _copy_concurrent(
-        f"{TMP_WORK_DIR}/raw/{date}", f"{OUT_VOL_DIR}/raw/{date}", "raw-out"
-    )
-    volume_out.commit()
-    print("=== stage committed ===", flush=True)
-
-    print("=== phase 3/3: hydrate (on /tmp) ===", flush=True)
-    _run_subcommand("hydrate", common_tmp)
-    print("=== persist snapshot: /tmp -> output volume ===", flush=True)
-    _copy_concurrent(
-        f"{TMP_WORK_DIR}/snapshot/{date}",
-        f"{OUT_VOL_DIR}/snapshot/{date}",
-        "snapshot-out",
-    )
-    volume_out.commit()
-    print("=== hydrate committed; snapshot ready ===", flush=True)
+    _ensure_rocks_on_volume(common)
 
 
 @app.function(
@@ -435,43 +474,46 @@ def build(
         "/vol-out": volume_out,
     },
     timeout=60 * 60 * 10,
-    cpu=4.0,
-    memory=12 * 1024,
-    ephemeral_disk=1024 * 1024,
+    # Pass B and Pass C run as parallel OS threads; Phase 5 spawns
+    # DuckDB threads. 8 cores keeps both rocks scans saturated and
+    # leaves headroom for DuckDB.
+    cpu=8.0,
+    # Stage v2 holds two in-memory maps during Passes B+C:
+    #   did → did_id    HashMap   ~10-12 GB at 100M actors
+    #   did_id → did    Vec       ~7-8 GB at 100M actors
+    # Both are dropped before Phase 5. DuckDB Phase 5 then runs with
+    # memory_limit=auto (capped at 80% of cgroup, hard cap 128 GiB),
+    # spilling to /tmp/duckdb_tmp. 32 GiB is the right shape: covers
+    # ActorMap during scans, leaves 12-16 GiB headroom for DuckDB
+    # during Phase 5 sorts and pivots. If full-scale runs hit
+    # ActorMap > 20 GB, bump to 48.
+    memory=32 * 1024,
+    # /tmp peak during stage:
+    #   rocks (650 GB)
+    #   + scratch lt_*.parquet + t_*_refs.parquet (~150-180 GB at LZ4)
+    #   + raw entity parquets (~200 GB)
+    #   + DuckDB sort spill during Phase 5 (~50-100 GB)
+    # ≈ 1.0-1.1 TB. 2 TiB gives comfortable headroom and Modal
+    # clamps the worker class to the disk tier, so we land on ~100
+    # GiB-RAM hosts where ActorMap won't squeeze us either.
+    ephemeral_disk=2 * 1024 * 1024,  # 2 TiB
+    retries=0,
 )
-def single_phase(
-    name: str,
+def stage_phase(
     backup_id: int | None = None,
     snapshot_date: str | None = None,
     mirror_concurrency: int = 64,
-    memory_limit: str = "8GiB",
+    memory_limit: str = "auto",
     config: str | None = None,
 ) -> None:
-    """Run a single phase: mirror, stage, or hydrate.
+    """Stage phase: rocks → entity parquets.
 
-    Mirror downloads to /tmp (per Modal's dataset-ingestion guide) then
-    persists rocks/ onto the Volume. Stage and hydrate stage their inputs
-    onto /tmp first via _copy_concurrent, run on local NVMe, and copy
-    outputs back to the Volume. Inbound copies short-circuit when /tmp is
-    already populated.
+    Reads /vol-rocks → /tmp, runs the binary's `stage` command, drops
+    rocks before persisting (frees ~650 GB to make room for the raw
+    write buffer), then copies raw entity parquets to /vol-out.
     """
-    if name not in {"mirror", "stage", "hydrate"}:
-        raise SystemExit(f"name must be mirror/stage/hydrate, got {name!r}")
     date = _resolve_date(snapshot_date)
-
-    if name == "mirror":
-        common = _common_args(
-            backup_id=backup_id,
-            snapshot_date=date,
-            mirror_concurrency=mirror_concurrency,
-            memory_limit=memory_limit,
-            config=config,
-            work_dir=TMP_WORK_DIR,
-        )
-        _obtain_rocks_at_tmp(common)
-        return
-
-    common_scratch = _common_args(
+    common = _common_args(
         backup_id=backup_id,
         snapshot_date=date,
         mirror_concurrency=mirror_concurrency,
@@ -479,26 +521,71 @@ def single_phase(
         config=config,
         work_dir=TMP_WORK_DIR,
     )
+    print("=== copy rocks: rocks volume -> /tmp ===", flush=True)
+    _copy_concurrent(
+        f"{ROCKS_VOL_DIR}/rocks",
+        f"{TMP_WORK_DIR}/rocks",
+        "rocks-in",
+        skip_if_dst_populated=True,
+    )
+    _run_subcommand("stage", common)
+    _drop_local_rocks()
+    print("=== persist raw: /tmp -> output volume ===", flush=True)
+    _copy_concurrent(
+        f"{TMP_WORK_DIR}/raw/{date}",
+        f"{OUT_VOL_DIR}/raw/{date}",
+        "raw-out",
+    )
+    volume_out.commit()
 
-    if name == "stage":
-        print("=== copy rocks: rocks volume -> /tmp ===", flush=True)
-        _copy_concurrent(
-            f"{ROCKS_VOL_DIR}/rocks",
-            f"{TMP_WORK_DIR}/rocks",
-            "rocks-in",
-            skip_if_dst_populated=True,
-        )
-        _run_subcommand("stage", common_scratch)
-        print("=== persist raw: /tmp -> output volume ===", flush=True)
-        _copy_concurrent(
-            f"{TMP_WORK_DIR}/raw/{date}",
-            f"{OUT_VOL_DIR}/raw/{date}",
-            "raw-out",
-        )
-        volume_out.commit()
-        return
 
-    # hydrate
+@app.function(
+    image=image,
+    volumes={
+        "/vol-out": volume_out,
+    },
+    timeout=60 * 60 * 6,
+    # DuckDB benefits from threads on the chunked aggregate stages.
+    # 4 cores is enough; aggregates are mostly memory-bound, not
+    # CPU-bound.
+    cpu=4.0,
+    # Hydrate's hot moment is the chunked aggregate phase: GROUP BY
+    # uri_id over likes (~5B rows × u64) and the actor_aggs joins.
+    # With chunk_buckets=8, per-chunk hash table is ~5 GB; DuckDB
+    # also keeps prior-chunk pages cached. 64 GiB gives memory_limit
+    # of ~50 GiB resolved (80% cap), enough headroom for the joins
+    # without spill thrashing.
+    memory=64 * 1024,
+    # /tmp peak during hydrate:
+    #   raw entity parquets (~200 GB)
+    #   + snapshot.duckdb (~100-150 GB)
+    #   + DuckDB temp_directory spill (configurable, sized at 400 GiB
+    #     in hydrate.rs) — bounded by max_temp_directory_size
+    # ≈ 700-800 GiB. 1 TiB fits.
+    ephemeral_disk=1024 * 1024,  # 1 TiB
+    retries=0,
+)
+def hydrate_phase(
+    backup_id: int | None = None,
+    snapshot_date: str | None = None,
+    memory_limit: str = "auto",
+    config: str | None = None,
+) -> None:
+    """Hydrate phase: entity parquets → snapshot.duckdb.
+
+    Stages raw parquets from /vol-out → /tmp, runs the binary's
+    `hydrate` command, copies snapshot.duckdb back to /vol-out.
+    No rocks involvement.
+    """
+    date = _resolve_date(snapshot_date)
+    common = _common_args(
+        backup_id=backup_id,
+        snapshot_date=date,
+        mirror_concurrency=1,
+        memory_limit=memory_limit,
+        config=config,
+        work_dir=TMP_WORK_DIR,
+    )
     print("=== copy raw: output volume -> /tmp ===", flush=True)
     _copy_concurrent(
         f"{OUT_VOL_DIR}/raw/{date}",
@@ -506,7 +593,7 @@ def single_phase(
         "raw-in",
         skip_if_dst_populated=True,
     )
-    _run_subcommand("hydrate", common_scratch)
+    _run_subcommand("hydrate", common)
     print("=== persist snapshot: /tmp -> output volume ===", flush=True)
     _copy_concurrent(
         f"{TMP_WORK_DIR}/snapshot/{date}",
@@ -518,10 +605,79 @@ def single_phase(
 
 @app.function(
     image=image,
+    # Orchestrator only — mounts /vol-out solely to check the resume
+    # condition. The heavy lifting happens on the workers spawned
+    # via the per-phase .remote() calls.
+    volumes={"/vol-out": volume_out},
+    timeout=60 * 60 * 24,
+    cpu=0.5,
+    memory=1 * 1024,
+    # Modal enforces a 512 GiB minimum on ephemeral_disk; we don't
+    # actually use it (the orchestrator does no local I/O) but we
+    # have to allocate at least that. The disk is per-container and
+    # ephemeral, so it's free if unused — billing is on what's
+    # actually written.
+    ephemeral_disk=512 * 1024,  # 512 GiB (Modal minimum)
+    retries=0,
+)
+def build(
+    backup_id: int | None = None,
+    snapshot_date: str | None = None,
+    mirror_concurrency: int = 64,
+    memory_limit: str = "auto",
+    config: str | None = None,
+) -> None:
+    """Orchestrate mirror → stage → hydrate end-to-end.
+
+    Each phase runs on its own purpose-sized worker via .remote(), so
+    the cheap mirror download doesn't pay for stage's RAM, and hydrate
+    doesn't pay for stage's 2 TiB disk. Resume-aware: if raw entity
+    parquets are already on /vol-out, skip mirror+stage and go
+    straight to hydrate.
+    """
+    date = _resolve_date(snapshot_date)
+    raw_on_vol = f"{OUT_VOL_DIR}/raw/{date}"
+    if _raw_outputs_complete(raw_on_vol):
+        print(
+            f"=== resume: {raw_on_vol} already complete; skipping mirror+stage ===",
+            flush=True,
+        )
+    else:
+        print("=== phase 1/3: mirror ===", flush=True)
+        mirror_phase.remote(
+            backup_id=backup_id,
+            snapshot_date=date,
+            mirror_concurrency=mirror_concurrency,
+            config=config,
+        )
+        print("=== mirror committed ===", flush=True)
+
+        print("=== phase 2/3: stage ===", flush=True)
+        stage_phase.remote(
+            backup_id=backup_id,
+            snapshot_date=date,
+            mirror_concurrency=mirror_concurrency,
+            memory_limit=memory_limit,
+            config=config,
+        )
+        print("=== stage committed ===", flush=True)
+
+    print("=== phase 3/3: hydrate ===", flush=True)
+    hydrate_phase.remote(
+        backup_id=backup_id,
+        snapshot_date=date,
+        memory_limit=memory_limit,
+        config=config,
+    )
+    print("=== hydrate committed; snapshot ready ===", flush=True)
+
+
+@app.function(
+    image=image,
     volumes={"/vol-rocks": volume_rocks},
     timeout=60 * 10,  # 10 min — open + property reads should take seconds
     cpu=1.0,
-    memory=2 * 1024,
+    memory=8 * 1024,
 )
 def inspect(
     config: str | None = None,
@@ -549,7 +705,7 @@ def inspect(
     secrets=[modal.Secret.from_name("atproto-snapshot")],
     timeout=60 * 60 * 4,
     cpu=2.0,
-    memory=4 * 1024,
+    memory=8 * 1024,
 )
 def upload(
     snapshot_date: str | None = None,
@@ -580,7 +736,7 @@ def main(
     backup_id: int | None = None,
     snapshot_date: str | None = None,
     mirror_concurrency: int = 64,
-    memory_limit: str = "8GiB",
+    memory_limit: str = "auto",
     config: str | None = None,
     background: bool = False,
 ) -> None:
@@ -617,13 +773,28 @@ def main(
             memory_limit=memory_limit,
             config=config,
         )
-    elif phase in {"mirror", "stage", "hydrate"}:
+    elif phase == "mirror":
         _kick(
-            single_phase,
-            name=phase,
+            mirror_phase,
             backup_id=backup_id,
             snapshot_date=snapshot_date,
             mirror_concurrency=mirror_concurrency,
+            config=config,
+        )
+    elif phase == "stage":
+        _kick(
+            stage_phase,
+            backup_id=backup_id,
+            snapshot_date=snapshot_date,
+            mirror_concurrency=mirror_concurrency,
+            memory_limit=memory_limit,
+            config=config,
+        )
+    elif phase == "hydrate":
+        _kick(
+            hydrate_phase,
+            backup_id=backup_id,
+            snapshot_date=snapshot_date,
             memory_limit=memory_limit,
             config=config,
         )

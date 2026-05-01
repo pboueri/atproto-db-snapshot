@@ -7,7 +7,9 @@
 
 source_url = "https://constellation.t3.storage.dev"
 work_dir   = "/vol/var"
-memory_limit = "8GiB"
+# "auto" sizes DuckDB to 80% of the runtime-detected RAM (cgroup-aware
+# on Linux); use a literal like "8GiB" to override.
+memory_limit = "auto"
 batch_size = 100000
 mirror_concurrency = 64
 

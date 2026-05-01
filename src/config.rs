@@ -24,6 +24,22 @@ pub struct Config {
     pub rocks_block_cache: String,
     #[serde(default = "default_stage_threads")]
     pub stage_threads: usize,
+    /// When set to N>1, chunked stages are run as N modulo-bucketed
+    /// passes and the rows are concatenated. Hash tables shrink ~N×
+    /// per pass at the cost of re-scanning the input parquet N times.
+    /// None or Some(1) disables chunking. Stage v2 only chunks the
+    /// aggregate stages (`actor_aggs` / `post_aggs`); entity tables
+    /// are emitted directly by stage and don't need chunking.
+    #[serde(default)]
+    pub hydrate_chunk_buckets: Option<u32>,
+    /// Dry-run sanity check: when set, chunked stages execute only the
+    /// first chunk (k=0 of `hydrate_chunk_buckets`) instead of all N.
+    /// The resulting snapshot covers ~1/N of the data — useful to
+    /// validate SQL changes end-to-end on Modal in ~1/N the time
+    /// before committing to a full run. Non-chunked stages still run
+    /// in full but operate on the partial inputs. None = full run.
+    #[serde(default)]
+    pub hydrate_chunk_dry_run: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -91,6 +107,36 @@ fn default_stage_threads() -> usize {
         .unwrap_or(1)
 }
 
+/// Read the cgroup memory ceiling, returning bytes if available.
+/// Tries cgroup v2 (`/sys/fs/cgroup/memory.max`) first, then v1
+/// (`/sys/fs/cgroup/memory/memory.limit_in_bytes`). Returns None on
+/// non-Linux, when the file isn't readable, when the value is "max"
+/// (v2's no-limit sentinel), or when the value is implausibly large
+/// (v1 reports a huge number to mean "no limit").
+fn read_cgroup_memory_max() -> Option<u64> {
+    const V1_NO_LIMIT_SENTINEL: u64 = u64::MAX / 4096 * 4096;
+    let candidates = [
+        "/sys/fs/cgroup/memory.max",
+        "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+    ];
+    for path in candidates {
+        let Ok(s) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let s = s.trim();
+        if s == "max" {
+            return None;
+        }
+        if let Ok(n) = s.parse::<u64>() {
+            if n >= V1_NO_LIMIT_SENTINEL {
+                return None;
+            }
+            return Some(n);
+        }
+    }
+    None
+}
+
 pub fn parse_size(s: &str) -> Result<usize> {
     let s = s.trim();
     let split_at = s
@@ -131,11 +177,54 @@ impl Config {
             upload: None,
             rocks_block_cache: default_rocks_block_cache(),
             stage_threads: default_stage_threads(),
+            hydrate_chunk_buckets: None,
+            hydrate_chunk_dry_run: None,
         }
     }
 
     pub fn rocks_block_cache_bytes(&self) -> Result<usize> {
         parse_size(&self.rocks_block_cache)
+    }
+
+    /// Resolve `memory_limit` to a concrete size string DuckDB will
+    /// accept. The literal "auto" (case-insensitive) is replaced with
+    /// `min(80% of cgroup-or-sysinfo total, AUTO_MEMORY_LIMIT_CAP)`.
+    ///
+    /// On Modal, sysinfo's `total_memory()` reports host RAM, not the
+    /// container's cgroup limit, so we also probe `/sys/fs/cgroup/...`
+    /// directly and take the smaller of the two. The hard cap keeps a
+    /// runaway DuckDB process from monopolizing the worker; pick a
+    /// value with headroom for buffer-pool buildup across stages
+    /// (chunked builds keep prior-chunk pages cached, and a tight cap
+    /// can SIGSEGV a later chunk that needs a fresh hash table).
+    /// Override by setting `memory_limit = "<size>"` explicitly.
+    pub fn resolved_memory_limit(&self) -> Result<String> {
+        if !self.memory_limit.eq_ignore_ascii_case("auto") {
+            return Ok(self.memory_limit.clone());
+        }
+        let mut sys = sysinfo::System::new();
+        sys.refresh_memory();
+        let sysinfo_bytes = sys.total_memory();
+        if sysinfo_bytes == 0 {
+            return Err(anyhow!(
+                "memory_limit=auto but sysinfo reported 0 total memory"
+            ));
+        }
+        let cgroup_bytes = read_cgroup_memory_max();
+        let total_bytes = match cgroup_bytes {
+            Some(c) if c < sysinfo_bytes => c,
+            _ => sysinfo_bytes,
+        };
+        tracing::info!(
+            sysinfo_total_mib = sysinfo_bytes / (1024 * 1024),
+            cgroup_max_mib = cgroup_bytes.map(|c| c / (1024 * 1024)),
+            chosen_total_mib = total_bytes / (1024 * 1024),
+            "auto memory probe"
+        );
+        const AUTO_MEMORY_LIMIT_CAP: u64 = 128 * 1024 * 1024 * 1024;
+        let target = ((total_bytes as f64 * 0.8) as u64).min(AUTO_MEMORY_LIMIT_CAP);
+        let mib = (target / (1024 * 1024)).max(1);
+        Ok(format!("{mib}MiB"))
     }
 
     pub fn rocks_dir(&self) -> PathBuf {

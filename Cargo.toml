@@ -7,6 +7,10 @@ edition = "2021"
 name = "at-snapshot"
 path = "src/main.rs"
 
+[[bin]]
+name = "synth_gen"
+path = "src/bin/synth_gen.rs"
+
 [dependencies]
 anyhow = "1"
 thiserror = "1"
@@ -32,6 +36,8 @@ sysinfo = "0.32"
 url = "2"
 hex = "0.4"
 lru = "0.12"
+twox-hash = "1.6"
+rand = { version = "0.8", features = ["small_rng"] }
 
 [dev-dependencies]
 tempfile = "3"
