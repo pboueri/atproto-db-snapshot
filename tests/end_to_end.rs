@@ -49,6 +49,8 @@ async fn end_to_end_synthetic_rocks() -> Result<()> {
         stage_threads: 1,
         hydrate_chunk_buckets: Some(4),
         hydrate_chunk_dry_run: None,
+        hydrate_window_days_back: None,
+        hydrate_window_days_lag: None,
     };
 
     let stage = at_snapshot::stage::run(&cfg, "2026-04-27").await?;

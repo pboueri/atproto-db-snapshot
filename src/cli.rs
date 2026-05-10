@@ -28,6 +28,46 @@ pub enum Cmd {
     /// estimate-num-keys / SST sizes, no scanning. Use to size pass B
     /// before kicking off stage.
     Inspect(CommonArgs),
+    /// Replace a single table or view in an existing snapshot.duckdb
+    /// with a fresh TABLE materialized from a local parquet file.
+    /// Use to fix VIEW-only entity tables (actors, follows, blocks,
+    /// likes, reposts) in a downloaded snapshot whose source parquets
+    /// no longer live at the build host's paths.
+    RepairTable(RepairTableArgs),
+    /// Drop the `posts` table (and dependent aggs) and rebuild from
+    /// the staging posts_from_records.parquet + posts_from_targets.parquet.
+    /// Use this when posts has block-level corruption.
+    RebuildPosts(RebuildPostsArgs),
+}
+
+#[derive(Parser, Debug, Clone)]
+pub struct RepairTableArgs {
+    /// Path to the existing snapshot.duckdb to modify in place.
+    #[arg(long)]
+    pub db: PathBuf,
+    /// Name of the table/view to replace (e.g. `actors`).
+    #[arg(long)]
+    pub table: String,
+    /// Path to the parquet file to materialize the table from.
+    #[arg(long)]
+    pub parquet: PathBuf,
+}
+
+#[derive(Parser, Debug, Clone)]
+pub struct RebuildPostsArgs {
+    /// Path to the existing snapshot.duckdb to modify in place.
+    #[arg(long)]
+    pub db: PathBuf,
+    /// Path to posts_from_records.parquet.
+    #[arg(long)]
+    pub records: PathBuf,
+    /// Path to posts_from_targets.parquet.
+    #[arg(long)]
+    pub targets: PathBuf,
+    /// DuckDB memory_limit. Defaults to 16GiB; bump if your machine
+    /// has more RAM and the dedup is slow.
+    #[arg(long, default_value = "16GiB")]
+    pub memory_limit: String,
 }
 
 /// Flags shared by every subcommand. Each subcommand uses the subset
@@ -57,6 +97,15 @@ pub struct CommonArgs {
     /// Number of worker threads for pass B (link_targets scan).
     #[arg(long)]
     pub stage_threads: Option<usize>,
+    /// Hydrate time-window: keep events whose created_at falls in
+    /// [snapshot_date - days_back, snapshot_date - days_lag]. Both
+    /// flags must be set together. Applies to likes / reposts /
+    /// posts_from_*. actors / blocks / follows are always loaded
+    /// in full (state, not events).
+    #[arg(long)]
+    pub window_days_back: Option<u32>,
+    #[arg(long)]
+    pub window_days_lag: Option<u32>,
 }
 
 pub async fn run() -> Result<()> {
@@ -69,6 +118,15 @@ pub async fn run() -> Result<()> {
         Cmd::Hydrate(args) => run_hydrate(args).await,
         Cmd::Upload(args) => run_upload(args).await,
         Cmd::Inspect(args) => run_inspect(args).await,
+        Cmd::RepairTable(args) => {
+            crate::repair::repair_table(&args.db, &args.table, &args.parquet)
+        }
+        Cmd::RebuildPosts(args) => crate::repair::rebuild_posts(
+            &args.db,
+            &args.records,
+            &args.targets,
+            &args.memory_limit,
+        ),
     }
 }
 
@@ -131,6 +189,12 @@ fn apply_overrides(cfg: &mut Config, args: &CommonArgs) {
     }
     if let Some(t) = args.stage_threads {
         cfg.stage_threads = t;
+    }
+    if let Some(b) = args.window_days_back {
+        cfg.hydrate_window_days_back = Some(b);
+    }
+    if let Some(l) = args.window_days_lag {
+        cfg.hydrate_window_days_lag = Some(l);
     }
 }
 

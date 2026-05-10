@@ -79,12 +79,14 @@ TMP_WORK_DIR = "/tmp/var"
 SOURCE_IGNORE = [
     "target",
     "var",
+    "analysis",
     ".git",
     ".github",
     ".cargo/config.toml",
     "__pycache__",
     "*.pyc",
     "*.parquet",
+    "*.duckdb",
     ".DS_Store",
     "deploy/modal_app.py",
 ]
@@ -149,6 +151,8 @@ def _common_args(
     memory_limit: str,
     config: str | None,
     work_dir: str = TMP_WORK_DIR,
+    window_days_back: int | None = None,
+    window_days_lag: int | None = None,
 ) -> list[str]:
     args = [
         "--work-dir",
@@ -164,6 +168,10 @@ def _common_args(
         args += ["--snapshot-date", snapshot_date]
     if config:
         args += ["--config", config]
+    if window_days_back is not None:
+        args += ["--window-days-back", str(window_days_back)]
+    if window_days_lag is not None:
+        args += ["--window-days-lag", str(window_days_lag)]
     return args
 
 
@@ -570,12 +578,20 @@ def hydrate_phase(
     snapshot_date: str | None = None,
     memory_limit: str = "auto",
     config: str | None = None,
+    window_days_back: int | None = None,
+    window_days_lag: int | None = None,
 ) -> None:
     """Hydrate phase: entity parquets → snapshot.duckdb.
 
     Stages raw parquets from /vol-out → /tmp, runs the binary's
     `hydrate` command, copies snapshot.duckdb back to /vol-out.
     No rocks involvement.
+
+    `window_days_back` / `window_days_lag` enable the hydrate-time
+    window: likes / reposts / posts_from_* are filtered to
+    created_at in [snapshot_date - back, snapshot_date - lag], and
+    orphan likes/reposts are pruned against the windowed posts.
+    Pass both or neither.
     """
     date = _resolve_date(snapshot_date)
     common = _common_args(
@@ -585,6 +601,8 @@ def hydrate_phase(
         memory_limit=memory_limit,
         config=config,
         work_dir=TMP_WORK_DIR,
+        window_days_back=window_days_back,
+        window_days_lag=window_days_lag,
     )
     print("=== copy raw: output volume -> /tmp ===", flush=True)
     _copy_concurrent(
@@ -699,6 +717,210 @@ def inspect(
     _run_subcommand("inspect", common)
 
 
+# Lightweight image just for read-only parquet inspection. Built off
+# debian_slim with the duckdb pip wheel — doesn't need the rocksdb /
+# Rust toolchain in the main image, so changes here don't drag the
+# Cargo cache.
+inspect_image = (
+    modal.Image.debian_slim(python_version="3.12")
+    .pip_install("duckdb==1.5.2")
+)
+
+
+@app.function(
+    image=inspect_image,
+    volumes={"/vol-out": volume_out},
+    timeout=60 * 60,
+    cpu=4.0,
+    # likes.parquet is 162 GiB; DuckDB streams it but column stats and
+    # min/max scans benefit from a few GiB of buffer space.
+    memory=16 * 1024,
+)
+def count_parquets(snapshot_date: str = "2026-04-28") -> None:
+    """Count rows + min/max created_at for each entity parquet in
+    /vol-out/var/raw/<snapshot_date>/. Pure read-only volume access:
+    no download, runs on Modal, exits in seconds-to-minutes.
+
+    `actors` has no `created_at` column — only the row count is
+    printed for it. All other entities have `created_at`.
+    """
+    import os
+    import time
+
+    import duckdb
+
+    raw_dir = f"{OUT_VOL_DIR}/raw/{snapshot_date}"
+    entities = [
+        ("actors", None),
+        ("blocks", "created_at"),
+        ("follows", "created_at"),
+        ("reposts", "created_at"),
+        ("likes", "created_at"),
+        ("posts_from_records", "created_at"),
+        ("posts_from_targets", "created_at"),
+    ]
+    con = duckdb.connect()
+    con.execute("SET threads=4")
+    print(f"=== parquet stats: {raw_dir} ===", flush=True)
+    print(f"{'table':<22}{'rows':>16}  {'min_created_at':<28}  {'max_created_at':<28}  size", flush=True)
+    for name, ts_col in entities:
+        path = f"{raw_dir}/{name}.parquet"
+        size_gib = os.path.getsize(path) / (1024**3)
+        t0 = time.time()
+        if ts_col is None:
+            (n,) = con.execute(
+                f"SELECT COUNT(*) FROM read_parquet(?)", [path]
+            ).fetchone()
+            mn, mx = "-", "-"
+        else:
+            row = con.execute(
+                f"SELECT COUNT(*), MIN({ts_col}), MAX({ts_col}) "
+                f"FROM read_parquet(?)",
+                [path],
+            ).fetchone()
+            n, mn, mx = row
+            mn = "" if mn is None else str(mn)
+            mx = "" if mx is None else str(mx)
+        elapsed = time.time() - t0
+        print(
+            f"{name:<22}{n:>16,}  {mn:<28}  {mx:<28}  "
+            f"{size_gib:>6.2f} GiB  ({elapsed:.1f}s)",
+            flush=True,
+        )
+
+
+@app.function(
+    image=inspect_image,
+    volumes={"/vol-out": volume_out},
+    timeout=60 * 60,
+    cpu=4.0,
+    memory=16 * 1024,
+)
+def plausible_count(
+    snapshot_date: str = "2026-04-28",
+    lo: str = "2022-01-01",
+    hi: str = "2026-05-31",
+) -> None:
+    """For each entity parquet that carries `created_at`, count how
+    many rows fall inside [lo, hi] (the atproto plausibility window)
+    vs. outside. Useful to see how much of each table is TID-decode
+    garbage from malformed rkeys before relying on time-window
+    analytics.
+
+    `actors` has no created_at — skipped.
+    """
+    import time
+
+    import duckdb
+
+    raw_dir = f"{OUT_VOL_DIR}/raw/{snapshot_date}"
+    entities = [
+        "blocks",
+        "follows",
+        "reposts",
+        "likes",
+        "posts_from_records",
+        "posts_from_targets",
+    ]
+    con = duckdb.connect()
+    con.execute("SET threads=4")
+    print(
+        f"=== plausibility filter: created_at in "
+        f"[{lo}, {hi}] on {raw_dir} ===",
+        flush=True,
+    )
+    print(
+        f"{'table':<22}{'total':>16}  {'plausible':>16}  "
+        f"{'too_early':>14}  {'too_late':>14}  {'%ok':>6}",
+        flush=True,
+    )
+    for name in entities:
+        path = f"{raw_dir}/{name}.parquet"
+        t0 = time.time()
+        row = con.execute(
+            f"""
+            SELECT
+              COUNT(*) AS total,
+              COUNT(*) FILTER (WHERE created_at >= ?::TIMESTAMP
+                                 AND created_at <= ?::TIMESTAMP) AS ok,
+              COUNT(*) FILTER (WHERE created_at <  ?::TIMESTAMP) AS early,
+              COUNT(*) FILTER (WHERE created_at >  ?::TIMESTAMP) AS late
+            FROM read_parquet(?)
+            """,
+            [lo, hi, lo, hi, path],
+        ).fetchone()
+        total, ok, early, late = row
+        pct = 100.0 * ok / total if total else 0.0
+        elapsed = time.time() - t0
+        print(
+            f"{name:<22}{total:>16,}  {ok:>16,}  "
+            f"{early:>14,}  {late:>14,}  {pct:>5.2f}%  "
+            f"({elapsed:.1f}s)",
+            flush=True,
+        )
+
+
+@app.function(
+    image=inspect_image,
+    volumes={"/vol-out": volume_out},
+    timeout=60 * 60,
+    cpu=4.0,
+    memory=16 * 1024,
+)
+def daily_histogram(
+    snapshot_date: str = "2026-04-28",
+    lo: str = "2022-01-01",
+    hi: str = "2026-05-31",
+    last_n_days: int = 90,
+) -> None:
+    """Per-month row counts (across the plausibility window) + a
+    last-N-days tally. Lets us compare against jazco.dev/stats:
+    20 M likes/day × 90 ≈ 1.8 B over 90 days, so any table whose
+    last-90-day window matches that is consistent with the public
+    chart even if its lifetime count is much larger.
+    """
+    import time
+
+    import duckdb
+
+    raw_dir = f"{OUT_VOL_DIR}/raw/{snapshot_date}"
+    entities = ["follows", "reposts", "likes", "posts_from_records"]
+    con = duckdb.connect()
+    con.execute("SET threads=4")
+    print(f"=== monthly + last-{last_n_days}d window on {raw_dir} ===", flush=True)
+    for name in entities:
+        path = f"{raw_dir}/{name}.parquet"
+        t0 = time.time()
+        last_window = con.execute(
+            f"""
+            SELECT COUNT(*) FROM read_parquet(?)
+            WHERE created_at >= (?::TIMESTAMP - INTERVAL '{last_n_days}' DAY)
+              AND created_at <= ?::TIMESTAMP
+            """,
+            [path, hi, hi],
+        ).fetchone()[0]
+        monthly = con.execute(
+            f"""
+            SELECT strftime(created_at, '%Y-%m') AS ym, COUNT(*) AS n
+            FROM read_parquet(?)
+            WHERE created_at >= ?::TIMESTAMP AND created_at <= ?::TIMESTAMP
+            GROUP BY 1
+            ORDER BY 1
+            """,
+            [path, lo, hi],
+        ).fetchall()
+        elapsed = time.time() - t0
+        print(
+            f"\n[{name}]  last {last_n_days} days ending {hi}: "
+            f"{last_window:,}   (scan {elapsed:.1f}s)",
+            flush=True,
+        )
+        print(f"  monthly rows in [{lo}, {hi}]:", flush=True)
+        for ym, n in monthly:
+            bar = "#" * min(60, int(n / 50_000_000))
+            print(f"    {ym}  {n:>14,}  {bar}", flush=True)
+
+
 @app.function(
     image=image,
     volumes={"/vol-out": volume_out},
@@ -739,6 +961,8 @@ def main(
     memory_limit: str = "auto",
     config: str | None = None,
     background: bool = False,
+    window_days_back: int | None = None,
+    window_days_lag: int | None = None,
 ) -> None:
     """Local entrypoint dispatcher.
 
@@ -797,6 +1021,8 @@ def main(
             snapshot_date=snapshot_date,
             memory_limit=memory_limit,
             config=config,
+            window_days_back=window_days_back,
+            window_days_lag=window_days_lag,
         )
     elif phase == "upload":
         _kick(upload, snapshot_date=snapshot_date, config=config)
