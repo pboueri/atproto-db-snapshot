@@ -232,12 +232,17 @@ struct DownloadJob {
 
 /// Walk the meta and decide, for each entry, whether the local
 /// filesystem already has a matching file. Match criterion is
-/// `local.size == meta.size`. crc32c is not validated here because
-/// it'd require re-reading every kept file (~hundreds of GB) which
-/// defeats the point. Adjacent-backup SSTs that happen to share a
-/// shared_checksum name will also share a size — collisions on
-/// (filename, size) but different content are not a thing in
-/// RocksDB's content-addressed scheme.
+/// `local.size == expected_size`, where `expected_size` is
+/// either taken from the meta's `size` field or — when missing,
+/// which constellation's backup meta currently does — parsed from
+/// the embedded size in the `shared_checksum/<no>_<crc>_<size>.sst`
+/// filename. crc32c is not re-validated against on-disk bytes
+/// because that'd cost a full ~650 GB read every run.
+///
+/// Adjacent-backup SSTs that share a shared_checksum name also
+/// share a size *and* crc — RocksDB's content-addressed scheme
+/// means filename collisions are content collisions. Size match
+/// is a sufficient skip predicate.
 fn plan_incremental(rocks_dir: &Path, meta: &BackupMeta) -> Result<Plan> {
     let mut plan = Plan {
         download: Vec::new(),
@@ -246,7 +251,8 @@ fn plan_incremental(rocks_dir: &Path, meta: &BackupMeta) -> Result<Plan> {
     };
     for f in &meta.files {
         let dest = local_dest_for(rocks_dir, &f.path)?;
-        if let Some(expected) = f.size {
+        let expected_size = f.size.or_else(|| size_from_shared_checksum_path(&f.path));
+        if let Some(expected) = expected_size {
             if let Ok(meta_local) = std::fs::metadata(&dest) {
                 if meta_local.is_file() && meta_local.len() == expected {
                     plan.skip.push(());
@@ -258,11 +264,35 @@ fn plan_incremental(rocks_dir: &Path, meta: &BackupMeta) -> Result<Plan> {
         plan.download.push(DownloadJob {
             backup_path: f.path.clone(),
             dest,
-            expected_size: f.size,
+            expected_size,
             expected_crc32c: f.crc32c,
         });
     }
     Ok(plan)
+}
+
+/// Recover the SST size from a `shared_checksum/<no>_<crc>_<size>.sst`
+/// path when the meta line itself doesn't carry `size <bytes>`.
+/// Returns None for any other shape (CURRENT, MANIFEST, *.log,
+/// shared/<name>) — those are small and we don't bother.
+fn size_from_shared_checksum_path(backup_path: &str) -> Option<u64> {
+    let sp = StorePath::from(backup_path);
+    let mut parts = sp.parts();
+    if parts.next().map(|p| p.as_ref().to_string()).as_deref() != Some("shared_checksum") {
+        return None;
+    }
+    let mangled = parts.next()?.as_ref().to_string();
+    let stem = Path::new(&mangled).file_stem()?.to_str()?;
+    // stem looks like "000007_2894567812_590"
+    let mut fields = stem.split('_');
+    let _file_no = fields.next()?;
+    let _crc = fields.next()?;
+    let size_str = fields.next()?;
+    if fields.next().is_some() {
+        // unexpected extra underscore — bail rather than guess
+        return None;
+    }
+    size_str.parse::<u64>().ok()
 }
 
 async fn download_missing(
@@ -488,5 +518,20 @@ mod tests {
             db_filename("shared/000007.sst").unwrap(),
             PathBuf::from("000007.sst")
         );
+    }
+
+    #[test]
+    fn size_from_shared_checksum_extracts_trailing_size() {
+        assert_eq!(
+            size_from_shared_checksum_path("shared_checksum/000007_2894567812_590.sst"),
+            Some(590),
+        );
+    }
+
+    #[test]
+    fn size_from_shared_checksum_rejects_other_shapes() {
+        assert_eq!(size_from_shared_checksum_path("CURRENT"), None);
+        assert_eq!(size_from_shared_checksum_path("private/1/MANIFEST-000008"), None);
+        assert_eq!(size_from_shared_checksum_path("shared/000007.sst"), None);
     }
 }
