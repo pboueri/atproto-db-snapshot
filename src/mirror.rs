@@ -329,19 +329,28 @@ async fn download_missing(
         "downloading deltas"
     );
 
-    let store_arc = Arc::new(store);
     let tasks = jobs.into_iter().map(|j| {
-        let store = Arc::clone(&store_arc);
-        async move { download_one(&*store, j).await }
+        let store = Arc::clone(&store);
+        async move {
+            let path = j.backup_path.clone();
+            let outcome = download_one_with_retries(&*store, j, 4).await;
+            (path, outcome)
+        }
     });
 
     let mut stream = futures::stream::iter(tasks).buffer_unordered(concurrency);
     let mut completed = 0usize;
     let mut bytes_downloaded = 0u64;
-    while let Some(r) = stream.next().await {
-        let bytes = r?;
+    let mut failures: Vec<(String, anyhow::Error)> = Vec::new();
+    while let Some((path, r)) = stream.next().await {
         completed += 1;
-        bytes_downloaded += bytes;
+        match r {
+            Ok(bytes) => bytes_downloaded += bytes,
+            Err(e) => {
+                tracing::warn!(path = %path, err = %e, "download failed; will continue with other files");
+                failures.push((path, e));
+            }
+        }
         if completed.is_multiple_of(50) || completed == total {
             let elapsed = started.elapsed().as_secs_f64();
             let rate = if elapsed > 0.0 {
@@ -352,6 +361,7 @@ async fn download_missing(
             tracing::info!(
                 completed,
                 total,
+                failures = failures.len(),
                 bytes_downloaded,
                 elapsed_secs = format!("{:.1}", elapsed),
                 mb_per_sec = format!("{:.1}", rate),
@@ -359,11 +369,53 @@ async fn download_missing(
             );
         }
     }
-    let _ = rocks_dir; // currently unused but kept for symmetry / future logging
+    let _ = rocks_dir;
+    if !failures.is_empty() {
+        for (path, e) in &failures {
+            tracing::error!(path = %path, err = %e, "failed download (after retries)");
+        }
+        return Err(anyhow!(
+            "{} file(s) failed to download after retries; re-run to pick up — \
+             surviving files won't be re-fetched thanks to size-skip",
+            failures.len()
+        ));
+    }
     Ok(bytes_downloaded)
 }
 
-async fn download_one(store: &dyn ObjectStore, job: DownloadJob) -> Result<u64> {
+/// Wrap `download_one` with a bounded retry loop. Each retry issues
+/// a fresh `store.get(&key)` so a 416 from a stale Range-resume
+/// inside object_store's internal retry doesn't poison subsequent
+/// attempts. Exponential backoff (1s, 2s, 4s, 8s, capped) between
+/// tries; total wall time on a fully-broken file ≈ 15s.
+async fn download_one_with_retries(
+    store: &dyn ObjectStore,
+    job: DownloadJob,
+    max_attempts: u32,
+) -> Result<u64> {
+    let mut last_err: Option<anyhow::Error> = None;
+    for attempt in 0..max_attempts {
+        if attempt > 0 {
+            let backoff = 1u64 << attempt.min(4); // 2, 4, 8, 16 seconds
+            tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
+            tracing::warn!(
+                path = %job.backup_path,
+                attempt = attempt + 1,
+                max = max_attempts,
+                "retrying download after backoff"
+            );
+        }
+        match download_one(store, &job).await {
+            Ok(n) => return Ok(n),
+            Err(e) => {
+                last_err = Some(e);
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow!("download retries exhausted with no error captured")))
+}
+
+async fn download_one(store: &dyn ObjectStore, job: &DownloadJob) -> Result<u64> {
     let key = StorePath::from(job.backup_path.as_str());
     let result = store
         .get(&key)
