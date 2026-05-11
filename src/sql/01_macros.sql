@@ -22,3 +22,21 @@ CREATE OR REPLACE MACRO tid_to_ts(rkey) AS (
     ((instr('234567abcdefghijklmnopqrstuvwxyz', substring(rkey, 11, 1)) - 1)::BIGINT)
   ) ELSE NULL END
 );
+
+-- URI / URL reconstruction (pure string ops). The snapshot stores
+-- actors by numeric did_id and posts by xxhash3-64 uri_id; the
+-- human-readable URI is reconstructable from (actors.did, posts.rkey).
+-- These macros centralize the format so queries don't repeat the
+-- concatenation (and don't drift if bsky.app ever changes its URL
+-- shape). Use these in any query that already joins posts to actors.
+-- For one-off uri_id → URL lookups, see 06_url_macros.sql which adds
+-- correlated-subquery variants that do the join inline.
+
+CREATE OR REPLACE MACRO post_at_uri(did, rkey) AS
+  'at://' || did || '/app.bsky.feed.post/' || rkey;
+
+CREATE OR REPLACE MACRO post_url(did, rkey) AS
+  'https://bsky.app/profile/' || did || '/post/' || rkey;
+
+CREATE OR REPLACE MACRO actor_url(did) AS
+  'https://bsky.app/profile/' || did;

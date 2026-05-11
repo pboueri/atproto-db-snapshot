@@ -177,3 +177,31 @@ fn is_safe_ident(s: &str) -> bool {
 fn sql_string_literal(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
+
+const MACROS_SQL_PURE: &str = include_str!("sql/01_macros.sql");
+const MACROS_SQL_URL_LOOKUP: &str = include_str!("sql/06_url_macros.sql");
+
+/// (Re)create every MACRO that ships with at-snapshot into an
+/// existing snapshot.duckdb. Applies both the pure-string macros
+/// (`tid_to_ts`, `post_at_uri`, `post_url`, `actor_url` — no table
+/// dependencies) and the lookup-by-id wrappers (`post_url_by_id`
+/// etc., which require posts + actors to already exist). All
+/// statements use `CREATE OR REPLACE`, so it's safe to run repeatedly.
+pub fn install_macros(db_path: &Path) -> Result<()> {
+    let conn = Connection::open(db_path)
+        .with_context(|| format!("open {}", db_path.display()))?;
+    let t0 = Instant::now();
+    tracing::info!(db = %db_path.display(), "install_macros start");
+    conn.execute_batch(MACROS_SQL_PURE)
+        .context("apply 01_macros.sql")?;
+    conn.execute_batch(MACROS_SQL_URL_LOOKUP)
+        .context("apply 06_url_macros.sql")?;
+    conn.execute_batch("FORCE CHECKPOINT")
+        .context("force checkpoint")?;
+    drop(conn);
+    tracing::info!(
+        elapsed_secs = t0.elapsed().as_secs_f64(),
+        "install_macros done"
+    );
+    Ok(())
+}

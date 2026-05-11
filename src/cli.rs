@@ -38,6 +38,17 @@ pub enum Cmd {
     /// the staging posts_from_records.parquet + posts_from_targets.parquet.
     /// Use this when posts has block-level corruption.
     RebuildPosts(RebuildPostsArgs),
+    /// (Re)install the URL/URI macros (`post_url`, `actor_url`, etc.)
+    /// into an existing snapshot.duckdb. Idempotent — safe to run
+    /// against a snapshot that already has them.
+    InstallMacros(InstallMacrosArgs),
+}
+
+#[derive(Parser, Debug, Clone)]
+pub struct InstallMacrosArgs {
+    /// Path to the existing snapshot.duckdb.
+    #[arg(long)]
+    pub db: PathBuf,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -127,6 +138,7 @@ pub async fn run() -> Result<()> {
             &args.targets,
             &args.memory_limit,
         ),
+        Cmd::InstallMacros(args) => crate::repair::install_macros(&args.db),
     }
 }
 
