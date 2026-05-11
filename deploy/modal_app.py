@@ -383,36 +383,13 @@ def _drop_local_rocks() -> None:
     print(f"[free] done in {time.time() - t0:.1f}s", flush=True)
 
 
-def _ensure_rocks_on_volume(common_tmp: list[str]) -> None:
-    """Ensure /vol-rocks/var/rocks holds a complete rocks tree.
-
-    Mirror runs in its own container; the next phase (stage) is the one
-    that actually reads rocks at /tmp. So mirror only needs to leave
-    rocks on the volume — copying it to /tmp here would be 650 GB of
-    pure waste, since the ephemeral disk vanishes when this container
-    exits.
-
-      1. Already persisted on the rocks volume — done. No copy.
-      2. Otherwise — run the binary's mirror subcommand to download
-         from constellation into /tmp, then persist /tmp → rocks
-         volume.
-    """
-    if _rocks_looks_complete(f"{ROCKS_VOL_DIR}/rocks"):
-        print(
-            "[mirror] rocks already on volume; nothing to do",
-            flush=True,
-        )
-        return
-    print(
-        "[mirror] no existing rocks; downloading from constellation to /tmp",
-        flush=True,
-    )
-    _run_subcommand("mirror", common_tmp)
-    print("[mirror] persisting fresh rocks: /tmp -> rocks volume", flush=True)
-    _copy_concurrent(
-        f"{TMP_WORK_DIR}/rocks", f"{ROCKS_VOL_DIR}/rocks", "rocks-tmp-to-vol"
-    )
-    volume_rocks.commit()
+# `_ensure_rocks_on_volume` used to gate by file presence and stage
+# rocks through /tmp on a cold start. The binary's mirror.rs now
+# does its own size-diff against the existing rocks tree and only
+# downloads delta files, so the right shape is: point the binary
+# straight at /vol-rocks and let it decide whether to do work.
+# Kept here as a stub so external callers don't break; new code
+# should not rely on it.
 
 
 # =====================================================================
@@ -440,14 +417,18 @@ def _ensure_rocks_on_volume(common_tmp: list[str]) -> None:
     },
     # eat-rocks streams ~80 GB compressed → ~650 GB SSTs over the
     # network; latency variability dominates wall time. 8h covers a
-    # slow link with margin.
+    # slow link with margin. Daily incremental refreshes complete
+    # in minutes.
     timeout=60 * 60 * 8,
     cpu=2.0,
     # Mirror is I/O bound. 4 GiB is plenty for eat-rocks + a small
     # restore buffer; we don't open the DB or run any analytic work.
     memory=4 * 1024,
-    # Rocks lands at ~650 GB on /tmp; eat-rocks may need transient
-    # download scratch on top. 1 TiB has comfortable headroom.
+    # Writing directly to /vol-rocks (no /tmp staging) — the local
+    # ephemeral disk is essentially unused, but Modal enforces a
+    # 512 GiB floor on ephemeral_disk. Leave at 1 TiB so a future
+    # full-rebuild path that wants to stage through /tmp still has
+    # room.
     ephemeral_disk=1024 * 1024,  # 1 TiB
     retries=0,
 )
@@ -457,11 +438,19 @@ def mirror_phase(
     mirror_concurrency: int = 64,
     config: str | None = None,
 ) -> None:
-    """Mirror phase: pull constellation rocks to /vol-rocks.
+    """Mirror phase: bring /vol-rocks/var/rocks to the latest (or
+    specified) constellation backup.
 
-    Resume-aware: if a complete rocks tree already exists on /tmp or
-    /vol-rocks, this is a near-no-op. Otherwise, eat-rocks downloads
-    into /tmp and we persist via _copy_concurrent at the end.
+    The binary's mirror.rs reads the persisted `.cursor` file from
+    the rocks dir, fetches the target backup's meta, and downloads
+    only files whose local size doesn't match. First run is a full
+    ~650 GB pull; subsequent daily refreshes touch only the SSTs
+    that changed (and the MANIFEST / CURRENT), so wall time drops
+    from hours to single-digit minutes.
+
+    Writes go directly to the Modal Volume — no /tmp staging. The
+    rocks tree is undated; cursor metadata records when each
+    backup_id became current.
     """
     date = _resolve_date(snapshot_date)
     common = _common_args(
@@ -470,9 +459,10 @@ def mirror_phase(
         mirror_concurrency=mirror_concurrency,
         memory_limit="2GiB",  # mirror itself doesn't open duckdb
         config=config,
-        work_dir=TMP_WORK_DIR,
+        work_dir=ROCKS_VOL_DIR,
     )
-    _ensure_rocks_on_volume(common)
+    _run_subcommand("mirror", common)
+    volume_rocks.commit()
 
 
 @app.function(

@@ -327,6 +327,7 @@ dependencies = [
  "bincode",
  "chrono",
  "clap",
+ "crc32c",
  "duckdb",
  "eat-rocks",
  "futures",
