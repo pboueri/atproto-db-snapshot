@@ -922,6 +922,194 @@ def daily_histogram(
 
 
 @app.function(
+    image=inspect_image,
+    volumes={"/vol-out": volume_out},
+    timeout=60 * 60,
+    cpu=4.0,
+    memory=16 * 1024,
+)
+def validate_snapshot(snapshot_date: str = "2026-04-28") -> None:
+    """Battery of correctness checks against the built snapshot
+    on /vol-out/var/snapshot/<date>/snapshot.duckdb. Opens read-only
+    so a misbehaving check can't corrupt the file. Each check prints
+    PASS / FAIL with the observed value and the expectation.
+
+    Categories:
+      1. structure: every expected table exists and is BASE TABLE
+      2. counts: row counts match the build log
+      3. window: time-windowed tables have created_at in [lo, hi]
+      4. orphans: every likes/reposts row joins to posts
+      5. uniqueness: posts.uri_id and actors.did_id are unique
+      6. aggregate consistency: post_aggs / actor_aggs sums match sources
+      7. data quality: no NULLs where the schema forbids them
+      8. cross-table join smoke test
+      9. snapshot_metadata is present and labeled correctly
+    """
+    import duckdb
+
+    db_path = f"{OUT_VOL_DIR}/snapshot/{snapshot_date}/snapshot.duckdb"
+    print(f"=== validate {db_path} ===", flush=True)
+    con = duckdb.connect(db_path, read_only=True)
+    con.execute("PRAGMA threads=4")
+
+    expected_counts = {
+        "actors": 24_424_551,
+        "follows": 1_330_346_041,
+        "blocks": 111_021_550,
+        "likes": 586_537_270,
+        "reposts": 94_753_851,
+        "posts": 98_028_415,
+        "actor_aggs": 24_424_551,
+        "post_aggs": 98_028_415,
+    }
+    # Window endpoints come from snapshot_date - 45 / -15 days.
+    window_lo = "2026-03-14 00:00:00"
+    window_hi = "2026-04-13 23:59:59"
+    windowed = ["likes", "reposts", "posts"]
+
+    fails = 0
+
+    def check(name: str, ok: bool, observed, expected=None) -> None:
+        nonlocal fails
+        marker = "PASS" if ok else "FAIL"
+        if not ok:
+            fails += 1
+        if expected is not None:
+            print(
+                f"  [{marker}] {name}: observed={observed}  expected={expected}",
+                flush=True,
+            )
+        else:
+            print(f"  [{marker}] {name}: observed={observed}", flush=True)
+
+    # 1. structure
+    print("\n[1] structure", flush=True)
+    rows = con.execute(
+        "SELECT table_name, table_type FROM information_schema.tables "
+        "WHERE table_schema='main' ORDER BY table_name"
+    ).fetchall()
+    by_name = {n: t for n, t in rows}
+    for t in list(expected_counts.keys()) + ["snapshot_metadata"]:
+        check(f"table {t} exists", t in by_name, by_name.get(t, "MISSING"))
+        if t in by_name:
+            check(
+                f"table {t} is BASE TABLE",
+                by_name[t] == "BASE TABLE",
+                by_name[t],
+                "BASE TABLE",
+            )
+
+    # 2. row counts
+    print("\n[2] row counts", flush=True)
+    for t, exp in expected_counts.items():
+        (n,) = con.execute(f"SELECT COUNT(*) FROM {t}").fetchone()
+        check(f"COUNT({t})", n == exp, f"{n:,}", f"{exp:,}")
+
+    # 3. window enforcement
+    print(f"\n[3] window enforcement [{window_lo}, {window_hi}]", flush=True)
+    for t in windowed:
+        mn, mx = con.execute(
+            f"SELECT MIN(created_at), MAX(created_at) FROM {t}"
+        ).fetchone()
+        check(
+            f"{t}.created_at >= {window_lo}",
+            mn is not None and str(mn) >= window_lo,
+            str(mn),
+            f">= {window_lo}",
+        )
+        check(
+            f"{t}.created_at <= {window_hi}",
+            mx is not None and str(mx) <= window_hi,
+            str(mx),
+            f"<= {window_hi}",
+        )
+
+    # 4. orphan rate
+    print("\n[4] orphan rate (must be 0 after prune)", flush=True)
+    for t in ("likes", "reposts"):
+        (n,) = con.execute(
+            f"SELECT COUNT(*) FROM {t} l "
+            f"WHERE NOT EXISTS (SELECT 1 FROM posts p WHERE p.uri_id = l.subject_uri_id)"
+        ).fetchone()
+        check(f"{t} rows with unresolvable subject_uri_id", n == 0, f"{n:,}", "0")
+
+    # 5. uniqueness
+    print("\n[5] uniqueness", flush=True)
+    (n, d) = con.execute(
+        "SELECT COUNT(*), COUNT(DISTINCT uri_id) FROM posts"
+    ).fetchone()
+    check("posts.uri_id distinct == total", n == d, f"{d:,}", f"{n:,}")
+    (n, d) = con.execute(
+        "SELECT COUNT(*), COUNT(DISTINCT did_id) FROM actors"
+    ).fetchone()
+    check("actors.did_id distinct == total", n == d, f"{d:,}", f"{n:,}")
+
+    # 6. aggregate consistency
+    print("\n[6] aggregate consistency", flush=True)
+    for col, src in [("likes", "likes"), ("reposts", "reposts")]:
+        (s,) = con.execute(f"SELECT SUM({col}) FROM post_aggs").fetchone()
+        (n,) = con.execute(f"SELECT COUNT(*) FROM {src}").fetchone()
+        check(f"SUM(post_aggs.{col}) == COUNT({src})", s == n, f"{s:,}", f"{n:,}")
+    for col, src in [
+        ("follows", "follows"),
+        ("blocks_out", "blocks"),
+        ("likes_out", "likes"),
+        ("reposts_out", "reposts"),
+        ("posts", "posts"),
+    ]:
+        (s,) = con.execute(f"SELECT SUM({col}) FROM actor_aggs").fetchone()
+        (n,) = con.execute(f"SELECT COUNT(*) FROM {src}").fetchone()
+        check(
+            f"SUM(actor_aggs.{col}) == COUNT({src})",
+            s == n,
+            f"{s:,}",
+            f"{n:,}",
+        )
+
+    # 7. data quality
+    print("\n[7] data quality", flush=True)
+    (n,) = con.execute("SELECT COUNT(*) FROM actors WHERE did IS NULL").fetchone()
+    check("actors.did NULLs", n == 0, f"{n:,}", "0")
+    (n,) = con.execute(
+        "SELECT COUNT(*) FROM posts WHERE author_did_id IS NULL"
+    ).fetchone()
+    check("posts.author_did_id NULLs", n == 0, f"{n:,}", "0")
+
+    # 8. cross-table join smoke test
+    print("\n[8] join smoke test", flush=True)
+    (n,) = con.execute(
+        "SELECT COUNT(*) FROM likes l "
+        "JOIN posts p ON p.uri_id = l.subject_uri_id "
+        "JOIN actors a ON a.did_id = p.author_did_id "
+        "WHERE p.created_at >= TIMESTAMP '2026-04-01' "
+        "  AND p.created_at <  TIMESTAMP '2026-04-02'"
+    ).fetchone()
+    check("likes targeting 2026-04-01 posts (join works)", n >= 0, f"{n:,}")
+
+    # 9. snapshot_metadata
+    print("\n[9] snapshot_metadata", flush=True)
+    row = con.execute(
+        "SELECT snapshot_date, at_snapshot_version, duckdb_memory_limit "
+        "FROM snapshot_metadata"
+    ).fetchone()
+    check(
+        "snapshot_metadata.snapshot_date",
+        str(row[0]) == snapshot_date,
+        str(row[0]),
+        snapshot_date,
+    )
+    print(
+        f"  (version={row[1]!r}, duckdb_memory_limit={row[2]!r})",
+        flush=True,
+    )
+
+    print(
+        f"\n=== {'ALL CHECKS PASS' if fails == 0 else f'{fails} FAILURE(S)'} ===",
+        flush=True,
+    )
+
+
+@app.function(
     image=image,
     volumes={"/vol-out": volume_out},
     secrets=[modal.Secret.from_name("atproto-snapshot")],
