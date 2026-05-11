@@ -103,29 +103,6 @@ pub async fn run(cfg: &Config) -> Result<MirrorOutcome> {
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok());
 
-    // No-op fast path: cursor says we're already on the target id
-    // AND the CURRENT marker is present (so the previous run
-    // completed cleanly). If either condition fails, fall through
-    // and let the diff-driven path do its work.
-    if let Some(c) = &existing_cursor {
-        if c.backup_id == Some(target_id) && rocks_dir.join("CURRENT").exists() {
-            tracing::info!(
-                rocks_dir = %rocks_dir.display(),
-                backup_id = target_id,
-                bytes_on_disk = c.bytes_on_disk,
-                "rocks mirror already at target backup_id; no-op"
-            );
-            return Ok(MirrorOutcome {
-                rocks_dir,
-                backup_id: Some(target_id),
-                bytes_on_disk: c.bytes_on_disk,
-                files_skipped: c.file_count,
-                files_downloaded: 0,
-                bytes_downloaded: 0,
-            });
-        }
-    }
-
     tracing::info!(
         source = %cfg.source_url,
         target = %rocks_dir.display(),
@@ -145,9 +122,9 @@ pub async fn run(cfg: &Config) -> Result<MirrorOutcome> {
              eat-rocks rejects these — pick a different backup"
         ));
     }
+    let total_files = meta.files.len();
 
     let plan = plan_incremental(&rocks_dir, &meta)?;
-    let total_files = meta.files.len();
     tracing::info!(
         target_backup_id = target_id,
         total_files,
@@ -158,7 +135,8 @@ pub async fn run(cfg: &Config) -> Result<MirrorOutcome> {
     );
 
     let bytes_downloaded =
-        download_missing(store, plan.download.clone(), &rocks_dir, cfg.mirror_concurrency).await?;
+        download_missing(store, plan.download.clone(), &rocks_dir, cfg.mirror_concurrency)
+            .await?;
 
     // Atomic CURRENT rename. The downloader writes CURRENT to
     // `CURRENT.tmp` so a partial run can't leave behind a CURRENT
@@ -170,6 +148,22 @@ pub async fn run(cfg: &Config) -> Result<MirrorOutcome> {
         std::fs::rename(&current_tmp, &final_current)
             .with_context(|| format!("rename CURRENT.tmp -> CURRENT in {}", rocks_dir.display()))?;
     }
+
+    // Orphan sweep: delete any local file in rocks_dir that the
+    // new meta doesn't reference. Upstream compactions roll old
+    // SSTs into new ones with different content-addressed names;
+    // without this, every incremental run leaves the prior
+    // backup's SSTs behind as ~hundreds of GB of dead weight that
+    // RocksDB will never read (CURRENT now points elsewhere) but
+    // that still bloats the volume and the rocks-→-stage copy.
+    // .cursor is ours and stays. CURRENT was just renamed in.
+    let cleanup_stats = sweep_orphans(&rocks_dir, &meta)?;
+    tracing::info!(
+        deleted_files = cleanup_stats.deleted_files,
+        deleted_bytes = cleanup_stats.deleted_bytes,
+        kept_files = cleanup_stats.kept_files,
+        "orphan sweep done"
+    );
 
     let bytes_on_disk = dir_size_bytes(&rocks_dir);
     let now = chrono::Utc::now().to_rfc3339();
@@ -521,6 +515,60 @@ fn unmangle_shared_checksum(mangled: &str) -> Result<PathBuf> {
         .find('_')
         .ok_or_else(|| anyhow!("shared_checksum no underscore: {mangled}"))?;
     Ok(PathBuf::from(format!("{}.{ext}", &stem[..underscore])))
+}
+
+struct SweepStats {
+    deleted_files: u64,
+    deleted_bytes: u64,
+    kept_files: u64,
+}
+
+/// Delete files in `rocks_dir` that aren't referenced by the new
+/// meta. Anything the meta lists is expected at its
+/// `local_dest_for` path; CURRENT is always preserved (just
+/// renamed from CURRENT.tmp); .cursor is our own bookkeeping.
+/// Subdirectories are not walked — the upstream backup layout is
+/// flat at the destination after `db_filename` unmangling.
+fn sweep_orphans(rocks_dir: &Path, meta: &BackupMeta) -> Result<SweepStats> {
+    let mut keep: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    for f in &meta.files {
+        let dest = local_dest_for(rocks_dir, &f.path)?;
+        // CURRENT lives in `CURRENT.tmp` during download and was
+        // renamed to `CURRENT` just before this sweep — keep the
+        // post-rename name.
+        if dest.file_name().map(|n| n == "CURRENT.tmp").unwrap_or(false) {
+            keep.insert(rocks_dir.join("CURRENT"));
+        } else {
+            keep.insert(dest);
+        }
+    }
+    keep.insert(rocks_dir.join(".cursor"));
+
+    let mut stats = SweepStats {
+        deleted_files: 0,
+        deleted_bytes: 0,
+        kept_files: 0,
+    };
+    for entry in std::fs::read_dir(rocks_dir)
+        .with_context(|| format!("read {}", rocks_dir.display()))?
+    {
+        let entry = entry?;
+        let ft = entry.file_type()?;
+        if !ft.is_file() {
+            continue;
+        }
+        let p = entry.path();
+        if keep.contains(&p) {
+            stats.kept_files += 1;
+            continue;
+        }
+        let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+        std::fs::remove_file(&p)
+            .with_context(|| format!("remove orphan {}", p.display()))?;
+        stats.deleted_files += 1;
+        stats.deleted_bytes += size;
+    }
+    Ok(stats)
 }
 
 fn dir_size_bytes(path: &std::path::Path) -> u64 {
