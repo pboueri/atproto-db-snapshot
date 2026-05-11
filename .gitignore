@@ -7,3 +7,11 @@ __pycache__/
 *.pyc
 *.lock
 !Cargo.lock
+
+# Local copies of HTML produced by `modal run analysis/modal_app.py` —
+# generated artifacts, not source. Patterns are anchored to the repo
+# root so a hand-authored doc anywhere else is unaffected.
+/likes_concentration_*.html
+/ratio_*.html
+/attrition_*.html
+/blocks_cleavage_*.html
