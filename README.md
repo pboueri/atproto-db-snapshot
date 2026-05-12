@@ -1,8 +1,13 @@
 # ATProto Snapshotter
+This is a work in progress. The goal is to reduce the cost of doing high quality analytics on Bluesky
 
-Builds a DuckDB snapshot of the Bluesky social graph from the
+This job produces a public DuckDB snapshot of the Bluesky social graph plus
+post-relationship graph, derived end-to-end from the
 [microcosm.blue constellation](https://tangled.org/microcosm.blue/microcosm-rs)
-backlinks index.
+RocksDB backlinks index.
+
+The current snapshot [is here](https://pub-5ef34deaa1e54c25a97cea1bcfbd6456.r2.dev/atproto-snapshot/snapshot/2026-05-11/snapshot.duckdb) it is about 60GB. It has all actors/blocks/follows and posts/likes are between 2026-02-10 and 2026-05-11 (90 days)
+
 
 ## Tables
 
