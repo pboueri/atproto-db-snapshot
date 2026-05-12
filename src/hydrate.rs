@@ -64,9 +64,32 @@ pub async fn run(cfg: &Config, snapshot_date: &str) -> Result<HydrateOutcome> {
         tracing::info!("chunking disabled (single-shot)");
     }
 
+    // Resolve [WINDOW_LO, WINDOW_HI] used by 02_load_raw.sql to
+    // filter likes / reposts / posts_from_*. When unconfigured we
+    // substitute permissive sentinels so the WHERE clauses in the
+    // SQL become no-ops (BETWEEN epoch AND year-2999 matches every
+    // valid timestamp, including the TID-decode garbage that ranges
+    // up to 2540).
+    let (window_lo, window_hi) = match cfg.hydrate_window(snapshot_date)? {
+        Some((lo, hi)) => {
+            tracing::info!(window_lo = %lo, window_hi = %hi, "hydrate time window");
+            (lo, hi)
+        }
+        None => {
+            tracing::info!("hydrate time window disabled");
+            (
+                "1970-01-01 00:00:00".to_string(),
+                "2999-12-31 23:59:59".to_string(),
+            )
+        }
+    };
+
     let stages_t0 = Instant::now();
     for (label, template) in SQL_STAGES {
-        let body = template.replace("{RAW}", &raw_str);
+        let body = template
+            .replace("{RAW}", &raw_str)
+            .replace("{WINDOW_LO}", &window_lo)
+            .replace("{WINDOW_HI}", &window_hi);
         let stage_t0 = Instant::now();
         tracing::info!(label, "stage start");
         match *label {
@@ -115,6 +138,13 @@ pub async fn run(cfg: &Config, snapshot_date: &str) -> Result<HydrateOutcome> {
         orphan_repost_rate = orphan_repost,
         "orphan rates"
     );
+
+    // FORCE CHECKPOINT before drop so the buffer pool is fully
+    // flushed and the WAL is fsync'd. The 2026-04-28 build produced
+    // blocks with stored_checksum=0 in the posts column data; those
+    // are pages that were allocated but never written, the classic
+    // symptom of a cgroup-pressure abort during shutdown checkpoint.
+    pragma(&conn, "FORCE CHECKPOINT")?;
     drop(conn);
 
     Ok(HydrateOutcome {
@@ -239,6 +269,8 @@ fn write_snapshot_metadata(
 }
 
 fn collect_counts(conn: &Connection) -> Result<Vec<(String, u64)>> {
+    // posts_from_records / posts_from_targets are intentionally
+    // omitted: 03_build_posts.sql DROPs them after `posts` is built.
     let tables = [
         "actors",
         "follows",

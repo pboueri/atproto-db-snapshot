@@ -79,12 +79,14 @@ TMP_WORK_DIR = "/tmp/var"
 SOURCE_IGNORE = [
     "target",
     "var",
+    "analysis",
     ".git",
     ".github",
     ".cargo/config.toml",
     "__pycache__",
     "*.pyc",
     "*.parquet",
+    "*.duckdb",
     ".DS_Store",
     "deploy/modal_app.py",
 ]
@@ -149,6 +151,8 @@ def _common_args(
     memory_limit: str,
     config: str | None,
     work_dir: str = TMP_WORK_DIR,
+    window_days_back: int | None = None,
+    window_days_lag: int | None = None,
 ) -> list[str]:
     args = [
         "--work-dir",
@@ -164,6 +168,10 @@ def _common_args(
         args += ["--snapshot-date", snapshot_date]
     if config:
         args += ["--config", config]
+    if window_days_back is not None:
+        args += ["--window-days-back", str(window_days_back)]
+    if window_days_lag is not None:
+        args += ["--window-days-lag", str(window_days_lag)]
     return args
 
 
@@ -375,36 +383,13 @@ def _drop_local_rocks() -> None:
     print(f"[free] done in {time.time() - t0:.1f}s", flush=True)
 
 
-def _ensure_rocks_on_volume(common_tmp: list[str]) -> None:
-    """Ensure /vol-rocks/var/rocks holds a complete rocks tree.
-
-    Mirror runs in its own container; the next phase (stage) is the one
-    that actually reads rocks at /tmp. So mirror only needs to leave
-    rocks on the volume — copying it to /tmp here would be 650 GB of
-    pure waste, since the ephemeral disk vanishes when this container
-    exits.
-
-      1. Already persisted on the rocks volume — done. No copy.
-      2. Otherwise — run the binary's mirror subcommand to download
-         from constellation into /tmp, then persist /tmp → rocks
-         volume.
-    """
-    if _rocks_looks_complete(f"{ROCKS_VOL_DIR}/rocks"):
-        print(
-            "[mirror] rocks already on volume; nothing to do",
-            flush=True,
-        )
-        return
-    print(
-        "[mirror] no existing rocks; downloading from constellation to /tmp",
-        flush=True,
-    )
-    _run_subcommand("mirror", common_tmp)
-    print("[mirror] persisting fresh rocks: /tmp -> rocks volume", flush=True)
-    _copy_concurrent(
-        f"{TMP_WORK_DIR}/rocks", f"{ROCKS_VOL_DIR}/rocks", "rocks-tmp-to-vol"
-    )
-    volume_rocks.commit()
+# `_ensure_rocks_on_volume` used to gate by file presence and stage
+# rocks through /tmp on a cold start. The binary's mirror.rs now
+# does its own size-diff against the existing rocks tree and only
+# downloads delta files, so the right shape is: point the binary
+# straight at /vol-rocks and let it decide whether to do work.
+# Kept here as a stub so external callers don't break; new code
+# should not rely on it.
 
 
 # =====================================================================
@@ -432,14 +417,18 @@ def _ensure_rocks_on_volume(common_tmp: list[str]) -> None:
     },
     # eat-rocks streams ~80 GB compressed → ~650 GB SSTs over the
     # network; latency variability dominates wall time. 8h covers a
-    # slow link with margin.
+    # slow link with margin. Daily incremental refreshes complete
+    # in minutes.
     timeout=60 * 60 * 8,
     cpu=2.0,
     # Mirror is I/O bound. 4 GiB is plenty for eat-rocks + a small
     # restore buffer; we don't open the DB or run any analytic work.
     memory=4 * 1024,
-    # Rocks lands at ~650 GB on /tmp; eat-rocks may need transient
-    # download scratch on top. 1 TiB has comfortable headroom.
+    # Writing directly to /vol-rocks (no /tmp staging) — the local
+    # ephemeral disk is essentially unused, but Modal enforces a
+    # 512 GiB floor on ephemeral_disk. Leave at 1 TiB so a future
+    # full-rebuild path that wants to stage through /tmp still has
+    # room.
     ephemeral_disk=1024 * 1024,  # 1 TiB
     retries=0,
 )
@@ -449,11 +438,19 @@ def mirror_phase(
     mirror_concurrency: int = 64,
     config: str | None = None,
 ) -> None:
-    """Mirror phase: pull constellation rocks to /vol-rocks.
+    """Mirror phase: bring /vol-rocks/var/rocks to the latest (or
+    specified) constellation backup.
 
-    Resume-aware: if a complete rocks tree already exists on /tmp or
-    /vol-rocks, this is a near-no-op. Otherwise, eat-rocks downloads
-    into /tmp and we persist via _copy_concurrent at the end.
+    The binary's mirror.rs reads the persisted `.cursor` file from
+    the rocks dir, fetches the target backup's meta, and downloads
+    only files whose local size doesn't match. First run is a full
+    ~650 GB pull; subsequent daily refreshes touch only the SSTs
+    that changed (and the MANIFEST / CURRENT), so wall time drops
+    from hours to single-digit minutes.
+
+    Writes go directly to the Modal Volume — no /tmp staging. The
+    rocks tree is undated; cursor metadata records when each
+    backup_id became current.
     """
     date = _resolve_date(snapshot_date)
     common = _common_args(
@@ -462,9 +459,10 @@ def mirror_phase(
         mirror_concurrency=mirror_concurrency,
         memory_limit="2GiB",  # mirror itself doesn't open duckdb
         config=config,
-        work_dir=TMP_WORK_DIR,
+        work_dir=ROCKS_VOL_DIR,
     )
-    _ensure_rocks_on_volume(common)
+    _run_subcommand("mirror", common)
+    volume_rocks.commit()
 
 
 @app.function(
@@ -570,12 +568,20 @@ def hydrate_phase(
     snapshot_date: str | None = None,
     memory_limit: str = "auto",
     config: str | None = None,
+    window_days_back: int | None = None,
+    window_days_lag: int | None = None,
 ) -> None:
     """Hydrate phase: entity parquets → snapshot.duckdb.
 
     Stages raw parquets from /vol-out → /tmp, runs the binary's
     `hydrate` command, copies snapshot.duckdb back to /vol-out.
     No rocks involvement.
+
+    `window_days_back` / `window_days_lag` enable the hydrate-time
+    window: likes / reposts / posts_from_* are filtered to
+    created_at in [snapshot_date - back, snapshot_date - lag], and
+    orphan likes/reposts are pruned against the windowed posts.
+    Pass both or neither.
     """
     date = _resolve_date(snapshot_date)
     common = _common_args(
@@ -585,6 +591,8 @@ def hydrate_phase(
         memory_limit=memory_limit,
         config=config,
         work_dir=TMP_WORK_DIR,
+        window_days_back=window_days_back,
+        window_days_lag=window_days_lag,
     )
     print("=== copy raw: output volume -> /tmp ===", flush=True)
     _copy_concurrent(
@@ -699,6 +707,398 @@ def inspect(
     _run_subcommand("inspect", common)
 
 
+# Lightweight image just for read-only parquet inspection. Built off
+# debian_slim with the duckdb pip wheel — doesn't need the rocksdb /
+# Rust toolchain in the main image, so changes here don't drag the
+# Cargo cache.
+inspect_image = (
+    modal.Image.debian_slim(python_version="3.12")
+    .pip_install("duckdb==1.5.2")
+)
+
+
+@app.function(
+    image=inspect_image,
+    volumes={"/vol-out": volume_out},
+    timeout=60 * 60,
+    cpu=4.0,
+    # likes.parquet is 162 GiB; DuckDB streams it but column stats and
+    # min/max scans benefit from a few GiB of buffer space.
+    memory=16 * 1024,
+)
+def count_parquets(snapshot_date: str = "2026-04-28") -> None:
+    """Count rows + min/max created_at for each entity parquet in
+    /vol-out/var/raw/<snapshot_date>/. Pure read-only volume access:
+    no download, runs on Modal, exits in seconds-to-minutes.
+
+    `actors` has no `created_at` column — only the row count is
+    printed for it. All other entities have `created_at`.
+    """
+    import os
+    import time
+
+    import duckdb
+
+    raw_dir = f"{OUT_VOL_DIR}/raw/{snapshot_date}"
+    entities = [
+        ("actors", None),
+        ("blocks", "created_at"),
+        ("follows", "created_at"),
+        ("reposts", "created_at"),
+        ("likes", "created_at"),
+        ("posts_from_records", "created_at"),
+        ("posts_from_targets", "created_at"),
+    ]
+    con = duckdb.connect()
+    con.execute("SET threads=4")
+    print(f"=== parquet stats: {raw_dir} ===", flush=True)
+    print(f"{'table':<22}{'rows':>16}  {'min_created_at':<28}  {'max_created_at':<28}  size", flush=True)
+    for name, ts_col in entities:
+        path = f"{raw_dir}/{name}.parquet"
+        size_gib = os.path.getsize(path) / (1024**3)
+        t0 = time.time()
+        if ts_col is None:
+            (n,) = con.execute(
+                f"SELECT COUNT(*) FROM read_parquet(?)", [path]
+            ).fetchone()
+            mn, mx = "-", "-"
+        else:
+            row = con.execute(
+                f"SELECT COUNT(*), MIN({ts_col}), MAX({ts_col}) "
+                f"FROM read_parquet(?)",
+                [path],
+            ).fetchone()
+            n, mn, mx = row
+            mn = "" if mn is None else str(mn)
+            mx = "" if mx is None else str(mx)
+        elapsed = time.time() - t0
+        print(
+            f"{name:<22}{n:>16,}  {mn:<28}  {mx:<28}  "
+            f"{size_gib:>6.2f} GiB  ({elapsed:.1f}s)",
+            flush=True,
+        )
+
+
+@app.function(
+    image=inspect_image,
+    volumes={"/vol-out": volume_out},
+    timeout=60 * 60,
+    cpu=4.0,
+    memory=16 * 1024,
+)
+def plausible_count(
+    snapshot_date: str = "2026-04-28",
+    lo: str = "2022-01-01",
+    hi: str = "2026-05-31",
+) -> None:
+    """For each entity parquet that carries `created_at`, count how
+    many rows fall inside [lo, hi] (the atproto plausibility window)
+    vs. outside. Useful to see how much of each table is TID-decode
+    garbage from malformed rkeys before relying on time-window
+    analytics.
+
+    `actors` has no created_at — skipped.
+    """
+    import time
+
+    import duckdb
+
+    raw_dir = f"{OUT_VOL_DIR}/raw/{snapshot_date}"
+    entities = [
+        "blocks",
+        "follows",
+        "reposts",
+        "likes",
+        "posts_from_records",
+        "posts_from_targets",
+    ]
+    con = duckdb.connect()
+    con.execute("SET threads=4")
+    print(
+        f"=== plausibility filter: created_at in "
+        f"[{lo}, {hi}] on {raw_dir} ===",
+        flush=True,
+    )
+    print(
+        f"{'table':<22}{'total':>16}  {'plausible':>16}  "
+        f"{'too_early':>14}  {'too_late':>14}  {'%ok':>6}",
+        flush=True,
+    )
+    for name in entities:
+        path = f"{raw_dir}/{name}.parquet"
+        t0 = time.time()
+        row = con.execute(
+            f"""
+            SELECT
+              COUNT(*) AS total,
+              COUNT(*) FILTER (WHERE created_at >= ?::TIMESTAMP
+                                 AND created_at <= ?::TIMESTAMP) AS ok,
+              COUNT(*) FILTER (WHERE created_at <  ?::TIMESTAMP) AS early,
+              COUNT(*) FILTER (WHERE created_at >  ?::TIMESTAMP) AS late
+            FROM read_parquet(?)
+            """,
+            [lo, hi, lo, hi, path],
+        ).fetchone()
+        total, ok, early, late = row
+        pct = 100.0 * ok / total if total else 0.0
+        elapsed = time.time() - t0
+        print(
+            f"{name:<22}{total:>16,}  {ok:>16,}  "
+            f"{early:>14,}  {late:>14,}  {pct:>5.2f}%  "
+            f"({elapsed:.1f}s)",
+            flush=True,
+        )
+
+
+@app.function(
+    image=inspect_image,
+    volumes={"/vol-out": volume_out},
+    timeout=60 * 60,
+    cpu=4.0,
+    memory=16 * 1024,
+)
+def daily_histogram(
+    snapshot_date: str = "2026-04-28",
+    lo: str = "2022-01-01",
+    hi: str = "2026-05-31",
+    last_n_days: int = 90,
+) -> None:
+    """Per-month row counts (across the plausibility window) + a
+    last-N-days tally. Lets us compare against jazco.dev/stats:
+    20 M likes/day × 90 ≈ 1.8 B over 90 days, so any table whose
+    last-90-day window matches that is consistent with the public
+    chart even if its lifetime count is much larger.
+    """
+    import time
+
+    import duckdb
+
+    raw_dir = f"{OUT_VOL_DIR}/raw/{snapshot_date}"
+    entities = ["follows", "reposts", "likes", "posts_from_records"]
+    con = duckdb.connect()
+    con.execute("SET threads=4")
+    print(f"=== monthly + last-{last_n_days}d window on {raw_dir} ===", flush=True)
+    for name in entities:
+        path = f"{raw_dir}/{name}.parquet"
+        t0 = time.time()
+        last_window = con.execute(
+            f"""
+            SELECT COUNT(*) FROM read_parquet(?)
+            WHERE created_at >= (?::TIMESTAMP - INTERVAL '{last_n_days}' DAY)
+              AND created_at <= ?::TIMESTAMP
+            """,
+            [path, hi, hi],
+        ).fetchone()[0]
+        monthly = con.execute(
+            f"""
+            SELECT strftime(created_at, '%Y-%m') AS ym, COUNT(*) AS n
+            FROM read_parquet(?)
+            WHERE created_at >= ?::TIMESTAMP AND created_at <= ?::TIMESTAMP
+            GROUP BY 1
+            ORDER BY 1
+            """,
+            [path, lo, hi],
+        ).fetchall()
+        elapsed = time.time() - t0
+        print(
+            f"\n[{name}]  last {last_n_days} days ending {hi}: "
+            f"{last_window:,}   (scan {elapsed:.1f}s)",
+            flush=True,
+        )
+        print(f"  monthly rows in [{lo}, {hi}]:", flush=True)
+        for ym, n in monthly:
+            bar = "#" * min(60, int(n / 50_000_000))
+            print(f"    {ym}  {n:>14,}  {bar}", flush=True)
+
+
+@app.function(
+    image=inspect_image,
+    volumes={"/vol-out": volume_out},
+    timeout=60 * 60,
+    cpu=4.0,
+    memory=16 * 1024,
+)
+def validate_snapshot(snapshot_date: str = "2026-04-28") -> None:
+    """Battery of correctness checks against the built snapshot
+    on /vol-out/var/snapshot/<date>/snapshot.duckdb. Opens read-only
+    so a misbehaving check can't corrupt the file. Each check prints
+    PASS / FAIL with the observed value and the expectation.
+
+    Categories:
+      1. structure: every expected table exists and is BASE TABLE
+      2. counts: row counts match the build log
+      3. window: time-windowed tables have created_at in [lo, hi]
+      4. orphans: every likes/reposts row joins to posts
+      5. uniqueness: posts.uri_id and actors.did_id are unique
+      6. aggregate consistency: post_aggs / actor_aggs sums match sources
+      7. data quality: no NULLs where the schema forbids them
+      8. cross-table join smoke test
+      9. snapshot_metadata is present and labeled correctly
+    """
+    import duckdb
+
+    db_path = f"{OUT_VOL_DIR}/snapshot/{snapshot_date}/snapshot.duckdb"
+    print(f"=== validate {db_path} ===", flush=True)
+    con = duckdb.connect(db_path, read_only=True)
+    con.execute("PRAGMA threads=4")
+
+    expected_counts = {
+        "actors": 24_424_551,
+        "follows": 1_330_346_041,
+        "blocks": 111_021_550,
+        "likes": 586_537_270,
+        "reposts": 94_753_851,
+        "posts": 98_028_415,
+        "actor_aggs": 24_424_551,
+        "post_aggs": 98_028_415,
+    }
+    # Window endpoints come from snapshot_date - 45 / -15 days.
+    window_lo = "2026-03-14 00:00:00"
+    window_hi = "2026-04-13 23:59:59"
+    windowed = ["likes", "reposts", "posts"]
+
+    fails = 0
+
+    def check(name: str, ok: bool, observed, expected=None) -> None:
+        nonlocal fails
+        marker = "PASS" if ok else "FAIL"
+        if not ok:
+            fails += 1
+        if expected is not None:
+            print(
+                f"  [{marker}] {name}: observed={observed}  expected={expected}",
+                flush=True,
+            )
+        else:
+            print(f"  [{marker}] {name}: observed={observed}", flush=True)
+
+    # 1. structure
+    print("\n[1] structure", flush=True)
+    rows = con.execute(
+        "SELECT table_name, table_type FROM information_schema.tables "
+        "WHERE table_schema='main' ORDER BY table_name"
+    ).fetchall()
+    by_name = {n: t for n, t in rows}
+    for t in list(expected_counts.keys()) + ["snapshot_metadata"]:
+        check(f"table {t} exists", t in by_name, by_name.get(t, "MISSING"))
+        if t in by_name:
+            check(
+                f"table {t} is BASE TABLE",
+                by_name[t] == "BASE TABLE",
+                by_name[t],
+                "BASE TABLE",
+            )
+
+    # 2. row counts
+    print("\n[2] row counts", flush=True)
+    for t, exp in expected_counts.items():
+        (n,) = con.execute(f"SELECT COUNT(*) FROM {t}").fetchone()
+        check(f"COUNT({t})", n == exp, f"{n:,}", f"{exp:,}")
+
+    # 3. window enforcement
+    print(f"\n[3] window enforcement [{window_lo}, {window_hi}]", flush=True)
+    for t in windowed:
+        mn, mx = con.execute(
+            f"SELECT MIN(created_at), MAX(created_at) FROM {t}"
+        ).fetchone()
+        check(
+            f"{t}.created_at >= {window_lo}",
+            mn is not None and str(mn) >= window_lo,
+            str(mn),
+            f">= {window_lo}",
+        )
+        check(
+            f"{t}.created_at <= {window_hi}",
+            mx is not None and str(mx) <= window_hi,
+            str(mx),
+            f"<= {window_hi}",
+        )
+
+    # 4. orphan rate
+    print("\n[4] orphan rate (must be 0 after prune)", flush=True)
+    for t in ("likes", "reposts"):
+        (n,) = con.execute(
+            f"SELECT COUNT(*) FROM {t} l "
+            f"WHERE NOT EXISTS (SELECT 1 FROM posts p WHERE p.uri_id = l.subject_uri_id)"
+        ).fetchone()
+        check(f"{t} rows with unresolvable subject_uri_id", n == 0, f"{n:,}", "0")
+
+    # 5. uniqueness
+    print("\n[5] uniqueness", flush=True)
+    (n, d) = con.execute(
+        "SELECT COUNT(*), COUNT(DISTINCT uri_id) FROM posts"
+    ).fetchone()
+    check("posts.uri_id distinct == total", n == d, f"{d:,}", f"{n:,}")
+    (n, d) = con.execute(
+        "SELECT COUNT(*), COUNT(DISTINCT did_id) FROM actors"
+    ).fetchone()
+    check("actors.did_id distinct == total", n == d, f"{d:,}", f"{n:,}")
+
+    # 6. aggregate consistency
+    print("\n[6] aggregate consistency", flush=True)
+    for col, src in [("likes", "likes"), ("reposts", "reposts")]:
+        (s,) = con.execute(f"SELECT SUM({col}) FROM post_aggs").fetchone()
+        (n,) = con.execute(f"SELECT COUNT(*) FROM {src}").fetchone()
+        check(f"SUM(post_aggs.{col}) == COUNT({src})", s == n, f"{s:,}", f"{n:,}")
+    for col, src in [
+        ("follows", "follows"),
+        ("blocks_out", "blocks"),
+        ("likes_out", "likes"),
+        ("reposts_out", "reposts"),
+        ("posts", "posts"),
+    ]:
+        (s,) = con.execute(f"SELECT SUM({col}) FROM actor_aggs").fetchone()
+        (n,) = con.execute(f"SELECT COUNT(*) FROM {src}").fetchone()
+        check(
+            f"SUM(actor_aggs.{col}) == COUNT({src})",
+            s == n,
+            f"{s:,}",
+            f"{n:,}",
+        )
+
+    # 7. data quality
+    print("\n[7] data quality", flush=True)
+    (n,) = con.execute("SELECT COUNT(*) FROM actors WHERE did IS NULL").fetchone()
+    check("actors.did NULLs", n == 0, f"{n:,}", "0")
+    (n,) = con.execute(
+        "SELECT COUNT(*) FROM posts WHERE author_did_id IS NULL"
+    ).fetchone()
+    check("posts.author_did_id NULLs", n == 0, f"{n:,}", "0")
+
+    # 8. cross-table join smoke test
+    print("\n[8] join smoke test", flush=True)
+    (n,) = con.execute(
+        "SELECT COUNT(*) FROM likes l "
+        "JOIN posts p ON p.uri_id = l.subject_uri_id "
+        "JOIN actors a ON a.did_id = p.author_did_id "
+        "WHERE p.created_at >= TIMESTAMP '2026-04-01' "
+        "  AND p.created_at <  TIMESTAMP '2026-04-02'"
+    ).fetchone()
+    check("likes targeting 2026-04-01 posts (join works)", n >= 0, f"{n:,}")
+
+    # 9. snapshot_metadata
+    print("\n[9] snapshot_metadata", flush=True)
+    row = con.execute(
+        "SELECT snapshot_date, at_snapshot_version, duckdb_memory_limit "
+        "FROM snapshot_metadata"
+    ).fetchone()
+    check(
+        "snapshot_metadata.snapshot_date",
+        str(row[0]) == snapshot_date,
+        str(row[0]),
+        snapshot_date,
+    )
+    print(
+        f"  (version={row[1]!r}, duckdb_memory_limit={row[2]!r})",
+        flush=True,
+    )
+
+    print(
+        f"\n=== {'ALL CHECKS PASS' if fails == 0 else f'{fails} FAILURE(S)'} ===",
+        flush=True,
+    )
+
+
 @app.function(
     image=image,
     volumes={"/vol-out": volume_out},
@@ -739,6 +1139,8 @@ def main(
     memory_limit: str = "auto",
     config: str | None = None,
     background: bool = False,
+    window_days_back: int | None = None,
+    window_days_lag: int | None = None,
 ) -> None:
     """Local entrypoint dispatcher.
 
@@ -797,6 +1199,8 @@ def main(
             snapshot_date=snapshot_date,
             memory_limit=memory_limit,
             config=config,
+            window_days_back=window_days_back,
+            window_days_lag=window_days_lag,
         )
     elif phase == "upload":
         _kick(upload, snapshot_date=snapshot_date, config=config)

@@ -40,6 +40,19 @@ pub struct Config {
     /// in full but operate on the partial inputs. None = full run.
     #[serde(default)]
     pub hydrate_chunk_dry_run: Option<bool>,
+    /// When set, `likes`, `reposts`, and `posts_from_*` are filtered
+    /// at hydrate time to created_at in
+    /// `[snapshot_date - days_back, snapshot_date - days_lag]`. Also
+    /// drops orphan likes/reposts whose subject_uri_id doesn't match
+    /// any post in the windowed `posts` table. `actors`, `blocks`,
+    /// and `follows` are always loaded in full because they represent
+    /// state, not events. Both bounds must be set together; if either
+    /// is None the window is disabled and the full lifetime of every
+    /// table is loaded (current behavior).
+    #[serde(default)]
+    pub hydrate_window_days_back: Option<u32>,
+    #[serde(default)]
+    pub hydrate_window_days_lag: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -179,7 +192,43 @@ impl Config {
             stage_threads: default_stage_threads(),
             hydrate_chunk_buckets: None,
             hydrate_chunk_dry_run: None,
+            hydrate_window_days_back: None,
+            hydrate_window_days_lag: None,
         }
+    }
+
+    /// Resolve the [lo, hi] timestamp window for hydrate filtering,
+    /// or None when no window is configured. Window endpoints are
+    /// `snapshot_date - days_back` and `snapshot_date - days_lag`.
+    /// Returned strings are SQL-friendly `YYYY-MM-DD HH:MM:SS`.
+    pub fn hydrate_window(&self, snapshot_date: &str) -> Result<Option<(String, String)>> {
+        let (Some(back), Some(lag)) = (
+            self.hydrate_window_days_back,
+            self.hydrate_window_days_lag,
+        ) else {
+            return Ok(None);
+        };
+        if lag >= back {
+            return Err(anyhow!(
+                "hydrate_window_days_lag ({lag}) must be less than \
+                 hydrate_window_days_back ({back})"
+            ));
+        }
+        let snap = chrono::NaiveDate::parse_from_str(snapshot_date, "%Y-%m-%d")
+            .with_context(|| format!("parse snapshot_date {snapshot_date:?}"))?;
+        let lo = snap - chrono::Duration::days(back as i64);
+        let hi = snap - chrono::Duration::days(lag as i64);
+        let fmt = "%Y-%m-%d %H:%M:%S";
+        Ok(Some((
+            lo.and_hms_opt(0, 0, 0)
+                .expect("midnight is always valid")
+                .format(fmt)
+                .to_string(),
+            hi.and_hms_opt(23, 59, 59)
+                .expect("end-of-day is always valid")
+                .format(fmt)
+                .to_string(),
+        )))
     }
 
     pub fn rocks_block_cache_bytes(&self) -> Result<usize> {
@@ -222,7 +271,24 @@ impl Config {
             "auto memory probe"
         );
         const AUTO_MEMORY_LIMIT_CAP: u64 = 128 * 1024 * 1024 * 1024;
-        let target = ((total_bytes as f64 * 0.8) as u64).min(AUTO_MEMORY_LIMIT_CAP);
+        // If we can't read the cgroup ceiling on Linux, sysinfo
+        // reports host RAM (e.g. ~720 GiB on a Modal worker), which
+        // is wildly above the container's actual memory.max. DuckDB
+        // would then accept dirty pages past the cgroup limit and
+        // either OOM-kill mid-write (leaving partially-flushed
+        // blocks with stored_checksum=0 — the symptom seen on the
+        // 2026-04-28 build) or thrash. Refuse to guess: cap at 32
+        // GiB until the operator passes an explicit memory_limit.
+        let target = if cfg!(target_os = "linux") && cgroup_bytes.is_none() {
+            const LINUX_NO_CGROUP_FALLBACK: u64 = 32 * 1024 * 1024 * 1024;
+            tracing::warn!(
+                "cgroup memory limit unreadable on Linux; falling back to 32 GiB. \
+                 Pass --memory-limit explicitly to override."
+            );
+            LINUX_NO_CGROUP_FALLBACK
+        } else {
+            ((total_bytes as f64 * 0.8) as u64).min(AUTO_MEMORY_LIMIT_CAP)
+        };
         let mib = (target / (1024 * 1024)).max(1);
         Ok(format!("{mib}MiB"))
     }

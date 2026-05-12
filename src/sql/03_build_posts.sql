@@ -43,3 +43,26 @@ ranked AS (
   GROUP BY 1
 )
 SELECT * FROM ranked;
+
+-- Reclaim ~80 GB: the from-records / from-targets tables are
+-- staging artifacts. Once `posts` is materialized + checkpointed,
+-- nothing downstream references them.
+CHECKPOINT;
+DROP TABLE posts_from_records;
+DROP TABLE posts_from_targets;
+CHECKPOINT;
+
+-- Prune orphan engagement: any like / repost whose subject_uri_id
+-- doesn't resolve to a row in the (possibly windowed) `posts` table
+-- is dropped. With a hydrate window applied, this drops engagement
+-- targeting older posts that fell outside the window — the operator
+-- chose "engagement on in-window content" over "engagement in
+-- window on any post." Anti-semi-join on a hashed posts.uri_id;
+-- DuckDB plans NOT IN as a hash semijoin in one pass.
+DELETE FROM likes
+  WHERE subject_uri_id NOT IN (SELECT uri_id FROM posts);
+CHECKPOINT;
+
+DELETE FROM reposts
+  WHERE subject_uri_id NOT IN (SELECT uri_id FROM posts);
+CHECKPOINT;
