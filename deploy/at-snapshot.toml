@@ -18,8 +18,12 @@ mirror_concurrency = 64
 # hydrate_chunk_buckets to 100 to validate end-to-end on a 1% slice
 # (~1/100 the cost). Output snapshot is partial — flip both back for a
 # real run.
-hydrate_chunk_buckets = 100
-hydrate_chunk_dry_run  = true
+hydrate_chunk_buckets = 8
+hydrate_chunk_dry_run  = false
+# Windowing: 90-day snapshot ending at snapshot_date.
+# Window = [snapshot_date - 90d, snapshot_date - 0d] = last 90 days.
+hydrate_window_days_back = 90
+hydrate_window_days_lag  = 0
 
 [upload]
 kind       = "r2"
