@@ -16,6 +16,12 @@ pub struct Config {
     pub batch_size: usize,
     #[serde(default = "default_mirror_concurrency")]
     pub mirror_concurrency: usize,
+    /// Verify streaming crc32c of every downloaded byte against the
+    /// manifest, and crc-check pre-existing local SSTs before deciding
+    /// to keep them. Disable for fast warm reruns over a ~650 GB tree
+    /// where the per-file read-back dominates wall time.
+    #[serde(default = "default_mirror_verify")]
+    pub mirror_verify: bool,
     #[serde(default)]
     pub backup_id: Option<u64>,
     #[serde(default)]
@@ -102,6 +108,10 @@ fn default_mirror_concurrency() -> usize {
     32
 }
 
+fn default_mirror_verify() -> bool {
+    true
+}
+
 fn default_upload_concurrency() -> usize {
     8
 }
@@ -186,6 +196,7 @@ impl Config {
             memory_limit: default_memory_limit(),
             batch_size: default_batch_size(),
             mirror_concurrency: default_mirror_concurrency(),
+            mirror_verify: default_mirror_verify(),
             backup_id: None,
             upload: None,
             rocks_block_cache: default_rocks_block_cache(),
