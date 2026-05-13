@@ -327,7 +327,6 @@ dependencies = [
  "bincode",
  "chrono",
  "clap",
- "crc32c",
  "duckdb",
  "eat-rocks",
  "futures",
@@ -815,8 +814,8 @@ dependencies = [
 
 [[package]]
 name = "eat-rocks"
-version = "0.1.1"
-source = "git+https://tangled.org/microcosm.blue/eat-rocks#b2da4a16f245bbfd9413734606836fc2dca12076"
+version = "0.2.0"
+source = "git+https://tangled.org/microcosm.blue/eat-rocks?rev=49a787c2e54adfe6b8a951c2f6e11e14f834cc25#49a787c2e54adfe6b8a951c2f6e11e14f834cc25"
 dependencies = [
  "crc32c",
  "futures",

@@ -100,6 +100,10 @@ pub struct CommonArgs {
     pub source_url: Option<String>,
     #[arg(long)]
     pub mirror_concurrency: Option<usize>,
+    /// Skip crc32c verification in mirror. Lets a warm rerun trust
+    /// local SST sizes instead of reading every file end-to-end.
+    #[arg(long)]
+    pub mirror_no_verify: bool,
     #[arg(long)]
     pub backup_id: Option<u64>,
     /// RocksDB block cache size, e.g. "4GiB". Bigger = fewer disk reads in pass B.
@@ -192,6 +196,9 @@ fn apply_overrides(cfg: &mut Config, args: &CommonArgs) {
     }
     if let Some(c) = args.mirror_concurrency {
         cfg.mirror_concurrency = c;
+    }
+    if args.mirror_no_verify {
+        cfg.mirror_verify = false;
     }
     if let Some(b) = args.backup_id {
         cfg.backup_id = Some(b);

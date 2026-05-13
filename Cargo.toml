@@ -30,8 +30,7 @@ arrow-array = "58"
 arrow-schema = "58"
 duckdb = { version = "1.10502", default-features = false }
 object_store = { version = "0.13", features = ["aws", "http"] }
-eat-rocks = { git = "https://tangled.org/microcosm.blue/eat-rocks", default-features = false, features = ["easy"] }
-crc32c = "0.6"
+eat-rocks = { git = "https://tangled.org/microcosm.blue/eat-rocks", rev = "49a787c2e54adfe6b8a951c2f6e11e14f834cc25", default-features = false, features = ["easy"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 sysinfo = "0.32"
 url = "2"
