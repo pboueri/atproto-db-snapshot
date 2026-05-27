@@ -151,7 +151,11 @@ def analyze_attrition(
     timeout=60 * 60 * 4,
     cpu=8.0,
     memory=64 * 1024,
-    ephemeral_disk=512 * 1024,
+    # Growth unions a year of likes/reposts/follows/posts and materializes
+    # an `all_events` temp table before the ORDER BY did_id, hour_idx
+    # sort. The combined working set + spill exceeded 512 GiB on the
+    # 2026-05-11 snapshot, so we match hydrate's 2 TiB allocation.
+    ephemeral_disk=2 * 1024 * 1024,
 )
 def analyze_growth(
     snapshot_date: str = "2026-04-28",
@@ -166,6 +170,9 @@ def analyze_growth(
     lookback = None if lookback_days <= 0 else lookback_days
     raw_dir = f"{OUT_VOL_DIR}/raw/{snapshot_date}"
     con = _open_snapshot(snapshot_date, memory_limit="56GiB")
+    # Cap DuckDB temp spill below the ephemeral_disk ceiling so it fails
+    # loudly instead of taking the container down on a full /tmp.
+    con.execute("SET max_temp_directory_size='1800GiB'")
     html, sidecar, hero_png = run(
         con, snapshot_date,
         raw_dir=raw_dir,
