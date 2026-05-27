@@ -32,10 +32,13 @@ from analysis.common import OUT_VOL_DIR, persist_artifact
 
 volume_out = modal.Volume.from_name("at-snapshot-output", create_if_missing=False)
 
-# Slim image: duckdb + plotly. Used by likes / ratio / attrition.
+# Slim image: duckdb + plotly. Used by likes / ratio / attrition / growth.
+# Growth needs numpy for the streaming state machine; pulling it into
+# the base image avoids a second image variant.
 analysis_image = (
     modal.Image.debian_slim(python_version="3.12")
-    .pip_install("duckdb==1.5.2", "plotly==5.22.0")
+    .pip_install("duckdb==1.5.2", "plotly==5.22.0", "numpy==1.26.4",
+                 "pyarrow==16.1.0")
     .add_local_python_source("analysis")
 )
 
@@ -128,6 +131,40 @@ def analyze_attrition(
 
 
 @app.function(
+    image=analysis_image,
+    volumes={"/vol-out": volume_out},
+    timeout=60 * 60 * 4,
+    cpu=8.0,
+    memory=64 * 1024,
+    ephemeral_disk=512 * 1024,
+)
+def analyze_growth(
+    snapshot_date: str = "2026-04-28",
+    at_risk_hours: int = 48,
+    churn_days: int = 14,
+    super_threshold: int = 50,
+    super_window_hours: int = 168,
+    existing_baseline_date: str = "2025-01-01",
+    lookback_days: int = 0,  # 0 ⇒ full history sentinel
+) -> bytes:
+    from analysis.growth import run
+    lookback = None if lookback_days <= 0 else lookback_days
+    raw_dir = f"{OUT_VOL_DIR}/raw/{snapshot_date}"
+    con = _open_snapshot(snapshot_date, memory_limit="56GiB")
+    html, sidecar = run(
+        con, snapshot_date,
+        raw_dir=raw_dir,
+        at_risk_hours=at_risk_hours,
+        churn_days=churn_days,
+        super_threshold=super_threshold,
+        super_window_hours=super_window_hours,
+        existing_baseline_date=existing_baseline_date,
+        lookback_days=lookback,
+    )
+    return _persist(snapshot_date, "growth", html, sidecar)
+
+
+@app.function(
     image=spectral_image,
     volumes={"/vol-out": volume_out},
     timeout=60 * 60 * 2,
@@ -180,6 +217,22 @@ _DISPATCH = {
         "vol_path": lambda d: f"/vol-out/var/analysis/{d}/blocks_cleavage.html",
         "kwargs": lambda d, **rest: {"snapshot_date": d},
     },
+    "growth": {
+        "fn": analyze_growth,
+        "out_name": lambda d: f"growth_{d}.html",
+        "vol_path": lambda d: f"/vol-out/var/analysis/{d}/growth.html",
+        "kwargs": lambda d, *, at_risk_hours, churn_days, super_threshold,
+                          super_window_hours, existing_baseline_date,
+                          lookback_days, **rest: {
+            "snapshot_date": d,
+            "at_risk_hours": at_risk_hours,
+            "churn_days": churn_days,
+            "super_threshold": super_threshold,
+            "super_window_hours": super_window_hours,
+            "existing_baseline_date": existing_baseline_date,
+            "lookback_days": lookback_days,
+        },
+    },
 }
 
 
@@ -189,6 +242,12 @@ def main(
     snapshot_date: str = "2026-04-28",
     window_days: int = 90,
     inactivity_days: int = 30,
+    at_risk_hours: int = 48,
+    churn_days: int = 14,
+    super_threshold: int = 50,
+    super_window_hours: int = 168,
+    existing_baseline_date: str = "2025-01-01",
+    lookback_days: int = 0,
     background: bool = False,
 ) -> None:
     """Dispatch to one of the snapshot analyses.
@@ -212,6 +271,12 @@ def main(
         snapshot_date,
         window_days=window_days,
         inactivity_days=inactivity_days,
+        at_risk_hours=at_risk_hours,
+        churn_days=churn_days,
+        super_threshold=super_threshold,
+        super_window_hours=super_window_hours,
+        existing_baseline_date=existing_baseline_date,
+        lookback_days=lookback_days,
     )
     out_name = spec["out_name"](snapshot_date)
     vol_path = spec["vol_path"](snapshot_date)
