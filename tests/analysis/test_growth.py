@@ -284,3 +284,50 @@ def test_growth_hero_png_present(synthetic_con, snapshot_date):
     # or it was unavailable and we got empty bytes — both are acceptable.
     if hero:
         assert hero[:8] == b"\x89PNG\r\n\x1a\n"
+
+
+# ---------------------------------------------------------------------------
+# Vectorized state-machine driver vs per-actor reference path
+# ---------------------------------------------------------------------------
+
+
+def test_vec_matches_serial_on_synthetic(synthetic_con, snapshot_date):
+    """The vectorized driver (n_workers=-1) must produce bitwise-identical
+    pop_delta and equal counters to the per-actor serial driver."""
+    from datetime import datetime
+
+    from analysis import growth as g
+
+    g._materialize_per_hour(
+        synthetic_con,
+        raw_dir=None,
+        snap_ts=f"{snapshot_date} 23:59:59",
+        plausible_lo_ts="2022-01-01 00:00:00",
+        lookback_lo_ts="2022-01-01 00:00:00",
+        log=False,
+    )
+    snap_h = g._to_hour_index(datetime.fromisoformat(f"{snapshot_date}T23:59:59"))
+    baseline_h = g._to_hour_index(datetime.fromisoformat("2025-01-01T00:00:00"))
+
+    kwargs = dict(
+        at_risk_h=48, churn_h=14 * 24,
+        super_h=168, super_thr=50,
+        baseline_h=baseline_h, end_h=snap_h, log=False,
+    )
+    serial = g._run_state_machine(synthetic_con, n_workers=1, **kwargs)
+    vec = g._run_state_machine(synthetic_con, n_workers=-1, **kwargs)
+
+    # pop_delta arrays equal element-by-element
+    assert np.array_equal(serial[0], vec[0]), \
+        "vec pop_delta differs from serial reference"
+    # transitions Counter (after dict-comparable cast)
+    assert dict(serial[1]) == dict(vec[1]), \
+        "vec transitions differ from serial reference"
+    # cohort_outcomes structures equal
+    s_co = {k: dict(v) for k, v in serial[2].items()}
+    v_co = {k: dict(v) for k, v in vec[2].items()}
+    assert s_co == v_co
+    assert dict(serial[3]) == dict(vec[3])
+    assert dict(serial[4]) == dict(vec[4])
+    assert serial[5] == vec[5]
+    assert serial[6] == vec[6]
