@@ -292,52 +292,58 @@ def _materialize_per_hour(
             )
         events_sql = "\n  UNION ALL\n  ".join(parts)
 
+    # Two-step build, no intermediate row-level materialization.
+    #
+    # Earlier this function created a 14.5-billion-row `all_events`
+    # temp table holding raw (did_id, created_at, hour_idx) tuples and
+    # then re-grouped it twice (once for `actor_cohort`, once for
+    # `per_hour_sorted`). At Modal scale that materialization filled
+    # >350 GiB of temp_directory and the subsequent GROUP BY +
+    # ORDER BY tipped the worker over the cgroup limit ("Worker
+    # disappeared").
+    #
+    # Now we go straight from the parquet/table reads into a
+    # `(did_id, hour_idx)` aggregate (`per_hour`), retaining
+    # `MIN(created_at)` per group. The second step adds `cohort_ym`
+    # via a window function — `MIN(hour_min_created) OVER (PARTITION
+    # BY did_id)` is the same value as the old `actor_cohort` MIN-by
+    # group — and sorts to produce the final `per_hour_sorted`. The
+    # `per_hour` aggregate is ~10–20x smaller than `all_events`, which
+    # makes the sort/spill fit comfortably.
     t0 = time.time()
-    # First materialize all_events so the cohort + per-hour passes don't
-    # re-scan the parquets twice.
     con.execute(
         f"""
-        CREATE OR REPLACE TEMPORARY TABLE all_events AS
-        SELECT did_id, created_at,
+        CREATE OR REPLACE TEMPORARY TABLE per_hour AS
+        SELECT did_id,
                DATEDIFF('hour',
                         TIMESTAMP '1970-01-01 00:00:00',
-                        DATE_TRUNC('hour', created_at))::BIGINT AS hour_idx
+                        DATE_TRUNC('hour', created_at))::BIGINT AS hour_idx,
+               COUNT(*)::INT AS n_actions,
+               MIN(created_at) AS hour_min_created
         FROM (
           {events_sql}
         )
         WHERE created_at >= TIMESTAMP '{lookback_lo_ts}'
+        GROUP BY did_id, hour_idx
         """
     )
     if log:
-        n = con.execute("SELECT COUNT(*) FROM all_events").fetchone()[0]
-        print(f"  ({time.time() - t0:.1f}s) all_events rows = {n:,}", flush=True)
-
-    t0 = time.time()
-    con.execute(
-        """
-        CREATE OR REPLACE TEMPORARY TABLE actor_cohort AS
-        SELECT did_id,
-               (EXTRACT(year FROM MIN(created_at)) * 100
-                + EXTRACT(month FROM MIN(created_at)))::INT AS cohort_ym
-        FROM all_events
-        GROUP BY did_id
-        """
-    )
-    if log:
-        print(f"  ({time.time() - t0:.1f}s) actor_cohort built", flush=True)
+        n = con.execute("SELECT COUNT(*) FROM per_hour").fetchone()[0]
+        print(f"  ({time.time() - t0:.1f}s) per_hour rows = {n:,}", flush=True)
 
     t0 = time.time()
     con.execute(
         """
         CREATE OR REPLACE TEMPORARY TABLE per_hour_sorted AS
-        SELECT e.did_id,
-               e.hour_idx,
-               COUNT(*)::INT AS n_actions,
-               c.cohort_ym
-        FROM all_events e
-        JOIN actor_cohort c USING (did_id)
-        GROUP BY e.did_id, e.hour_idx, c.cohort_ym
-        ORDER BY e.did_id, e.hour_idx
+        SELECT did_id,
+               hour_idx,
+               n_actions,
+               (EXTRACT(year FROM MIN(hour_min_created)
+                                  OVER (PARTITION BY did_id)) * 100
+                + EXTRACT(month FROM MIN(hour_min_created)
+                                   OVER (PARTITION BY did_id)))::INT AS cohort_ym
+        FROM per_hour
+        ORDER BY did_id, hour_idx
         """
     )
     if log:
