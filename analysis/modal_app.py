@@ -35,17 +35,21 @@ volume_out = modal.Volume.from_name("at-snapshot-output", create_if_missing=Fals
 # Slim image: duckdb + plotly. Used by likes / ratio / attrition / growth.
 # Growth needs numpy for the streaming state machine; pulling it into
 # the base image avoids a second image variant.
-analysis_image = (
+# NOTE: Modal requires `add_local_*` to be the LAST step in any image
+# chain. We build `_base_pkgs` (no local source) and tack the local
+# source on as the terminal step in each derived image.
+_base_pkgs = (
     modal.Image.debian_slim(python_version="3.12")
     .pip_install("duckdb==1.5.2", "plotly==5.22.0", "numpy==1.26.4",
                  "pyarrow==16.1.0", "kaleido==0.2.1")
-    .add_local_python_source("analysis")
 )
+analysis_image = _base_pkgs.add_local_python_source("analysis")
 
-# Spectral image adds scipy / numpy / pyarrow for the blocks SVD.
+# Spectral image adds scipy for the blocks SVD.
 spectral_image = (
-    analysis_image
-    .pip_install("scipy==1.13.0", "numpy==1.26.4", "pyarrow==16.1.0")
+    _base_pkgs
+    .pip_install("scipy==1.13.0")
+    .add_local_python_source("analysis")
 )
 
 app = modal.App("at-snapshot-analysis")
