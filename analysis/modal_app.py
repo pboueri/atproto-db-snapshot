@@ -38,7 +38,7 @@ volume_out = modal.Volume.from_name("at-snapshot-output", create_if_missing=Fals
 analysis_image = (
     modal.Image.debian_slim(python_version="3.12")
     .pip_install("duckdb==1.5.2", "plotly==5.22.0", "numpy==1.26.4",
-                 "pyarrow==16.1.0")
+                 "pyarrow==16.1.0", "kaleido==0.2.1")
     .add_local_python_source("analysis")
 )
 
@@ -71,9 +71,20 @@ def _open_snapshot(snapshot_date: str, *, memory_limit: str):
     return con
 
 
-def _persist(snapshot_date: str, basename: str, html: bytes, sidecar: dict) -> bytes:
+def _persist(
+    snapshot_date: str,
+    basename: str,
+    html: bytes,
+    sidecar: dict,
+    hero_png: bytes | None = None,
+) -> bytes:
     out_dir = f"{OUT_VOL_DIR}/analysis/{snapshot_date}"
     path = persist_artifact(out_dir, basename, html, sidecar)
+    if hero_png is not None:
+        hero_path = f"{out_dir}/{basename}_hero.png"
+        with open(hero_path, "wb") as f:
+            f.write(hero_png)
+        print(f"=== wrote {hero_path} ({len(hero_png):,} bytes) ===", flush=True)
     volume_out.commit()
     print(f"=== wrote {path} ({len(html):,} bytes) ===", flush=True)
     return html
@@ -151,7 +162,7 @@ def analyze_growth(
     lookback = None if lookback_days <= 0 else lookback_days
     raw_dir = f"{OUT_VOL_DIR}/raw/{snapshot_date}"
     con = _open_snapshot(snapshot_date, memory_limit="56GiB")
-    html, sidecar = run(
+    html, sidecar, hero_png = run(
         con, snapshot_date,
         raw_dir=raw_dir,
         at_risk_hours=at_risk_hours,
@@ -161,7 +172,7 @@ def analyze_growth(
         existing_baseline_date=existing_baseline_date,
         lookback_days=lookback,
     )
-    return _persist(snapshot_date, "growth", html, sidecar)
+    return _persist(snapshot_date, "growth", html, sidecar, hero_png=hero_png)
 
 
 @app.function(

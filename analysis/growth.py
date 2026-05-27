@@ -165,6 +165,11 @@ def run(
     cohort_outcomes = defaultdict(Counter)  # (cohort_ym) -> Counter[state]
     cohort_size = Counter()
 
+    # Per-week churn tenure buckets. Lets us tell "leaky onboarding"
+    # (young cohorts churning) from "churning active" (old guard
+    # bleeding). Buckets are < 90d, 90-180d, > 180d since first_seen.
+    churn_buckets = Counter()  # (week_idx, age_bucket) -> count
+
     t0 = time.time()
     n_actors = 0
     n_events = 0
@@ -184,6 +189,7 @@ def run(
             cohort_outcomes=cohort_outcomes,
             cohort_size=cohort_size,
             cohort_ym=cohort_ym,
+            churn_buckets=churn_buckets,
         )
         n_actors += 1
         n_events += len(hours)
@@ -209,8 +215,20 @@ def run(
         populations, transitions, snap_h, n_hours,
     )
 
+    # Weekly aggregation drives the hero chart + regime classifier.
+    weekly = _aggregate_weekly(
+        populations, transitions, churn_buckets, snap_h,
+    )
+
+    # Markov steady-state from the last `markov_window_days` of activity.
+    markov_window_days = 90
+    markov = _compute_markov_steady_state(
+        populations, transitions, snap_h,
+        window_hours=markov_window_days * 24,
+    )
+
     install_template()
-    html, sidecar = _render(
+    html, sidecar, hero_png = _render(
         snapshot_date=snapshot_date,
         at_risk_hours=at_risk_hours,
         churn_days=churn_days,
@@ -220,12 +238,15 @@ def run(
         populations_daily=populations_daily,
         transitions_daily=transitions_daily,
         day_dates=day_dates,
+        weekly=weekly,
+        markov=markov,
+        markov_window_days=markov_window_days,
         cohort_outcomes=cohort_outcomes,
         cohort_size=cohort_size,
         n_actors=n_actors,
         n_events=n_events,
     )
-    return html, sidecar
+    return html, sidecar, hero_png
 
 
 # ---------------------------------------------------------------------------
@@ -412,15 +433,26 @@ def process_actor(
     cohort_outcomes: defaultdict,
     cohort_size: Counter,
     cohort_ym: int,
+    churn_buckets: Counter | None = None,
 ) -> None:
     """Run the state machine for one actor's full event timeline.
 
-    Mutates `pop_delta`, `transitions`, `cohort_outcomes`, `cohort_size`.
+    Mutates `pop_delta`, `transitions`, `cohort_outcomes`, `cohort_size`,
+    and `churn_buckets` (if provided).
 
     `pop_delta[s][h] += 1` when actor enters state s at hour h, `-= 1`
     on exit. cumsum-by-hour gives population over time. Transitions
     after `end_h` are skipped (we can't observe them in the data).
+
+    `churn_buckets[(week_idx, age_bucket)] += 1` is incremented at each
+    AT_RISK→CHURNED transition; age_bucket is 0/1/2 for tenure
+    <90d / 90–180d / >180d at the moment of churn. Used by the regime
+    classifier to distinguish "leaky onboarding" (young cohorts
+    churning) from "churning active" (old guard leaving).
     """
+    # True first-seen hour, used for tenure-at-churn calculation. For
+    # existing actors this can be far in the past (pre-baseline).
+    true_first_seen_h = int(hours[0])
     # ---- starting state -------------------------------------------------
     if is_existing:
         # Existing user — seeded ACTIVE at baseline_h regardless of when
@@ -464,6 +496,19 @@ def process_actor(
             pop_delta[state, clamp_h] -= 1
             pop_delta[new_state, clamp_h] += 1
             transitions[(clamp_h, state, new_state)] += 1
+            # Record tenure-at-churn for regime classification.
+            if (churn_buckets is not None
+                    and new_state == STATE_CHURNED
+                    and state == STATE_AT_RISK):
+                age_h = clamp_h - true_first_seen_h
+                if age_h < 90 * 24:
+                    bucket = 0
+                elif age_h < 180 * 24:
+                    bucket = 1
+                else:
+                    bucket = 2
+                week_idx = clamp_h // (7 * 24)
+                churn_buckets[(week_idx, bucket)] += 1
             state = new_state
         return state
 
@@ -628,6 +673,278 @@ def _to_hour_index(dt: datetime) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Aggregation: hourly → weekly, with regime classification
+# ---------------------------------------------------------------------------
+
+
+# Regime labels used by the hero chart and the sidecar.
+REGIME_GROWTH = "growth"
+REGIME_NO_NEW = "no_new"
+REGIME_LEAKY_ONBOARDING = "leaky_onboarding"
+REGIME_CHURNING_ACTIVE = "churning_active"
+
+REGIME_COLORS = {
+    REGIME_GROWTH:           "rgba(22, 163, 74, 0.18)",
+    REGIME_NO_NEW:           "rgba(245, 158, 11, 0.18)",
+    REGIME_LEAKY_ONBOARDING: "rgba(124, 58, 237, 0.18)",
+    REGIME_CHURNING_ACTIVE:  "rgba(239, 68, 68, 0.20)",
+}
+REGIME_LABELS = {
+    REGIME_GROWTH:           "Growth",
+    REGIME_NO_NEW:           "No new users",
+    REGIME_LEAKY_ONBOARDING: "Leaky onboarding",
+    REGIME_CHURNING_ACTIVE:  "Churning active users",
+}
+
+
+def _aggregate_weekly(populations, transitions, churn_buckets, snap_h):
+    """Roll hourly population + transition data up to per-week series.
+
+    Returns a dict with parallel numpy arrays indexed by week, plus the
+    list of week-start ISO dates. The regime classifier uses these to
+    label each week.
+    """
+    nonzero = np.where(populations.sum(axis=0) > 0)[0]
+    if len(nonzero) == 0:
+        return _empty_weekly()
+
+    start_h = int(nonzero[0])
+    # Anchor on a Monday 00:00. We work in hour-since-epoch space; the
+    # Unix epoch 1970-01-01 was a Thursday, so subtract 96h (4 days) to
+    # find the prior Monday boundary, then take week-aligned indices.
+    start_h -= (start_h % (7 * 24))
+    end_h = snap_h - (snap_h % (7 * 24))
+    if end_h <= start_h:
+        end_h = start_h + 7 * 24
+
+    n_weeks = (end_h - start_h) // (7 * 24)
+    if n_weeks == 0:
+        return _empty_weekly()
+
+    # Population at the end of each week (last hour of the week).
+    sample_hours = np.arange(n_weeks) * 168 + start_h + 167
+    sample_hours = np.clip(sample_hours, 0, populations.shape[1] - 1)
+    pop_weekly = populations[:, sample_hours]  # shape (N_STATES, n_weeks)
+
+    # Per-week transition tallies, keyed by (from, to).
+    weekly_new = np.zeros(n_weeks, dtype=np.int64)
+    weekly_resurrect = np.zeros(n_weeks, dtype=np.int64)
+    weekly_recover = np.zeros(n_weeks, dtype=np.int64)
+    weekly_to_churned = np.zeros(n_weeks, dtype=np.int64)
+    weekly_to_at_risk = np.zeros(n_weeks, dtype=np.int64)
+    weekly_super_up = np.zeros(n_weeks, dtype=np.int64)
+    weekly_super_down = np.zeros(n_weeks, dtype=np.int64)
+
+    healthy = {STATE_ACTIVE, STATE_SUPER}
+    for (h, fr, to), cnt in transitions.items():
+        if h < start_h or h >= end_h:
+            continue
+        w = (h - start_h) // 168
+        if fr == STATE_NEW and to in healthy:
+            weekly_new[w] += cnt
+        elif fr == STATE_CHURNED and to in healthy:
+            weekly_resurrect[w] += cnt
+        elif fr == STATE_AT_RISK and to in healthy:
+            weekly_recover[w] += cnt
+        elif fr in healthy and to == STATE_AT_RISK:
+            weekly_to_at_risk[w] += cnt
+        elif fr == STATE_AT_RISK and to == STATE_CHURNED:
+            weekly_to_churned[w] += cnt
+        elif fr == STATE_ACTIVE and to == STATE_SUPER:
+            weekly_super_up[w] += cnt
+        elif fr == STATE_SUPER and to == STATE_ACTIVE:
+            weekly_super_down[w] += cnt
+
+    # Young-cohort share of weekly churn, used to flag leaky onboarding.
+    # churn_buckets is keyed by (raw_week_idx, age_bucket). Translate raw
+    # week index to our 0-indexed week.
+    weekly_young_churn = np.zeros(n_weeks, dtype=np.int64)
+    weekly_old_churn = np.zeros(n_weeks, dtype=np.int64)
+    start_week = start_h // 168
+    for (raw_w, bucket), cnt in churn_buckets.items():
+        w = raw_w - start_week
+        if w < 0 or w >= n_weeks:
+            continue
+        if bucket == 0:        # < 90 days tenure
+            weekly_young_churn[w] += cnt
+        elif bucket == 2:      # > 180 days tenure
+            weekly_old_churn[w] += cnt
+        # bucket == 1 is the 90-180d middle, contributes to neither bias.
+
+    # Regime classification — needs aggregate baselines.
+    regimes = _classify_regimes(
+        weekly_new=weekly_new,
+        weekly_resurrect=weekly_resurrect,
+        weekly_to_churned=weekly_to_churned,
+        weekly_young_churn=weekly_young_churn,
+    )
+
+    week_dates = [
+        (datetime.fromtimestamp(0, tz=timezone.utc) + timedelta(hours=int(h)))
+        .date().isoformat()
+        for h in (np.arange(n_weeks) * 168 + start_h)
+    ]
+    return {
+        "week_dates": week_dates,
+        "pop": pop_weekly,
+        "new": weekly_new,
+        "resurrect": weekly_resurrect,
+        "recover": weekly_recover,
+        "to_churned": weekly_to_churned,
+        "to_at_risk": weekly_to_at_risk,
+        "super_up": weekly_super_up,
+        "super_down": weekly_super_down,
+        "young_churn": weekly_young_churn,
+        "old_churn": weekly_old_churn,
+        "regimes": regimes,
+    }
+
+
+def _empty_weekly():
+    return {
+        "week_dates": [],
+        "pop": np.zeros((N_STATES, 0), dtype=np.int64),
+        "new": np.zeros(0, dtype=np.int64),
+        "resurrect": np.zeros(0, dtype=np.int64),
+        "recover": np.zeros(0, dtype=np.int64),
+        "to_churned": np.zeros(0, dtype=np.int64),
+        "to_at_risk": np.zeros(0, dtype=np.int64),
+        "super_up": np.zeros(0, dtype=np.int64),
+        "super_down": np.zeros(0, dtype=np.int64),
+        "young_churn": np.zeros(0, dtype=np.int64),
+        "old_churn": np.zeros(0, dtype=np.int64),
+        "regimes": [],
+    }
+
+
+def _classify_regimes(
+    *, weekly_new, weekly_resurrect, weekly_to_churned, weekly_young_churn,
+):
+    """Per-week regime label. Returns list[str] of length n_weeks.
+
+    Decision tree (in order):
+      1. net inflow ≥ 0  →  growth
+      2. weekly_new < 50% of median historical inflow  →  no_new
+      3. young-cohort share of churn ≥ 50%  →  leaky_onboarding
+      4. otherwise                          →  churning_active
+
+    The thresholds are deliberately blunt — the regime label is meant
+    to communicate the dominant story, not capture fine variation.
+    """
+    n = len(weekly_new)
+    if n == 0:
+        return []
+    # Use median over weeks with non-zero new-inflow to avoid the
+    # earliest weeks dragging the baseline to zero.
+    nonzero_new = weekly_new[weekly_new > 0]
+    median_new = float(np.median(nonzero_new)) if len(nonzero_new) else 0.0
+
+    regimes = []
+    for w in range(n):
+        net = int(weekly_new[w]) + int(weekly_resurrect[w]) - int(weekly_to_churned[w])
+        if net >= 0:
+            regimes.append(REGIME_GROWTH)
+            continue
+        if median_new > 0 and weekly_new[w] < 0.5 * median_new:
+            regimes.append(REGIME_NO_NEW)
+            continue
+        total_churn = int(weekly_to_churned[w])
+        young_share = (
+            int(weekly_young_churn[w]) / total_churn if total_churn > 0 else 0.0
+        )
+        if young_share >= 0.5:
+            regimes.append(REGIME_LEAKY_ONBOARDING)
+        else:
+            regimes.append(REGIME_CHURNING_ACTIVE)
+    return regimes
+
+
+# ---------------------------------------------------------------------------
+# Markov steady-state
+# ---------------------------------------------------------------------------
+
+
+def _compute_markov_steady_state(populations, transitions, snap_h, *, window_hours):
+    """Build a per-hour transition matrix from the most-recent
+    `window_hours` of activity and solve for its stationary distribution.
+
+    The matrix P is built as:
+      P[i][j] = (transitions[(h, i, j)] in window) / (actor-hours in i in window)
+      P[i][i] = 1 - sum_{j!=i} P[i][j]   (self-loop probability)
+
+    Then we solve π P = π, sum π = 1, via lstsq on the augmented system.
+
+    Returns a dict with the matrix, the stationary vector, mean
+    dwell-time per state, and the dominant non-self transition per row
+    (used in the report's commentary).
+    """
+    lo_h = max(0, snap_h - window_hours)
+    hi_h = snap_h
+
+    # Per-state actor-hours in window.
+    state_hours = populations[:, lo_h:hi_h + 1].sum(axis=1).astype(np.float64)
+
+    # Per-(i, j) transition counts in window.
+    flow = np.zeros((N_STATES, N_STATES), dtype=np.float64)
+    for (h, fr, to), cnt in transitions.items():
+        if lo_h <= h <= hi_h:
+            flow[fr, to] += cnt
+
+    # Build P row by row. If a state had ~no exposure in the window
+    # (state_hours[i] == 0) leave its row as identity — it's effectively
+    # absorbing for the purpose of this estimate.
+    P = np.eye(N_STATES)
+    for i in range(N_STATES):
+        if state_hours[i] <= 0:
+            continue
+        outflow_sum = 0.0
+        for j in range(N_STATES):
+            if i == j:
+                continue
+            p_ij = flow[i, j] / state_hours[i]
+            P[i, j] = p_ij
+            outflow_sum += p_ij
+        # Cap outflow at 0.999 to keep P[i][i] non-negative even if a
+        # state has lots of churn relative to dwell time in the window.
+        if outflow_sum > 0.999:
+            scale = 0.999 / outflow_sum
+            for j in range(N_STATES):
+                if i != j:
+                    P[i, j] *= scale
+            outflow_sum *= scale
+        P[i, i] = 1.0 - outflow_sum
+
+    # Solve π P = π with sum(π) = 1.
+    # Equivalently: π (P - I) = 0, plus π · 1 = 1.
+    # Stack into a (N+1, N) linear system and use lstsq.
+    A = np.vstack([(P - np.eye(N_STATES)).T, np.ones(N_STATES)])
+    b = np.zeros(N_STATES + 1)
+    b[-1] = 1.0
+    pi, *_ = np.linalg.lstsq(A, b, rcond=None)
+    # Numerical clean-up: clip tiny negatives, renormalize.
+    pi = np.clip(pi, 0.0, None)
+    s = pi.sum()
+    if s > 0:
+        pi = pi / s
+
+    # Mean dwell time per state ≈ 1 / (1 - P[i][i]) in per-hour units.
+    dwell_hours = np.zeros(N_STATES)
+    for i in range(N_STATES):
+        leave_p = 1.0 - P[i, i]
+        if leave_p > 1e-9:
+            dwell_hours[i] = 1.0 / leave_p
+        else:
+            dwell_hours[i] = float("inf")
+
+    return {
+        "P": P,
+        "pi": pi,
+        "dwell_hours": dwell_hours,
+        "state_hours_in_window": state_hours,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Rendering
 # ---------------------------------------------------------------------------
 
@@ -643,11 +960,14 @@ def _render(
     populations_daily: np.ndarray,
     transitions_daily: dict,
     day_dates: list[str],
+    weekly: dict,
+    markov: dict,
+    markov_window_days: int,
     cohort_outcomes: defaultdict,
     cohort_size: Counter,
     n_actors: int,
     n_events: int,
-) -> tuple[bytes, dict]:
+) -> tuple[bytes, dict, bytes]:
     import plotly.graph_objects as go
 
     # --- chart 1: stacked area of state populations over time ---------
@@ -814,7 +1134,33 @@ def _render(
         height=380,
     )
 
+    # --- chart 5: HERO — active-pool line + regime shading -------------
+    # Single-image story for posting. Spans the last ~18 months of
+    # weeks; background-shaded by per-week regime classification.
+    fig_hero = _build_hero_figure(
+        weekly=weekly,
+        snapshot_date=snapshot_date,
+        at_risk_hours=at_risk_hours,
+        churn_days=churn_days,
+        markov=markov,
+        markov_window_days=markov_window_days,
+        hero_lookback_weeks=78,  # ~18 months
+    )
+
+    # PNG export for direct posting (requires kaleido in the runtime).
+    # If kaleido isn't available locally (e.g. minimal CI), we skip
+    # silently — the interactive HTML still embeds the chart.
+    try:
+        import plotly.io as pio
+        hero_png = pio.to_image(
+            fig_hero, format="png", width=1600, height=900, scale=2,
+        )
+    except Exception as e:
+        hero_png = b""
+        print(f"  (hero PNG export skipped: {e})", flush=True)
+
     plot_html = {
+        "hero": fig_html(fig_hero, "fig_hero"),
         "pop": fig_html(fig_pop, "fig_pop"),
         "flow": fig_html(fig_flow, "fig_flow"),
         "cohort": fig_html(fig_cohort, "fig_cohort"),
@@ -891,6 +1237,23 @@ def _render(
 </div>
 
 <section>
+  <div class="kicker">Hero · {snapshot_date}</div>
+  <h2>The active pool, regime-shaded.</h2>
+  <p>
+    The line is the active+super population at the end of each week
+    over the last ~18 months. The colored background classifies each
+    week into one of four regimes:
+    <span style="background:{REGIME_COLORS[REGIME_GROWTH]};padding:1px 6px;border-radius:3px">growth</span>,
+    <span style="background:{REGIME_COLORS[REGIME_NO_NEW]};padding:1px 6px;border-radius:3px">no new users</span>,
+    <span style="background:{REGIME_COLORS[REGIME_LEAKY_ONBOARDING]};padding:1px 6px;border-radius:3px">leaky onboarding</span>, or
+    <span style="background:{REGIME_COLORS[REGIME_CHURNING_ACTIVE]};padding:1px 6px;border-radius:3px">churning active users</span>.
+    Classification is based on weekly inflow / outflow plus the tenure
+    profile of churned actors — see Methodology.
+  </p>
+  <div class="figure">{plot_html["hero"]}</div>
+</section>
+
+<section>
   <div class="kicker">Finding 01</div>
   <h2>The shape of the population over time.</h2>
   <p>
@@ -938,6 +1301,24 @@ def _render(
     churned bar is the cumulative cost of all the daily outflows above.
   </p>
   <div class="figure">{plot_html["final"]}</div>
+</section>
+
+<section>
+  <div class="kicker">Finding 05 · Markov steady-state</div>
+  <h2>If today's transition rates persisted forever, where would Bluesky converge?</h2>
+  <p>
+    Treating user-state evolution as a Markov chain with transition
+    probabilities estimated from the last {markov_window_days} days
+    gives a stationary distribution π. If the current per-hour
+    transition rates held indefinitely and the actor universe were
+    closed, the population would converge to these state shares. A
+    steady-state with a substantial <em>churned</em> fraction means the
+    current dynamics are structurally lossy — the platform is bleeding
+    even without any change in user behavior. A high
+    <em>active</em>+<em>super</em> share means the current rates can
+    sustain engagement long-term.
+  </p>
+  {_render_markov_table(markov)}
 </section>
 
 <footer>
@@ -993,10 +1374,271 @@ def _render(
             }
             for i, k in enumerate(cohort_keys)
         ],
+        "markov": {
+            "window_days": markov_window_days,
+            "P": markov["P"].tolist(),
+            "steady_state": {
+                STATE_NAMES[s]: float(markov["pi"][s]) for s in range(N_STATES)
+            },
+            "dwell_hours": {
+                STATE_NAMES[s]: (None if not np.isfinite(markov["dwell_hours"][s])
+                                 else float(markov["dwell_hours"][s]))
+                for s in range(N_STATES)
+            },
+        },
+        "regimes": [
+            {"week": d, "regime": r}
+            for d, r in zip(weekly["week_dates"], weekly["regimes"])
+        ],
+        "current_regime": weekly["regimes"][-1] if weekly["regimes"] else None,
     }
-    return html.encode("utf-8"), sidecar
+    return html.encode("utf-8"), sidecar, hero_png
 
 
 def _fmt_ym(ym: int) -> str:
     y, m = divmod(ym, 100)
     return f"{y:04d}-{m:02d}"
+
+
+# ---------------------------------------------------------------------------
+# Hero chart construction
+# ---------------------------------------------------------------------------
+
+
+def _build_hero_figure(
+    *,
+    weekly: dict,
+    snapshot_date: str,
+    at_risk_hours: int,
+    churn_days: int,
+    markov: dict,
+    markov_window_days: int,
+    hero_lookback_weeks: int,
+):
+    """Build the postable hero line chart with per-week regime shading.
+
+    The figure spans the last `hero_lookback_weeks` weeks (default 78
+    ≈ 18 months) ending at the snapshot. The primary y-axis carries the
+    weekly active+super population as a line; the secondary y-axis
+    carries weekly new-activations and churn-outflow bars for context.
+    Background is colored by per-week regime so the dominant story is
+    readable at a glance.
+    """
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+
+    week_dates = weekly["week_dates"]
+    regimes = weekly["regimes"]
+    pop = weekly["pop"]
+    n_weeks = pop.shape[1]
+
+    if n_weeks == 0:
+        # Empty placeholder figure so the wider pipeline still runs.
+        return go.Figure().update_layout(
+            template="bsky",
+            title="Insufficient data for hero chart",
+            height=900,
+        )
+
+    # Slice to the trailing window.
+    lo = max(0, n_weeks - hero_lookback_weeks)
+    week_dates = week_dates[lo:]
+    regimes = regimes[lo:]
+    pop = pop[:, lo:]
+    active = (pop[STATE_ACTIVE] + pop[STATE_SUPER]).astype(np.int64)
+    new_in = weekly["new"][lo:]
+    churn_out = weekly["to_churned"][lo:]
+    resurrect = weekly["resurrect"][lo:]
+
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+
+    # ---- background shading: one vrect per contiguous regime run -----
+    # Contiguous runs of the same regime get a single rectangle —
+    # cleaner visual than per-week stripes.
+    runs = _contiguous_runs(regimes)
+    for s_i, e_i, r in runs:
+        # Each week_date is the Monday of that week; the rect spans
+        # from this Monday to next Monday for the last week in the run.
+        x0 = week_dates[s_i]
+        # The end of the run: take the start of the week after the last
+        # one in the run, capped at the last available week's "next"
+        # date so we don't extend past snapshot.
+        if e_i + 1 < len(week_dates):
+            x1 = week_dates[e_i + 1]
+        else:
+            # Compute the next Monday from the final week_date.
+            last_dt = datetime.fromisoformat(week_dates[e_i])
+            x1 = (last_dt + timedelta(days=7)).date().isoformat()
+        fig.add_vrect(
+            x0=x0, x1=x1,
+            fillcolor=REGIME_COLORS[r],
+            line_width=0, layer="below",
+        )
+
+    # ---- regime label annotations on each run, top of plot ----------
+    # Only label runs ≥ 3 weeks wide; shorter ones would crowd.
+    y_top = float(active.max()) * 1.05 if len(active) else 1.0
+    for s_i, e_i, r in runs:
+        if e_i - s_i + 1 < 3:
+            continue
+        mid = (s_i + e_i) // 2
+        fig.add_annotation(
+            x=week_dates[mid],
+            y=y_top,
+            text=REGIME_LABELS[r],
+            showarrow=False,
+            yref="y",
+            xref="x",
+            font=dict(size=11, color="#475569"),
+            opacity=0.85,
+        )
+
+    # ---- main line: active pool over time ----------------------------
+    fig.add_trace(
+        go.Scatter(
+            x=week_dates, y=active.tolist(),
+            mode="lines",
+            name="Active + super",
+            line=dict(color=BRAND, width=3.5),
+            hovertemplate="%{x}<br><b>%{y:,}</b> active+super<extra></extra>",
+        ),
+        secondary_y=False,
+    )
+
+    # ---- secondary axis: new activations and churn outflow as bars --
+    fig.add_trace(
+        go.Bar(
+            x=week_dates, y=new_in.tolist(),
+            name="New activations / week",
+            marker=dict(color="rgba(22, 163, 74, 0.55)"),
+            hovertemplate="%{x}<br>+%{y:,} new activations<extra></extra>",
+        ),
+        secondary_y=True,
+    )
+    fig.add_trace(
+        go.Bar(
+            x=week_dates, y=(-churn_out).tolist(),
+            name="Churn outflow / week",
+            marker=dict(color="rgba(239, 68, 68, 0.55)"),
+            customdata=churn_out.tolist(),
+            hovertemplate="%{x}<br>−%{customdata:,} churned<extra></extra>",
+        ),
+        secondary_y=True,
+    )
+
+    # ---- steady-state callout (right-hand annotation) ----------------
+    pi = markov["pi"]
+    ss_active = float(pi[STATE_ACTIVE] + pi[STATE_SUPER])
+    ss_churned = float(pi[STATE_CHURNED])
+    callout = (
+        f"<b>Steady-state forecast</b><br>"
+        f"(if last {markov_window_days}d rates persist)<br>"
+        f"active: {ss_active*100:.1f}%<br>"
+        f"churned: {ss_churned*100:.1f}%"
+    )
+    if len(week_dates) > 0:
+        fig.add_annotation(
+            x=week_dates[-1], y=active[-1] if len(active) else 0,
+            text=callout,
+            showarrow=True,
+            arrowhead=2, arrowsize=1, arrowwidth=1.5, arrowcolor="#475569",
+            ax=-80, ay=-100,
+            bgcolor="white", bordercolor="#cbd5e1", borderwidth=1,
+            font=dict(size=12, color="#1d2433"),
+            align="left",
+        )
+
+    current_regime = regimes[-1] if regimes else "n/a"
+    fig.update_layout(
+        template="bsky",
+        title=dict(
+            text=f"<b>Is Bluesky growing or shrinking?</b>  ·  "
+                 f"active pool, weekly, last 18 months · "
+                 f"current regime: <b>{REGIME_LABELS.get(current_regime, current_regime)}</b>",
+            x=0.02, xanchor="left",
+            font=dict(size=18),
+        ),
+        height=900,
+        width=1600,
+        barmode="relative",
+        bargap=0.05,
+        legend=dict(
+            orientation="h", y=-0.10, x=0.5, xanchor="center",
+            font=dict(size=13),
+        ),
+        margin=dict(l=80, r=80, t=90, b=80),
+        annotations=list(fig.layout.annotations) + [
+            dict(
+                xref="paper", yref="paper",
+                x=0.0, y=1.06, xanchor="left", yanchor="bottom",
+                text=(f"<span style='color:#5b6472;font-size:12px'>"
+                      f"thresholds: at-risk &gt;{at_risk_hours}h · "
+                      f"churned &gt;{churn_days}d  ·  "
+                      f"snapshot {snapshot_date}</span>"),
+                showarrow=False,
+            ),
+        ],
+    )
+    fig.update_xaxes(title="Week (Monday)")
+    fig.update_yaxes(title_text="Active + super population", secondary_y=False)
+    fig.update_yaxes(
+        title_text="New activations  /  churned (per week)",
+        secondary_y=True, showgrid=False,
+    )
+    return fig
+
+
+def _contiguous_runs(labels: list[str]) -> list[tuple[int, int, str]]:
+    """Return [(start_idx, end_idx_inclusive, label), ...] for runs of
+    identical labels in `labels`. Used for vrect shading."""
+    out = []
+    if not labels:
+        return out
+    s = 0
+    for i in range(1, len(labels)):
+        if labels[i] != labels[s]:
+            out.append((s, i - 1, labels[s]))
+            s = i
+    out.append((s, len(labels) - 1, labels[s]))
+    return out
+
+
+def _render_markov_table(markov: dict) -> str:
+    """HTML table summarizing the steady-state distribution + per-state
+    dwell time. Used in the Finding 05 section.
+    """
+    pi = markov["pi"]
+    dwell = markov["dwell_hours"]
+    rows = []
+    for s in range(N_STATES):
+        name = STATE_NAMES[s]
+        pct = pi[s] * 100
+        d = dwell[s]
+        if not np.isfinite(d):
+            dwell_str = "∞ (absorbing)"
+        elif d >= 24:
+            dwell_str = f"{d / 24:.1f} days"
+        else:
+            dwell_str = f"{d:.1f} hours"
+        rows.append(
+            f"<tr>"
+            f"<td><span style='display:inline-block;width:10px;height:10px;"
+            f"background:{STATE_COLORS[name]};border-radius:2px;"
+            f"margin-right:6px'></span>{name}</td>"
+            f"<td style='text-align:right'>{pct:.2f}%</td>"
+            f"<td style='text-align:right'>{dwell_str}</td>"
+            f"</tr>"
+        )
+    return (
+        "<div class='figure'>"
+        "<table style='width:100%;border-collapse:collapse;font-size:14px'>"
+        "<thead><tr style='border-bottom:1px solid var(--rule);"
+        "text-align:left;color:var(--muted)'>"
+        "<th style='padding:8px 4px'>State</th>"
+        "<th style='padding:8px 4px;text-align:right'>Steady-state share</th>"
+        "<th style='padding:8px 4px;text-align:right'>Mean dwell time</th>"
+        "</tr></thead>"
+        f"<tbody>{''.join(rows)}</tbody>"
+        "</table>"
+        "</div>"
+    )

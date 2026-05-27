@@ -184,7 +184,7 @@ def test_growth_runs_and_produces_html(synthetic_con, snapshot_date):
     # Synthetic snapshot covers ~1 year ending just before 2026-04-28.
     # Use a baseline of 2025-12-01 so most synthetic actors land as
     # "existing" — exercises both seeding paths.
-    html, sidecar = run(
+    html, sidecar, _hero = run(
         synthetic_con, snapshot_date,
         raw_dir=None,  # use in-DB tables
         at_risk_hours=48,
@@ -221,16 +221,66 @@ def test_growth_runs_and_produces_html(synthetic_con, snapshot_date):
 def test_growth_lookback_filter_drops_events(synthetic_con, snapshot_date):
     # With a tiny lookback (1 day), the synthetic dataset's 365-day spread
     # should leave only a sliver of events.
-    _html, sidecar = run(
+    _html, sidecar, _hero = run(
         synthetic_con, snapshot_date,
         raw_dir=None,
         lookback_days=1,
         log=False,
     )
-    _html_all, sidecar_all = run(
+    _html_all, sidecar_all, _hero_all = run(
         synthetic_con, snapshot_date,
         raw_dir=None,
         lookback_days=None,
         log=False,
     )
     assert sidecar["n_events"] < sidecar_all["n_events"]
+
+
+def test_growth_markov_and_regimes(synthetic_con, snapshot_date):
+    """The Markov section and regime classification show up in the
+    sidecar, and the steady-state is a proper probability distribution.
+    """
+    _html, sidecar, _hero = run(
+        synthetic_con, snapshot_date,
+        raw_dir=None,
+        existing_baseline_date="2025-06-01",
+        log=False,
+    )
+    # Markov stationary is a proper probability distribution.
+    pi = sidecar["markov"]["steady_state"]
+    assert set(pi.keys()) == set(STATE_NAMES)
+    s = sum(pi.values())
+    assert 0.99 < s < 1.01, f"steady-state must sum to ~1, got {s}"
+    for v in pi.values():
+        assert -1e-9 <= v <= 1.0
+
+    # P is a stochastic matrix: rows sum to 1.
+    import numpy as _np
+    P = _np.array(sidecar["markov"]["P"])
+    assert P.shape == (5, 5)
+    row_sums = P.sum(axis=1)
+    assert _np.allclose(row_sums, 1.0, atol=1e-6), f"P rows not stochastic: {row_sums}"
+
+    # Regimes is a list of per-week labels with valid labels only.
+    valid = {"growth", "no_new", "leaky_onboarding", "churning_active"}
+    assert len(sidecar["regimes"]) >= 1
+    for r in sidecar["regimes"]:
+        assert r["regime"] in valid
+        assert isinstance(r["week"], str)
+    assert sidecar["current_regime"] in valid
+
+
+def test_growth_hero_png_present(synthetic_con, snapshot_date):
+    """If kaleido is available, the hero PNG should be valid bytes;
+    if not, an empty bytes object is returned (and the rest still works).
+    """
+    _html, _sc, hero = run(
+        synthetic_con, snapshot_date,
+        raw_dir=None,
+        existing_baseline_date="2025-06-01",
+        log=False,
+    )
+    # Either kaleido produced a real PNG (starts with the PNG magic bytes),
+    # or it was unavailable and we got empty bytes — both are acceptable.
+    if hero:
+        assert hero[:8] == b"\x89PNG\r\n\x1a\n"
