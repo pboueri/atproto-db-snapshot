@@ -55,6 +55,19 @@ from datetime import date, datetime, timedelta, timezone
 
 import numpy as np
 
+try:
+    from numba import njit
+    _HAVE_NUMBA = True
+except ImportError:  # numba unavailable (e.g. py3.14 dev box) — fall back to vec
+    _HAVE_NUMBA = False
+
+    def njit(*args, **kwargs):  # no-op decorator so the module still imports
+        def _wrap(fn):
+            return fn
+        if args and callable(args[0]) and not kwargs:
+            return args[0]
+        return _wrap
+
 from .common import (
     BRAND, SHARED_CSS, built_at_utc, fig_html, fmt_int,
     install_template, plotlyjs_inline, timed_query,
@@ -164,18 +177,19 @@ def run(
         log=log,
     )
 
-    # Default to the fully vectorized numpy path (n_workers=-1). It's
-    # ~5-6x faster than the per-actor serial loop on the synthetic
-    # bench (20k actors, 600k events: 600ms → 110ms) and produces
-    # bitwise-identical pop_delta + counters. Set n_workers=1 to take
-    # the serial reference path or n_workers>1 for chunked
-    # ProcessPoolExecutor fan-out.
+    # Default path selection:
+    #   numba (-2) if the JIT is importable — one compiled pass over all
+    #     actors, handles super natively at C speed (no vec/super split).
+    #   else vec (-1) — fully vectorized 4-state base + per-actor super
+    #     fallback; ~5-6x over the serial loop on the bench.
+    # Set n_workers=1 for the serial reference, >1 for ProcessPoolExecutor.
     if n_workers is None:
-        n_workers = -1
+        n_workers = -2 if _HAVE_NUMBA else -1
 
     if log:
         path_label = (
-            "vec" if n_workers == -1
+            "numba" if n_workers == -2
+            else "vec" if n_workers == -1
             else "serial" if n_workers == 1
             else f"{n_workers}-worker"
         )
@@ -616,6 +630,16 @@ def _run_state_machine(
     n_actors = 0
     n_events = 0
     t0 = time.time()
+
+    if n_workers == -2:
+        # Sentinel: Numba-compiled single-pass kernel over all actors.
+        return _run_state_machine_numba(
+            con,
+            at_risk_h=at_risk_h, churn_h=churn_h,
+            super_h=super_h, super_thr=super_thr,
+            baseline_h=baseline_h, end_h=end_h,
+            log=log,
+        )
 
     if n_workers == -1:
         # Sentinel: take the fully vectorized numpy path. Falls back to
@@ -1088,6 +1112,326 @@ def _run_state_machine_vec(
         )
     return (pop_delta, transitions, cohort_outcomes, cohort_size,
             churn_buckets, n_actors, n_events)
+
+
+# ---------------------------------------------------------------------------
+# Numba-compiled state-machine kernel
+# ---------------------------------------------------------------------------
+
+
+@njit(cache=True, nogil=True)
+def _sm_kernel(
+    seg_starts, seg_lens, is_existing,
+    hours_all, counts_all,
+    at_risk_h, churn_h, super_h, super_thr, baseline_h, end_h,
+    pop_delta, trans_arr, churn_arr, final_state,
+    win_h, win_n,
+):
+    """Compiled per-actor state machine over every actor in one call.
+
+    Direct port of `process_actor` (which remains the readable reference
+    and the equality oracle in the test suite). Writes results into
+    preallocated arrays instead of Python Counters so the whole body is
+    nopython-compilable:
+
+      pop_delta[state, hour]            += / -=  on entry/exit
+      trans_arr[hour, from, to]         += 1     per transition
+      churn_arr[week_idx, age_bucket]   += 1     per AT_RISK→CHURNED
+      final_state[actor]                = state at end_h (-1 if skipped)
+
+    `win_h` / `win_n` are scratch ring buffers sized to the longest
+    actor segment, reused across actors (no per-actor allocation).
+    """
+    n_actors = seg_starts.shape[0]
+    week_div = 7 * 24
+    age_90d = 90 * 24
+    age_180d = 180 * 24
+
+    for ai in range(n_actors):
+        s = seg_starts[ai]
+        ln = seg_lens[ai]
+        first_h = hours_all[s]
+
+        if is_existing[ai]:
+            state = STATE_ACTIVE
+            start_h = baseline_h
+            idx0 = np.searchsorted(hours_all[s:s + ln], baseline_h) + 0
+            last_active_h = -1
+        else:
+            state = STATE_NEW
+            start_h = first_h
+            idx0 = 0
+            last_active_h = first_h
+
+        if start_h > end_h:
+            final_state[ai] = -1
+            continue
+
+        pop_delta[state, start_h] += 1
+
+        win_head = 0
+        win_tail = 0
+        win_sum = 0
+
+        if not is_existing[ai]:
+            win_h[win_tail] = first_h
+            win_n[win_tail] = counts_all[s]
+            win_tail += 1
+            win_sum = counts_all[s]
+            idx0 = 1
+
+        for k in range(idx0, ln):
+            h = hours_all[s + k]
+            n = counts_all[s + k]
+
+            if last_active_h >= 0:
+                at_risk_fire = last_active_h + at_risk_h
+                churn_fire = last_active_h + churn_h
+            elif is_existing[ai]:
+                at_risk_fire = baseline_h + at_risk_h
+                churn_fire = baseline_h + churn_h
+            else:
+                at_risk_fire = -1
+                churn_fire = -1
+
+            if state == STATE_NEW:
+                grad_h = start_h + at_risk_h
+                if h >= grad_h:
+                    if grad_h <= end_h:
+                        pop_delta[state, grad_h] -= 1
+                        pop_delta[STATE_ACTIVE, grad_h] += 1
+                        trans_arr[grad_h, state, STATE_ACTIVE] += 1
+                        state = STATE_ACTIVE
+                    if last_active_h >= 0:
+                        arf = last_active_h + at_risk_h
+                        if (state == STATE_ACTIVE or state == STATE_SUPER) and h >= arf:
+                            if arf <= end_h:
+                                pop_delta[state, arf] -= 1
+                                pop_delta[STATE_AT_RISK, arf] += 1
+                                trans_arr[arf, state, STATE_AT_RISK] += 1
+                                state = STATE_AT_RISK
+                        cf = last_active_h + churn_h
+                        if state == STATE_AT_RISK and h >= cf:
+                            if cf <= end_h:
+                                pop_delta[state, cf] -= 1
+                                pop_delta[STATE_CHURNED, cf] += 1
+                                trans_arr[cf, state, STATE_CHURNED] += 1
+                                age_h = cf - first_h
+                                bkt = 0 if age_h < age_90d else (1 if age_h < age_180d else 2)
+                                churn_arr[cf // week_div, bkt] += 1
+                                state = STATE_CHURNED
+            else:
+                if at_risk_fire >= 0 and h >= at_risk_fire \
+                        and (state == STATE_ACTIVE or state == STATE_SUPER):
+                    if at_risk_fire <= end_h:
+                        pop_delta[state, at_risk_fire] -= 1
+                        pop_delta[STATE_AT_RISK, at_risk_fire] += 1
+                        trans_arr[at_risk_fire, state, STATE_AT_RISK] += 1
+                        state = STATE_AT_RISK
+                if churn_fire >= 0 and h >= churn_fire and state == STATE_AT_RISK:
+                    if churn_fire <= end_h:
+                        pop_delta[state, churn_fire] -= 1
+                        pop_delta[STATE_CHURNED, churn_fire] += 1
+                        trans_arr[churn_fire, state, STATE_CHURNED] += 1
+                        age_h = churn_fire - first_h
+                        bkt = 0 if age_h < age_90d else (1 if age_h < age_180d else 2)
+                        churn_arr[churn_fire // week_div, bkt] += 1
+                        state = STATE_CHURNED
+
+            while win_head < win_tail and win_h[win_head] + super_h <= h:
+                old_h = win_h[win_head]
+                old_n = win_n[win_head]
+                win_head += 1
+                win_sum -= old_n
+                if state == STATE_SUPER and win_sum < super_thr:
+                    expire_h = old_h + super_h
+                    if expire_h <= end_h:
+                        pop_delta[state, expire_h] -= 1
+                        pop_delta[STATE_ACTIVE, expire_h] += 1
+                        trans_arr[expire_h, state, STATE_ACTIVE] += 1
+                        state = STATE_ACTIVE
+
+            if state == STATE_CHURNED or state == STATE_AT_RISK:
+                pop_delta[state, h] -= 1
+                pop_delta[STATE_ACTIVE, h] += 1
+                trans_arr[h, state, STATE_ACTIVE] += 1
+                state = STATE_ACTIVE
+
+            win_h[win_tail] = h
+            win_n[win_tail] = n
+            win_tail += 1
+            win_sum += n
+            if state == STATE_ACTIVE and win_sum >= super_thr:
+                pop_delta[state, h] -= 1
+                pop_delta[STATE_SUPER, h] += 1
+                trans_arr[h, state, STATE_SUPER] += 1
+                state = STATE_SUPER
+            last_active_h = h
+
+        if last_active_h < 0:
+            last_active_h = baseline_h
+
+        if state == STATE_NEW:
+            grad_h = start_h + at_risk_h
+            if end_h >= grad_h:
+                pop_delta[state, grad_h] -= 1
+                pop_delta[STATE_ACTIVE, grad_h] += 1
+                trans_arr[grad_h, state, STATE_ACTIVE] += 1
+                state = STATE_ACTIVE
+
+        if state == STATE_ACTIVE or state == STATE_SUPER:
+            at_risk_fire = last_active_h + at_risk_h
+            decay_horizon = at_risk_fire if at_risk_fire < end_h else end_h
+            while win_head < win_tail and win_h[win_head] + super_h <= decay_horizon:
+                old_h = win_h[win_head]
+                old_n = win_n[win_head]
+                win_head += 1
+                win_sum -= old_n
+                if state == STATE_SUPER and win_sum < super_thr:
+                    expire_h = old_h + super_h
+                    if expire_h <= end_h:
+                        pop_delta[state, expire_h] -= 1
+                        pop_delta[STATE_ACTIVE, expire_h] += 1
+                        trans_arr[expire_h, state, STATE_ACTIVE] += 1
+                        state = STATE_ACTIVE
+            if at_risk_fire <= end_h:
+                pop_delta[state, at_risk_fire] -= 1
+                pop_delta[STATE_AT_RISK, at_risk_fire] += 1
+                trans_arr[at_risk_fire, state, STATE_AT_RISK] += 1
+                state = STATE_AT_RISK
+
+        if state == STATE_AT_RISK:
+            churn_fire = last_active_h + churn_h
+            if churn_fire <= end_h:
+                pop_delta[state, churn_fire] -= 1
+                pop_delta[STATE_CHURNED, churn_fire] += 1
+                trans_arr[churn_fire, state, STATE_CHURNED] += 1
+                age_h = churn_fire - first_h
+                bkt = 0 if age_h < age_90d else (1 if age_h < age_180d else 2)
+                churn_arr[churn_fire // week_div, bkt] += 1
+                state = STATE_CHURNED
+
+        final_state[ai] = state
+
+
+def _run_state_machine_numba(
+    con, *,
+    at_risk_h: int,
+    churn_h: int,
+    super_h: int,
+    super_thr: int,
+    baseline_h: int,
+    end_h: int,
+    log: bool = True,
+) -> tuple:
+    """Numba-backed driver — one compiled pass over every actor.
+
+    Loads `per_hour_sorted` into numpy (same as the vec path), computes
+    per-actor segment offsets, then runs `_sm_kernel` once over all
+    actors. Dense `trans_arr` / `churn_arr` outputs are folded into the
+    Counter / defaultdict structures the renderer expects. Output is
+    bitwise-identical to the per-actor reference (asserted in tests).
+    """
+    if log:
+        print("  numba: loading per_hour_sorted into numpy", flush=True)
+    t_load = time.time()
+    tbl = con.execute(
+        "SELECT did_id, hour_idx, n_actions, cohort_ym FROM per_hour_sorted"
+    ).fetch_arrow_table()
+    did = tbl.column("did_id").to_numpy().astype(np.int64, copy=False)
+    hour = tbl.column("hour_idx").to_numpy().astype(np.int64, copy=False)
+    count = tbl.column("n_actions").to_numpy().astype(np.int64, copy=False)
+    cohort_ym_all = tbl.column("cohort_ym").to_numpy().astype(np.int64, copy=False)
+    n_rows = len(did)
+
+    n_hours_plus_1 = end_h + 2
+    pop_delta = np.zeros((N_STATES, n_hours_plus_1), dtype=np.int64)
+    transitions: Counter = Counter()
+    cohort_outcomes: defaultdict = defaultdict(Counter)
+    cohort_size: Counter = Counter()
+    churn_buckets: Counter = Counter()
+
+    if n_rows == 0:
+        return (pop_delta, transitions, cohort_outcomes, cohort_size,
+                churn_buckets, 0, 0)
+
+    seg_starts = np.concatenate(
+        ([0], np.where(np.diff(did) != 0)[0] + 1)
+    ).astype(np.int64)
+    seg_ends = np.concatenate((seg_starts[1:], [n_rows])).astype(np.int64)
+    seg_lens = (seg_ends - seg_starts).astype(np.int64)
+    n_actors = len(seg_starts)
+    actor_first_hour = hour[seg_starts]
+    actor_cohort = cohort_ym_all[seg_starts]
+    is_existing = (actor_first_hour < baseline_h)
+
+    n_weeks_plus_1 = end_h // (7 * 24) + 2
+    trans_arr = np.zeros((n_hours_plus_1, N_STATES, N_STATES), dtype=np.int64)
+    churn_arr = np.zeros((n_weeks_plus_1, 3), dtype=np.int64)
+    final_state = np.empty(n_actors, dtype=np.int64)
+    max_len = int(seg_lens.max()) + 1
+    win_h = np.empty(max_len, dtype=np.int64)
+    win_n = np.empty(max_len, dtype=np.int64)
+
+    if log:
+        print(
+            f"  numba: loaded {n_rows:,} rows / {n_actors:,} actors "
+            f"in {(time.time() - t_load) * 1000:.0f} ms; "
+            f"trans_arr={trans_arr.nbytes / 1e6:.0f}MB max_seg={max_len}",
+            flush=True,
+        )
+
+    t_run = time.time()
+    _sm_kernel(
+        seg_starts, seg_lens, is_existing,
+        hour, count,
+        at_risk_h, churn_h, super_h, super_thr, baseline_h, end_h,
+        pop_delta, trans_arr, churn_arr, final_state,
+        win_h, win_n,
+    )
+    if log:
+        dt = time.time() - t_run
+        print(
+            f"  numba: kernel ran {n_actors:,} actors in {dt:.2f}s "
+            f"({n_actors / max(dt, 1e-9):,.0f} actor/s, includes JIT warmup)",
+            flush=True,
+        )
+
+    # ---- fold dense outputs into the Counter structures -------------------
+    t_fold = time.time()
+    nz = np.nonzero(trans_arr)
+    nz_vals = trans_arr[nz]
+    for h_v, fr, to, v in zip(nz[0], nz[1], nz[2], nz_vals):
+        transitions[(int(h_v), int(fr), int(to))] = int(v)
+
+    cz = np.nonzero(churn_arr)
+    cz_vals = churn_arr[cz]
+    for w, b, v in zip(cz[0], cz[1], cz_vals):
+        churn_buckets[(int(w), int(b))] = int(v)
+
+    # cohort_size: count non-skipped actors per cohort
+    kept = final_state >= 0
+    u_sz, c_sz = np.unique(actor_cohort[kept], return_counts=True)
+    for ym, c in zip(u_sz, c_sz):
+        cohort_size[int(ym)] = int(c)
+
+    # cohort_outcomes: (cohort, final_state) for kept actors
+    coh_packed = actor_cohort[kept] * N_STATES + final_state[kept]
+    u_co, c_co = np.unique(coh_packed, return_counts=True)
+    for packed_v, cnt in zip(u_co, c_co):
+        ym = int(packed_v) // N_STATES
+        st = int(packed_v) % N_STATES
+        cohort_outcomes[ym][st] += int(cnt)
+
+    if log:
+        print(
+            f"  numba: folded outputs in {time.time() - t_fold:.2f}s "
+            f"({len(transitions):,} transition keys)",
+            flush=True,
+        )
+
+    return (pop_delta, transitions, cohort_outcomes, cohort_size,
+            churn_buckets, n_actors, int(n_rows))
 
 
 def process_actor(

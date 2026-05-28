@@ -41,7 +41,7 @@ volume_out = modal.Volume.from_name("at-snapshot-output", create_if_missing=Fals
 _base_pkgs = (
     modal.Image.debian_slim(python_version="3.12")
     .pip_install("duckdb==1.5.2", "plotly==5.22.0", "numpy==1.26.4",
-                 "pyarrow==16.1.0", "kaleido==0.2.1")
+                 "pyarrow==16.1.0", "kaleido==0.2.1", "numba==0.61.0")
 )
 analysis_image = _base_pkgs.add_local_python_source("analysis")
 
@@ -151,11 +151,15 @@ def analyze_attrition(
     timeout=60 * 60 * 4,
     cpu=8.0,
     memory=64 * 1024,
-    # Growth unions a year of likes/reposts/follows/posts and materializes
-    # an `all_events` temp table before the ORDER BY did_id, hour_idx
-    # sort. The combined working set + spill exceeded 512 GiB on the
-    # 2026-05-11 snapshot, so we match hydrate's 2 TiB allocation.
+    # Growth streams a year of likes/reposts/follows/posts into a
+    # `per_hour` (did_id, hour_idx) aggregate (~2.1B rows on the
+    # 2026-05-11 snapshot) and sorts it. The aggregation + sort spill
+    # to /tmp; 2 TiB matches hydrate and leaves comfortable headroom.
     ephemeral_disk=2 * 1024 * 1024,
+    # The pre-aggregation alone runs ~30 min; a spot preemption wipes it
+    # and restarts from scratch (no DuckDB temp-table checkpoint). Pin
+    # to non-preemptible so a single worker can see the job through.
+    nonpreemptible=True,
 )
 def analyze_growth(
     snapshot_date: str = "2026-04-28",

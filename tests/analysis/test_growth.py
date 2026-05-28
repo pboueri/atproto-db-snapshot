@@ -331,3 +331,54 @@ def test_vec_matches_serial_on_synthetic(synthetic_con, snapshot_date):
     assert dict(serial[4]) == dict(vec[4])
     assert serial[5] == vec[5]
     assert serial[6] == vec[6]
+
+
+def test_numba_matches_serial_on_synthetic(synthetic_con, snapshot_date):
+    """The Numba kernel (n_workers=-2) must produce bitwise-identical
+    pop_delta and equal counters to the per-actor serial driver.
+
+    Skipped where numba isn't importable (e.g. a py3.14 dev box); the
+    Modal image ships py3.12 + numba so it runs there and in CI on a
+    compatible interpreter.
+    """
+    import pytest
+
+    from analysis import growth as g
+
+    if not g._HAVE_NUMBA:
+        pytest.skip("numba not available in this interpreter")
+
+    from datetime import datetime
+
+    g._materialize_per_hour(
+        synthetic_con,
+        raw_dir=None,
+        snap_ts=f"{snapshot_date} 23:59:59",
+        plausible_lo_ts="2022-01-01 00:00:00",
+        lookback_lo_ts="2022-01-01 00:00:00",
+        log=False,
+    )
+    snap_h = g._to_hour_index(datetime.fromisoformat(f"{snapshot_date}T23:59:59"))
+    baseline_h = g._to_hour_index(datetime.fromisoformat("2025-01-01T00:00:00"))
+
+    # super_thr=5 forces meaningful SUPER activity so the kernel's super
+    # promotion/decay branches are exercised, not just the 4-state base.
+    kwargs = dict(
+        at_risk_h=48, churn_h=14 * 24,
+        super_h=168, super_thr=5,
+        baseline_h=baseline_h, end_h=snap_h, log=False,
+    )
+    serial = g._run_state_machine(synthetic_con, n_workers=1, **kwargs)
+    numba = g._run_state_machine(synthetic_con, n_workers=-2, **kwargs)
+
+    assert np.array_equal(serial[0], numba[0]), \
+        "numba pop_delta differs from serial reference"
+    assert dict(serial[1]) == dict(numba[1]), \
+        "numba transitions differ from serial reference"
+    s_co = {k: dict(v) for k, v in serial[2].items()}
+    n_co = {k: dict(v) for k, v in numba[2].items()}
+    assert s_co == n_co
+    assert dict(serial[3]) == dict(numba[3])
+    assert dict(serial[4]) == dict(numba[4])
+    assert serial[5] == numba[5]
+    assert serial[6] == numba[6]
