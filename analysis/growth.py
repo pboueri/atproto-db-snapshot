@@ -2397,66 +2397,66 @@ def _render(
         legend=dict(orientation="h", y=-0.18),
     )
 
-    # --- chart 2: daily net change in Active+Super ---------------------
-    # Decomposition: +new activations, +resurrections (churned->active),
-    # +recoveries (at_risk->active), -active->at_risk, -at_risk->churned.
-    n_days = len(day_dates)
-    inflow_new = np.zeros(n_days, dtype=np.int64)
-    inflow_resurrect = np.zeros(n_days, dtype=np.int64)
-    inflow_recover = np.zeros(n_days, dtype=np.int64)
-    outflow_to_at_risk = np.zeros(n_days, dtype=np.int64)
-    outflow_to_churned = np.zeros(n_days, dtype=np.int64)
-
-    healthy = {STATE_ACTIVE, STATE_SUPER}
-    for (d, fr, to), c in transitions_daily.items():
-        if 0 <= d < n_days:
-            if fr == STATE_NEW and to in healthy:
-                inflow_new[d] += c
-            elif fr == STATE_CHURNED and to in healthy:
-                inflow_resurrect[d] += c
-            elif fr == STATE_AT_RISK and to in healthy:
-                inflow_recover[d] += c
-            elif fr in healthy and to == STATE_AT_RISK:
-                outflow_to_at_risk[d] += c
-            elif fr == STATE_AT_RISK and to == STATE_CHURNED:
-                outflow_to_churned[d] += c
+    # --- chart 2: weekly attributed flow, churn split by tenure --------
+    # Inflows (+): new activations (NEW→ACTIVE), resurrections
+    # (CHURNED→ACTIVE). Outflows (−): churn out of the at-risk pool, split
+    # by tenure-at-churn into "new" (<90d, leaky onboarding) vs "active"
+    # (≥90d, old-guard bleed). Net line = inflows − churn outflows.
+    #
+    # Weekly (not daily) because the tenure split comes from `churn_buckets`,
+    # which the state machine tallies per ISO week. `young_churn` is the
+    # <90d bucket; ≥90d is the remainder of total weekly churn.
+    wk_dates = weekly["week_dates"]
+    wk_new = weekly["new"]
+    wk_resurrect = weekly["resurrect"]
+    wk_churn_total = weekly["to_churned"]
+    wk_churn_new = weekly["young_churn"]            # < 90d tenure
+    wk_churn_active = wk_churn_total - wk_churn_new  # ≥ 90d tenure
+    wk_net = wk_new + wk_resurrect - wk_churn_total
 
     fig_flow = go.Figure()
     fig_flow.add_trace(go.Bar(
-        x=day_dates, y=inflow_new.tolist(),
+        x=wk_dates, y=wk_new.tolist(),
         name="New activations",
         marker=dict(color="#16a34a"),
-        hovertemplate="%{x}<br>+%{y:,} new activations<extra></extra>",
+        hovertemplate="%{x}<br>+%{y:,} new<extra></extra>",
     ))
     fig_flow.add_trace(go.Bar(
-        x=day_dates, y=inflow_resurrect.tolist(),
+        x=wk_dates, y=wk_resurrect.tolist(),
         name="Resurrected (churned→active)",
         marker=dict(color=BRAND),
-        hovertemplate="%{x}<br>+%{y:,} resurrections<extra></extra>",
+        hovertemplate="%{x}<br>+%{y:,} resurrected<extra></extra>",
     ))
     fig_flow.add_trace(go.Bar(
-        x=day_dates, y=inflow_recover.tolist(),
-        name="Recovered (at_risk→active)",
-        marker=dict(color="#7c3aed"),
-        hovertemplate="%{x}<br>+%{y:,} recoveries<extra></extra>",
+        x=wk_dates, y=(-wk_churn_new).tolist(),
+        name="Churned — new (&lt;90d tenure)",
+        marker=dict(color="#f59e0b"),
+        customdata=wk_churn_new.tolist(),
+        hovertemplate="%{x}<br>−%{customdata:,} churned (new)<extra></extra>",
     ))
     fig_flow.add_trace(go.Bar(
-        x=day_dates, y=(-outflow_to_churned).tolist(),
-        name="To churned",
+        x=wk_dates, y=(-wk_churn_active).tolist(),
+        name="Churned — active (≥90d tenure)",
         marker=dict(color="#ef4444"),
-        hovertemplate="%{x}<br>−%{customdata:,} churned<extra></extra>",
-        customdata=outflow_to_churned.tolist(),
+        customdata=wk_churn_active.tolist(),
+        hovertemplate="%{x}<br>−%{customdata:,} churned (active)<extra></extra>",
+    ))
+    fig_flow.add_trace(go.Scatter(
+        x=wk_dates, y=wk_net.tolist(),
+        name="Net (in − churn out)",
+        mode="lines", line=dict(color="#111827", width=2),
+        hovertemplate="%{x}<br>net %{y:,}<extra></extra>",
     ))
     fig_flow.update_layout(
         template="bsky",
         barmode="relative",
         title=dict(
-            text="<b>Daily flow into and out of the active pool</b>  ·  "
-                 "new activations vs. resurrections vs. churn outflow",
+            text="<b>Weekly engagement flow, attributed</b>  ·  "
+                 "new + resurrected in, churn out split by tenure-at-churn",
             x=0.02, xanchor="left",
         ),
-        xaxis=dict(title="Date"),
-        yaxis=dict(title="Net change in active pool"),
+        xaxis=dict(title="Week"),
+        yaxis=dict(title="Actors per week (in +, churn −)"),
         height=420,
         legend=dict(orientation="h", y=-0.18),
     )
@@ -2572,12 +2572,12 @@ def _render(
     final_at_risk = int(final_pop[STATE_AT_RISK])
     final_new = int(final_pop[STATE_NEW])
 
-    # Where did the most recent month's daily flow land?
-    recent_window = min(28, n_days)
-    if recent_window > 0:
-        recent_new = int(inflow_new[-recent_window:].sum())
-        recent_resurrect = int(inflow_resurrect[-recent_window:].sum())
-        recent_to_churned = int(outflow_to_churned[-recent_window:].sum())
+    # Where did the most recent ~4 weeks of flow land? (last 4 weekly buckets)
+    recent_weeks = min(4, len(wk_dates))
+    if recent_weeks > 0:
+        recent_new = int(wk_new[-recent_weeks:].sum())
+        recent_resurrect = int(wk_resurrect[-recent_weeks:].sum())
+        recent_to_churned = int(wk_churn_total[-recent_weeks:].sum())
         net_recent = recent_new + recent_resurrect - recent_to_churned
     else:
         recent_new = recent_resurrect = recent_to_churned = net_recent = 0
@@ -2664,15 +2664,18 @@ def _render(
 
 <section>
   <div class="kicker">Finding 02</div>
-  <h2>What's the daily growth dynamic — new users, resurrections, or churn?</h2>
+  <h2>What's the weekly growth dynamic — and who is churning?</h2>
   <p>
-    This decomposes net change in the active pool every day. <strong>New
-    activations</strong> (green) are first-time graduates. <strong>Resurrections</strong>
-    are previously-churned accounts coming back. <strong>Recoveries</strong> are
-    at-risk users who returned before the {churn_days}d line. The red bar is
-    daily churn flow out of the at-risk pool. If green is shrinking and
-    red is growing, top-of-funnel is collapsing; if green is steady and
-    red is growing, retention is the problem.
+    Each week's inflow and outflow, attributed. Above the line:
+    <strong>new activations</strong> (green, first-time graduates) and
+    <strong>resurrections</strong> (blue, previously-churned accounts
+    coming back). Below the line, churn out of the at-risk pool is split
+    by <em>tenure at the moment of churn</em>: <strong>churned — new</strong>
+    (amber, &lt;90 days since first seen) is leaky onboarding;
+    <strong>churned — active</strong> (red, ≥90 days) is the long-tenured
+    base bleeding out. The black line is the net (new + resurrected −
+    churn). If amber dominates, top-of-funnel is leaking; if red grows,
+    the established base is the problem.
   </p>
   <div class="figure">{plot_html["flow"]}</div>
 </section>
