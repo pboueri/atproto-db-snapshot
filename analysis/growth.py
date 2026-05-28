@@ -47,6 +47,8 @@ from __future__ import annotations
 import concurrent.futures as _futures
 import multiprocessing as _mp
 import os
+import shutil
+import threading
 import time
 from collections import Counter, defaultdict
 from datetime import date, datetime, timedelta, timezone
@@ -241,6 +243,67 @@ def run(
 
 
 # ---------------------------------------------------------------------------
+# Resource monitor: visibility into RSS + /tmp during long DuckDB queries
+# ---------------------------------------------------------------------------
+
+
+def _resource_snapshot(tmp_dir: str = "/tmp") -> str:
+    """One-line summary of process RSS + temp-dir disk usage.
+
+    Used by the in-DuckDB-query monitor thread so long-running
+    aggregations don't look hung — when a CREATE TABLE silently
+    GROUP-BYs a year of events the only signal we get is RSS climbing
+    + tmp filling up. Reads /proc/self/status on Linux (the only place
+    we run this in anger); falls back to zero on macOS/anywhere it
+    isn't available.
+    """
+    try:
+        with open("/proc/self/status") as f:
+            rss_gib = 0.0
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    rss_gib = int(line.split()[1]) / (1024 * 1024)
+                    break
+    except (FileNotFoundError, PermissionError, OSError):
+        rss_gib = 0.0
+    try:
+        tot, used, free = shutil.disk_usage(tmp_dir)
+        disk = f"{tmp_dir} used={used / 1e9:.0f}GB free={free / 1e9:.0f}GB"
+    except OSError:
+        disk = f"{tmp_dir} <unavailable>"
+    return f"rss={rss_gib:.1f}GiB {disk}"
+
+
+def _start_resource_monitor(
+    label: str, *, interval_sec: float = 30.0, tmp_dir: str = "/tmp",
+) -> threading.Event:
+    """Spawn a daemon thread that prints `_resource_snapshot()` every N sec.
+
+    Returns a stop event; caller sets it to terminate the loop.
+    """
+    stop = threading.Event()
+
+    def _loop():
+        t0 = time.time()
+        # Immediate snapshot so the start state is visible alongside
+        # the operation's begin log line.
+        print(
+            f"  [res {label} t+0s] {_resource_snapshot(tmp_dir)}",
+            flush=True,
+        )
+        while not stop.wait(interval_sec):
+            dt = int(time.time() - t0)
+            print(
+                f"  [res {label} t+{dt}s] {_resource_snapshot(tmp_dir)}",
+                flush=True,
+            )
+
+    th = threading.Thread(target=_loop, daemon=True, name=f"resmon-{label}")
+    th.start()
+    return stop
+
+
+# ---------------------------------------------------------------------------
 # DuckDB pre-aggregation
 # ---------------------------------------------------------------------------
 
@@ -310,46 +373,81 @@ def _materialize_per_hour(
     # group — and sorts to produce the final `per_hour_sorted`. The
     # `per_hour` aggregate is ~10–20x smaller than `all_events`, which
     # makes the sort/spill fit comfortably.
-    t0 = time.time()
-    con.execute(
-        f"""
-        CREATE OR REPLACE TEMPORARY TABLE per_hour AS
-        SELECT did_id,
-               DATEDIFF('hour',
-                        TIMESTAMP '1970-01-01 00:00:00',
-                        DATE_TRUNC('hour', created_at))::BIGINT AS hour_idx,
-               COUNT(*)::INT AS n_actions,
-               MIN(created_at) AS hour_min_created
-        FROM (
-          {events_sql}
-        )
-        WHERE created_at >= TIMESTAMP '{lookback_lo_ts}'
-        GROUP BY did_id, hour_idx
-        """
-    )
     if log:
-        n = con.execute("SELECT COUNT(*) FROM per_hour").fetchone()[0]
-        print(f"  ({time.time() - t0:.1f}s) per_hour rows = {n:,}", flush=True)
+        try:
+            cpu = os.cpu_count() or 0
+            mem_gib = (os.sysconf("SC_PHYS_PAGES")
+                       * os.sysconf("SC_PAGE_SIZE")) / (1024 ** 3)
+        except (AttributeError, ValueError, OSError):
+            cpu, mem_gib = 0, 0.0
+        print(
+            f"  [env] cpu_count={cpu} host_mem={mem_gib:.0f}GiB  "
+            f"start: {_resource_snapshot('/tmp')}",
+            flush=True,
+        )
 
     t0 = time.time()
-    con.execute(
-        """
-        CREATE OR REPLACE TEMPORARY TABLE per_hour_sorted AS
-        SELECT did_id,
-               hour_idx,
-               n_actions,
-               (EXTRACT(year FROM MIN(hour_min_created)
-                                  OVER (PARTITION BY did_id)) * 100
-                + EXTRACT(month FROM MIN(hour_min_created)
-                                   OVER (PARTITION BY did_id)))::INT AS cohort_ym
-        FROM per_hour
-        ORDER BY did_id, hour_idx
-        """
-    )
+    stop = _start_resource_monitor("per_hour") if log else None
+    try:
+        con.execute(
+            f"""
+            CREATE OR REPLACE TEMPORARY TABLE per_hour AS
+            SELECT did_id,
+                   DATEDIFF('hour',
+                            TIMESTAMP '1970-01-01 00:00:00',
+                            DATE_TRUNC('hour', created_at))::BIGINT AS hour_idx,
+                   COUNT(*)::INT AS n_actions,
+                   MIN(created_at) AS hour_min_created
+            FROM (
+              {events_sql}
+            )
+            WHERE created_at >= TIMESTAMP '{lookback_lo_ts}'
+            GROUP BY did_id, hour_idx
+            """
+        )
+    finally:
+        if stop is not None:
+            stop.set()
+    if log:
+        n = con.execute("SELECT COUNT(*) FROM per_hour").fetchone()[0]
+        print(
+            f"  ({time.time() - t0:.1f}s) per_hour rows = {n:,}  "
+            f"end: {_resource_snapshot('/tmp')}",
+            flush=True,
+        )
+
+    t0 = time.time()
+    stop = _start_resource_monitor("per_hour_sorted") if log else None
+    try:
+        con.execute(
+            """
+            CREATE OR REPLACE TEMPORARY TABLE per_hour_sorted AS
+            SELECT did_id,
+                   hour_idx,
+                   n_actions,
+                   (EXTRACT(year FROM MIN(hour_min_created)
+                                      OVER (PARTITION BY did_id)) * 100
+                    + EXTRACT(month FROM MIN(hour_min_created)
+                                       OVER (PARTITION BY did_id)))::INT AS cohort_ym
+            FROM per_hour
+            ORDER BY did_id, hour_idx
+            """
+        )
+    finally:
+        if stop is not None:
+            stop.set()
     if log:
         n = con.execute("SELECT COUNT(*) FROM per_hour_sorted").fetchone()[0]
         print(
-            f"  ({time.time() - t0:.1f}s) per_hour_sorted rows = {n:,}",
+            f"  ({time.time() - t0:.1f}s) per_hour_sorted rows = {n:,}  "
+            f"end: {_resource_snapshot('/tmp')}",
+            flush=True,
+        )
+        # Drop the now-redundant intermediate to free /tmp before the
+        # state-machine load — per_hour_sorted has everything we need.
+        con.execute("DROP TABLE per_hour")
+        print(
+            f"  dropped per_hour; {_resource_snapshot('/tmp')}",
             flush=True,
         )
 
