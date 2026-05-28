@@ -382,3 +382,65 @@ def test_numba_matches_serial_on_synthetic(synthetic_con, snapshot_date):
     assert dict(serial[4]) == dict(numba[4])
     assert serial[5] == numba[5]
     assert serial[6] == numba[6]
+
+
+def test_state_log_reconstructs_pop_delta(synthetic_con, snapshot_date, tmp_path):
+    """The per-user state-interval log must reconstruct exactly the same
+    pop_delta the kernel produced — cross-validates `_sm_state_log_kernel`
+    against `_sm_kernel`. Forward-filling the (did, hour, state) records
+    is the inverse of the population deltas."""
+    import pytest
+
+    from analysis import growth as g
+
+    if not g._HAVE_NUMBA:
+        pytest.skip("numba not available in this interpreter")
+
+    from datetime import datetime
+
+    import pyarrow.parquet as pq
+
+    g._materialize_per_hour(
+        synthetic_con, raw_dir=None,
+        snap_ts=f"{snapshot_date} 23:59:59",
+        plausible_lo_ts="2022-01-01 00:00:00",
+        lookback_lo_ts="2022-01-01 00:00:00",
+        log=False,
+    )
+    snap_h = g._to_hour_index(datetime.fromisoformat(f"{snapshot_date}T23:59:59"))
+    baseline_h = g._to_hour_index(datetime.fromisoformat("2025-01-01T00:00:00"))
+
+    log_path = str(tmp_path / "state_log.parquet")
+    kwargs = dict(
+        at_risk_h=48, churn_h=14 * 24, super_h=168, super_thr=5,
+        baseline_h=baseline_h, end_h=snap_h, log=False,
+    )
+    numba = g._run_state_machine(
+        synthetic_con, n_workers=-2, state_log_path=log_path, **kwargs,
+    )
+    pop_delta = numba[0]
+
+    tbl = pq.read_table(log_path)
+    did = tbl.column("did_id").to_numpy()
+    hour = tbl.column("hour_idx").to_numpy()
+    state = tbl.column("state").to_numpy()
+
+    # Reconstruct pop_delta by forward-filling each actor's intervals.
+    recon = np.zeros_like(pop_delta)
+    prev_state = -1
+    prev_did = None
+    for i in range(len(did)):
+        d, h, s = int(did[i]), int(hour[i]), int(state[i])
+        if d != prev_did:  # first record for this actor → initial entry
+            recon[s, h] += 1
+            prev_did = d
+        else:  # transition: exit prev state, enter new state at this hour
+            recon[prev_state, h] -= 1
+            recon[s, h] += 1
+        prev_state = s
+
+    assert np.array_equal(recon, pop_delta), \
+        "state-log forward-fill does not reconstruct kernel pop_delta"
+
+    # state values are valid; records sorted by (did, hour) within actor.
+    assert set(np.unique(state).tolist()).issubset(set(range(N_STATES)))

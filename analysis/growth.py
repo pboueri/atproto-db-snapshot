@@ -118,6 +118,7 @@ def run(
     lookback_days: int | None = None,
     n_workers: int | None = None,
     chunk_size: int = 4_000,
+    state_log_path: str | None = None,
     log: bool = True,
 ) -> tuple[bytes, dict]:
     """Build the growth-model HTML + JSON sidecar.
@@ -211,6 +212,7 @@ def run(
         end_h=snap_h,
         n_workers=n_workers,
         chunk_size=chunk_size,
+        state_log_path=state_log_path,
         log=log,
     )
 
@@ -608,6 +610,7 @@ def _run_state_machine(
     end_h: int,
     n_workers: int = 1,
     chunk_size: int = 4_000,
+    state_log_path: str | None = None,
     log: bool = True,
 ) -> tuple:
     """Drive the per-actor state machine; return accumulated counters.
@@ -619,6 +622,9 @@ def _run_state_machine(
     tests and small inputs). `n_workers>1` farms chunks of actors out
     to a ProcessPoolExecutor with bounded backpressure (queue depth
     capped at 2x worker count) so memory stays flat.
+
+    `state_log_path` (numba path only) writes the per-user state-interval
+    parquet as a side effect.
     """
     n_hours_plus_1 = end_h + 2
     pop_delta = np.zeros((N_STATES, n_hours_plus_1), dtype=np.int64)
@@ -638,7 +644,15 @@ def _run_state_machine(
             at_risk_h=at_risk_h, churn_h=churn_h,
             super_h=super_h, super_thr=super_thr,
             baseline_h=baseline_h, end_h=end_h,
+            state_log_path=state_log_path,
             log=log,
+        )
+    elif state_log_path is not None:
+        raise ValueError(
+            "state_log_path requires the numba path (n_workers=-2); "
+            "numba is unavailable in this interpreter"
+            if not _HAVE_NUMBA else
+            "state_log_path requires n_workers=-2 (numba)"
         )
 
     if n_workers == -1:
@@ -1314,6 +1328,274 @@ def _sm_kernel(
         final_state[ai] = state
 
 
+@njit(cache=True, nogil=True)
+def _sm_state_log_kernel(
+    seg_starts, seg_lens, is_existing, did_all,
+    hours_all, counts_all,
+    at_risk_h, churn_h, super_h, super_thr, baseline_h, end_h,
+    count_only, out_did, out_hour, out_state, out_trail,
+    win_h, win_n,
+):
+    """Emit the per-user state-interval log.
+
+    Mirrors `_sm_kernel`'s transition logic *exactly*, but instead of
+    accumulating population deltas it appends one record per state
+    *entry*: (did_id, hour_idx, state, trailing_actions). The first
+    record per actor is their initial state; each subsequent record is
+    a transition destination. Forward-filling between consecutive
+    records of the same actor reconstructs the dense hourly state.
+
+    `trailing_actions` is `win_sum` — the actor's action count in the
+    trailing `super_h` window at the moment of the record — a coarse
+    engagement / action-rate signal sampled at each state change
+    (rate ≈ trailing_actions / super_h actions·hr⁻¹). For a dense rate
+    over arbitrary windows, use the companion raw `per_hour` parquet.
+
+    Two-pass: call with `count_only=True` (dummy out arrays) to get the
+    total record count, allocate exactly, then call with
+    `count_only=False`. Returns the number of records emitted.
+
+    Kept in lock-step with `_sm_kernel`; the test suite reconstructs
+    pop_delta from this log and asserts equality with `_sm_kernel`.
+    """
+    n_actors = seg_starts.shape[0]
+    wptr = 0
+
+    for ai in range(n_actors):
+        s = seg_starts[ai]
+        ln = seg_lens[ai]
+        first_h = hours_all[s]
+        did = did_all[s]
+
+        if is_existing[ai]:
+            state = STATE_ACTIVE
+            start_h = baseline_h
+            idx0 = np.searchsorted(hours_all[s:s + ln], baseline_h) + 0
+            last_active_h = -1
+        else:
+            state = STATE_NEW
+            start_h = first_h
+            idx0 = 0
+            last_active_h = first_h
+
+        if start_h > end_h:
+            continue
+
+        win_head = 0
+        win_tail = 0
+        win_sum = 0
+
+        if not is_existing[ai]:
+            win_h[win_tail] = first_h
+            win_n[win_tail] = counts_all[s]
+            win_tail += 1
+            win_sum = counts_all[s]
+            idx0 = 1
+
+        # initial entry
+        if not count_only:
+            out_did[wptr] = did
+            out_hour[wptr] = start_h
+            out_state[wptr] = state
+            out_trail[wptr] = win_sum
+        wptr += 1
+
+        for k in range(idx0, ln):
+            h = hours_all[s + k]
+            n = counts_all[s + k]
+
+            if last_active_h >= 0:
+                at_risk_fire = last_active_h + at_risk_h
+                churn_fire = last_active_h + churn_h
+            elif is_existing[ai]:
+                at_risk_fire = baseline_h + at_risk_h
+                churn_fire = baseline_h + churn_h
+            else:
+                at_risk_fire = -1
+                churn_fire = -1
+
+            if state == STATE_NEW:
+                grad_h = start_h + at_risk_h
+                if h >= grad_h:
+                    if grad_h <= end_h:
+                        state = STATE_ACTIVE
+                        if not count_only:
+                            out_did[wptr] = did; out_hour[wptr] = grad_h
+                            out_state[wptr] = state; out_trail[wptr] = win_sum
+                        wptr += 1
+                    if last_active_h >= 0:
+                        arf = last_active_h + at_risk_h
+                        if (state == STATE_ACTIVE or state == STATE_SUPER) and h >= arf:
+                            if arf <= end_h:
+                                state = STATE_AT_RISK
+                                if not count_only:
+                                    out_did[wptr] = did; out_hour[wptr] = arf
+                                    out_state[wptr] = state; out_trail[wptr] = win_sum
+                                wptr += 1
+                        cf = last_active_h + churn_h
+                        if state == STATE_AT_RISK and h >= cf:
+                            if cf <= end_h:
+                                state = STATE_CHURNED
+                                if not count_only:
+                                    out_did[wptr] = did; out_hour[wptr] = cf
+                                    out_state[wptr] = state; out_trail[wptr] = win_sum
+                                wptr += 1
+            else:
+                if at_risk_fire >= 0 and h >= at_risk_fire \
+                        and (state == STATE_ACTIVE or state == STATE_SUPER):
+                    if at_risk_fire <= end_h:
+                        state = STATE_AT_RISK
+                        if not count_only:
+                            out_did[wptr] = did; out_hour[wptr] = at_risk_fire
+                            out_state[wptr] = state; out_trail[wptr] = win_sum
+                        wptr += 1
+                if churn_fire >= 0 and h >= churn_fire and state == STATE_AT_RISK:
+                    if churn_fire <= end_h:
+                        state = STATE_CHURNED
+                        if not count_only:
+                            out_did[wptr] = did; out_hour[wptr] = churn_fire
+                            out_state[wptr] = state; out_trail[wptr] = win_sum
+                        wptr += 1
+
+            while win_head < win_tail and win_h[win_head] + super_h <= h:
+                old_h = win_h[win_head]
+                old_n = win_n[win_head]
+                win_head += 1
+                win_sum -= old_n
+                if state == STATE_SUPER and win_sum < super_thr:
+                    expire_h = old_h + super_h
+                    if expire_h <= end_h:
+                        state = STATE_ACTIVE
+                        if not count_only:
+                            out_did[wptr] = did; out_hour[wptr] = expire_h
+                            out_state[wptr] = state; out_trail[wptr] = win_sum
+                        wptr += 1
+
+            if state == STATE_CHURNED or state == STATE_AT_RISK:
+                state = STATE_ACTIVE
+                if not count_only:
+                    out_did[wptr] = did; out_hour[wptr] = h
+                    out_state[wptr] = state; out_trail[wptr] = win_sum
+                wptr += 1
+
+            win_h[win_tail] = h
+            win_n[win_tail] = n
+            win_tail += 1
+            win_sum += n
+            if state == STATE_ACTIVE and win_sum >= super_thr:
+                state = STATE_SUPER
+                if not count_only:
+                    out_did[wptr] = did; out_hour[wptr] = h
+                    out_state[wptr] = state; out_trail[wptr] = win_sum
+                wptr += 1
+            last_active_h = h
+
+        if last_active_h < 0:
+            last_active_h = baseline_h
+
+        if state == STATE_NEW:
+            grad_h = start_h + at_risk_h
+            if end_h >= grad_h:
+                state = STATE_ACTIVE
+                if not count_only:
+                    out_did[wptr] = did; out_hour[wptr] = grad_h
+                    out_state[wptr] = state; out_trail[wptr] = win_sum
+                wptr += 1
+
+        if state == STATE_ACTIVE or state == STATE_SUPER:
+            at_risk_fire = last_active_h + at_risk_h
+            decay_horizon = at_risk_fire if at_risk_fire < end_h else end_h
+            while win_head < win_tail and win_h[win_head] + super_h <= decay_horizon:
+                old_h = win_h[win_head]
+                old_n = win_n[win_head]
+                win_head += 1
+                win_sum -= old_n
+                if state == STATE_SUPER and win_sum < super_thr:
+                    expire_h = old_h + super_h
+                    if expire_h <= end_h:
+                        state = STATE_ACTIVE
+                        if not count_only:
+                            out_did[wptr] = did; out_hour[wptr] = expire_h
+                            out_state[wptr] = state; out_trail[wptr] = win_sum
+                        wptr += 1
+            if at_risk_fire <= end_h:
+                state = STATE_AT_RISK
+                if not count_only:
+                    out_did[wptr] = did; out_hour[wptr] = at_risk_fire
+                    out_state[wptr] = state; out_trail[wptr] = win_sum
+                wptr += 1
+
+        if state == STATE_AT_RISK:
+            churn_fire = last_active_h + churn_h
+            if churn_fire <= end_h:
+                state = STATE_CHURNED
+                if not count_only:
+                    out_did[wptr] = did; out_hour[wptr] = churn_fire
+                    out_state[wptr] = state; out_trail[wptr] = win_sum
+                wptr += 1
+
+    return wptr
+
+
+def _write_state_log(
+    con, *,
+    state_log_path: str,
+    seg_starts, seg_lens, is_existing, did, hour, count,
+    at_risk_h, churn_h, super_h, super_thr, baseline_h, end_h,
+    max_len, log,
+) -> None:
+    """Run the two-pass log kernel and write the interval parquet.
+
+    Schema: did_id INT64, hour_idx INT64, state INT8, trailing_actions
+    INT64. Sorted by (did_id, hour_idx) — same order as the actor
+    segments. Forward-fill within a did_id to get the dense hourly tick.
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    win_h = np.empty(max_len, dtype=np.int64)
+    win_n = np.empty(max_len, dtype=np.int64)
+    _dummy = np.empty(1, dtype=np.int64)
+    _dummy8 = np.empty(1, dtype=np.int8)
+
+    t0 = time.time()
+    n_rec = _sm_state_log_kernel(
+        seg_starts, seg_lens, is_existing, did, hour, count,
+        at_risk_h, churn_h, super_h, super_thr, baseline_h, end_h,
+        True, _dummy, _dummy, _dummy8, _dummy, win_h, win_n,
+    )
+    if log:
+        print(f"  state-log: {n_rec:,} interval records "
+              f"(count pass {time.time() - t0:.1f}s)", flush=True)
+
+    out_did = np.empty(n_rec, dtype=np.int64)
+    out_hour = np.empty(n_rec, dtype=np.int64)
+    out_state = np.empty(n_rec, dtype=np.int8)
+    out_trail = np.empty(n_rec, dtype=np.int64)
+    t0 = time.time()
+    _sm_state_log_kernel(
+        seg_starts, seg_lens, is_existing, did, hour, count,
+        at_risk_h, churn_h, super_h, super_thr, baseline_h, end_h,
+        False, out_did, out_hour, out_state, out_trail, win_h, win_n,
+    )
+    if log:
+        print(f"  state-log: filled in {time.time() - t0:.1f}s; "
+              f"writing {state_log_path}", flush=True)
+
+    t0 = time.time()
+    tbl = pa.table({
+        "did_id": out_did,
+        "hour_idx": out_hour,
+        "state": out_state,
+        "trailing_actions": out_trail,
+    })
+    pq.write_table(tbl, state_log_path, compression="zstd")
+    if log:
+        sz = os.path.getsize(state_log_path)
+        print(f"  state-log: wrote {sz / 1e9:.2f} GB "
+              f"in {time.time() - t0:.1f}s", flush=True)
+
+
 def _run_state_machine_numba(
     con, *,
     at_risk_h: int,
@@ -1322,6 +1604,7 @@ def _run_state_machine_numba(
     super_thr: int,
     baseline_h: int,
     end_h: int,
+    state_log_path: str | None = None,
     log: bool = True,
 ) -> tuple:
     """Numba-backed driver — one compiled pass over every actor.
@@ -1395,6 +1678,19 @@ def _run_state_machine_numba(
             f"  numba: kernel ran {n_actors:,} actors in {dt:.2f}s "
             f"({n_actors / max(dt, 1e-9):,.0f} actor/s, includes JIT warmup)",
             flush=True,
+        )
+
+    # ---- optional per-user state-interval log -----------------------------
+    # Done here while the event arrays (did/hour/count) are still resident.
+    if state_log_path is not None:
+        _write_state_log(
+            con, state_log_path=state_log_path,
+            seg_starts=seg_starts, seg_lens=seg_lens, is_existing=is_existing,
+            did=did, hour=hour, count=count,
+            at_risk_h=at_risk_h, churn_h=churn_h,
+            super_h=super_h, super_thr=super_thr,
+            baseline_h=baseline_h, end_h=end_h,
+            max_len=max_len, log=log,
         )
 
     # ---- fold dense outputs into the Counter structures -------------------
