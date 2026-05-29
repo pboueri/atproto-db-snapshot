@@ -32,17 +32,24 @@ from analysis.common import OUT_VOL_DIR, persist_artifact
 
 volume_out = modal.Volume.from_name("at-snapshot-output", create_if_missing=False)
 
-# Slim image: duckdb + plotly. Used by likes / ratio / attrition.
-analysis_image = (
+# Slim image: duckdb + plotly. Used by likes / ratio / attrition / growth.
+# Growth needs numpy for the streaming state machine; pulling it into
+# the base image avoids a second image variant.
+# NOTE: Modal requires `add_local_*` to be the LAST step in any image
+# chain. We build `_base_pkgs` (no local source) and tack the local
+# source on as the terminal step in each derived image.
+_base_pkgs = (
     modal.Image.debian_slim(python_version="3.12")
-    .pip_install("duckdb==1.5.2", "plotly==5.22.0")
-    .add_local_python_source("analysis")
+    .pip_install("duckdb==1.5.2", "plotly==5.22.0", "numpy==1.26.4",
+                 "pyarrow==16.1.0", "kaleido==0.2.1", "numba==0.61.0")
 )
+analysis_image = _base_pkgs.add_local_python_source("analysis")
 
-# Spectral image adds scipy / numpy / pyarrow for the blocks SVD.
+# Spectral image adds scipy for the blocks SVD.
 spectral_image = (
-    analysis_image
-    .pip_install("scipy==1.13.0", "numpy==1.26.4", "pyarrow==16.1.0")
+    _base_pkgs
+    .pip_install("scipy==1.13.0")
+    .add_local_python_source("analysis")
 )
 
 app = modal.App("at-snapshot-analysis")
@@ -68,9 +75,20 @@ def _open_snapshot(snapshot_date: str, *, memory_limit: str):
     return con
 
 
-def _persist(snapshot_date: str, basename: str, html: bytes, sidecar: dict) -> bytes:
+def _persist(
+    snapshot_date: str,
+    basename: str,
+    html: bytes,
+    sidecar: dict,
+    hero_png: bytes | None = None,
+) -> bytes:
     out_dir = f"{OUT_VOL_DIR}/analysis/{snapshot_date}"
     path = persist_artifact(out_dir, basename, html, sidecar)
+    if hero_png is not None:
+        hero_path = f"{out_dir}/{basename}_hero.png"
+        with open(hero_path, "wb") as f:
+            f.write(hero_png)
+        print(f"=== wrote {hero_path} ({len(hero_png):,} bytes) ===", flush=True)
     volume_out.commit()
     print(f"=== wrote {path} ({len(html):,} bytes) ===", flush=True)
     return html
@@ -128,6 +146,70 @@ def analyze_attrition(
 
 
 @app.function(
+    image=analysis_image,
+    volumes={"/vol-out": volume_out},
+    timeout=60 * 60 * 4,
+    cpu=8.0,
+    # 128 GiB: the numba state-machine load holds ~50 GB of event arrays
+    # resident, and the optional per-user state-log adds the interval
+    # arrays (~5-8 GB) plus a transient pyarrow copy while writing the
+    # parquet. 64 GiB left no headroom for the state-log variant.
+    memory=128 * 1024,
+    # Growth streams a year of likes/reposts/follows/posts into a
+    # `per_hour` (did_id, hour_idx) aggregate (~2.1B rows on the
+    # 2026-05-11 snapshot) and sorts it. The aggregation + sort spill
+    # to /tmp; 2 TiB matches hydrate and leaves comfortable headroom.
+    ephemeral_disk=2 * 1024 * 1024,
+    # The pre-aggregation alone runs ~30 min; a spot preemption wipes it
+    # and restarts from scratch (no DuckDB temp-table checkpoint). Pin
+    # to non-preemptible so a single worker can see the job through.
+    nonpreemptible=True,
+)
+def analyze_growth(
+    snapshot_date: str = "2026-04-28",
+    at_risk_hours: int = 48,
+    churn_days: int = 14,
+    super_threshold: int = 50,
+    super_window_hours: int = 168,
+    existing_baseline_date: str = "2025-01-01",
+    lookback_days: int = 0,  # 0 ⇒ full history sentinel
+    emit_state_log: int = 0,  # 1 ⇒ write per-user state-interval parquet
+) -> bytes:
+    import os
+
+    from analysis.growth import run
+    lookback = None if lookback_days <= 0 else lookback_days
+    raw_dir = f"{OUT_VOL_DIR}/raw/{snapshot_date}"
+    con = _open_snapshot(snapshot_date, memory_limit="56GiB")
+    # Cap DuckDB temp spill below the ephemeral_disk ceiling so it fails
+    # loudly instead of taking the container down on a full /tmp.
+    con.execute("SET max_temp_directory_size='1800GiB'")
+
+    state_log_path = None
+    if emit_state_log:
+        out_dir = f"{OUT_VOL_DIR}/analysis/{snapshot_date}"
+        os.makedirs(out_dir, exist_ok=True)
+        state_log_path = f"{out_dir}/growth_state_log.parquet"
+
+    html, sidecar, hero_png = run(
+        con, snapshot_date,
+        raw_dir=raw_dir,
+        at_risk_hours=at_risk_hours,
+        churn_days=churn_days,
+        super_threshold=super_threshold,
+        super_window_hours=super_window_hours,
+        existing_baseline_date=existing_baseline_date,
+        lookback_days=lookback,
+        state_log_path=state_log_path,
+    )
+    if state_log_path is not None:
+        # The state log is written before this commit; persist it too.
+        volume_out.commit()
+        print(f"=== wrote {state_log_path} ===", flush=True)
+    return _persist(snapshot_date, "growth", html, sidecar, hero_png=hero_png)
+
+
+@app.function(
     image=spectral_image,
     volumes={"/vol-out": volume_out},
     timeout=60 * 60 * 2,
@@ -180,6 +262,23 @@ _DISPATCH = {
         "vol_path": lambda d: f"/vol-out/var/analysis/{d}/blocks_cleavage.html",
         "kwargs": lambda d, **rest: {"snapshot_date": d},
     },
+    "growth": {
+        "fn": analyze_growth,
+        "out_name": lambda d: f"growth_{d}.html",
+        "vol_path": lambda d: f"/vol-out/var/analysis/{d}/growth.html",
+        "kwargs": lambda d, *, at_risk_hours, churn_days, super_threshold,
+                          super_window_hours, existing_baseline_date,
+                          lookback_days, emit_state_log, **rest: {
+            "snapshot_date": d,
+            "at_risk_hours": at_risk_hours,
+            "churn_days": churn_days,
+            "super_threshold": super_threshold,
+            "super_window_hours": super_window_hours,
+            "existing_baseline_date": existing_baseline_date,
+            "lookback_days": lookback_days,
+            "emit_state_log": emit_state_log,
+        },
+    },
 }
 
 
@@ -189,6 +288,13 @@ def main(
     snapshot_date: str = "2026-04-28",
     window_days: int = 90,
     inactivity_days: int = 30,
+    at_risk_hours: int = 48,
+    churn_days: int = 14,
+    super_threshold: int = 50,
+    super_window_hours: int = 168,
+    existing_baseline_date: str = "2025-01-01",
+    lookback_days: int = 0,
+    emit_state_log: int = 0,
     background: bool = False,
 ) -> None:
     """Dispatch to one of the snapshot analyses.
@@ -198,6 +304,8 @@ def main(
       snapshot_date: which snapshot in /vol-out/var/snapshot/<date>/ to read.
       window_days: time-window length for windowed analyses (ratio).
       inactivity_days: inactivity threshold for attrition.
+      emit_state_log: growth only — 1 writes the per-user state-interval
+        parquet to /vol-out/var/analysis/<date>/growth_state_log.parquet.
       background: spawn the remote call instead of waiting on it.
     """
     spec = _DISPATCH.get(analysis)
@@ -212,6 +320,13 @@ def main(
         snapshot_date,
         window_days=window_days,
         inactivity_days=inactivity_days,
+        at_risk_hours=at_risk_hours,
+        churn_days=churn_days,
+        super_threshold=super_threshold,
+        super_window_hours=super_window_hours,
+        existing_baseline_date=existing_baseline_date,
+        lookback_days=lookback_days,
+        emit_state_log=emit_state_log,
     )
     out_name = spec["out_name"](snapshot_date)
     vol_path = spec["vol_path"](snapshot_date)
