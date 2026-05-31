@@ -32,6 +32,21 @@ from .common import (
 # enough to resolve separate modes without turning into noise.
 BINS_PER_DECADE = 10
 
+# Gaussian-smoothing width (in bins) for the guide line and mode
+# detection. At low follower counts the integers are sparse in log space
+# — some 0.1-dex bins contain no integer at all and read as literal
+# zeros — so a too-narrow kernel (≲1.5 bins) turns that discretization
+# comb into a fistful of spurious "modes". Going too wide (≳2.5 bins)
+# over-smooths and erases genuine sub-decade humps. ~1.8 bins (0.18 dex)
+# sits in the stable window: the comb is gone but real humps survive.
+SMOOTH_SIGMA_BINS = 1.8
+
+# Minimum separation (in log10 decades) between two reported modes. Peaks
+# closer than this are merged into the taller one — this is what collapses
+# the 1 / 2 / 3-follower integer spikes into a single low-follower mode
+# instead of reporting each as its own.
+MIN_MODE_SEP_DEX = 0.5
+
 
 def _human(n: float) -> str:
     """Render a follower count compactly: 1, 10, 1K, 1M, …."""
@@ -46,7 +61,7 @@ def _human(n: float) -> str:
     return f"{n / 1_000_000_000:g}B"
 
 
-def _smooth(counts: list[float], sigma_bins: float = 1.6) -> list[float]:
+def _smooth(counts: list[float], sigma_bins: float = SMOOTH_SIGMA_BINS) -> list[float]:
     """Gaussian-smooth a histogram (reflect at the edges).
 
     Used only to draw a guide line over the bars and to make local-maxima
@@ -75,24 +90,35 @@ def _smooth(counts: list[float], sigma_bins: float = 1.6) -> list[float]:
 
 
 def _find_modes(centers_dex: list[float], smooth: list[float],
-                *, min_rel_height: float = 0.05) -> list[tuple[float, float]]:
-    """Local maxima of the smoothed curve, tall enough to count as modes.
+                *, min_rel_height: float = 0.05,
+                min_sep_dex: float = MIN_MODE_SEP_DEX) -> list[tuple[float, float]]:
+    """Distinct modes of the smoothed curve, sorted tallest-first.
 
-    Returns (follower_count, smoothed_height) pairs sorted tallest-first.
-    `min_rel_height` filters out ripples below 5% of the global peak.
+    Returns (follower_count, smoothed_height) pairs. A mode is a local
+    maximum at least `min_rel_height` of the global peak. Local maxima
+    within `min_sep_dex` decades of an already-accepted taller mode are
+    merged into it — without that, the integer-discretization comb at low
+    follower counts (separate 1-, 2-, 3-follower spikes) would each be
+    reported as its own mode rather than a single low-follower peak.
     """
     if not smooth:
         return []
     peak = max(smooth)
     floor = peak * min_rel_height
-    modes = []
+    raw = []
     for i in range(len(smooth)):
         left = smooth[i - 1] if i > 0 else -1.0
         right = smooth[i + 1] if i < len(smooth) - 1 else -1.0
         if smooth[i] >= left and smooth[i] >= right and smooth[i] >= floor:
-            modes.append((10 ** centers_dex[i], smooth[i]))
-    modes.sort(key=lambda m: m[1], reverse=True)
-    return modes
+            raw.append((centers_dex[i], smooth[i]))
+    # Greedily keep the tallest peaks, dropping any within min_sep_dex of a
+    # taller one already kept.
+    raw.sort(key=lambda m: m[1], reverse=True)
+    kept: list[tuple[float, float]] = []
+    for dex, h in raw:
+        if all(abs(dex - kd) >= min_sep_dex for kd, _ in kept):
+            kept.append((dex, h))
+    return [(10 ** dex, h) for dex, h in kept]
 
 
 def run(con, snapshot_date: str, *, log: bool = True) -> tuple[bytes, dict]:
