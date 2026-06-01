@@ -1,19 +1,29 @@
-"""Follower-count distribution analysis.
+"""Distribution of *followers gained since 2025* per account.
 
-Reads the `actor_aggs` table from a snapshot.duckdb connection and asks a
-single question: when you line every account up by how many followers it
-has and bin them on a **log10 scale**, what shape does the distribution
-take? The hope is to surface a bimodal (or multi-modal) structure —
-e.g. a hump of low-follower / dormant accounts and a separate hump of
-"established" accounts — that a linear-scale histogram would smear into
-an unreadable spike at zero.
+IMPORTANT framing — read before trusting any number here. The snapshot's
+`follows` table only contains follow edges created on or after
+2025-01-01 (verified empirically: pre-2025 months hold a few backdated
+noise rows each, then January 2025 jumps to ~13M edges). So the
+`actor_aggs.followers` column is **not** a lifetime follower count — it is
+the number of *new followers an account gained since the start of 2025*.
 
-Binning is done in log space (a fixed number of bins per decade) so the
-bars have equal width in log10 and modes are directly comparable. The
-x-axis is plotted in log10-dex with tick labels rendered back in human
-follower counts (1, 10, 100, 1K, …). Accounts with zero followers have
-no log10 and are reported separately as a headline number rather than
-forced into the first bin.
+We confirmed the gap by spot-checking the top accounts against the live
+AppView: capture ratio (snapshot ÷ live) ran 27–100%, and it tracked
+exactly when an account's followers arrived. Accounts whose audience grew
+mostly after the cutoff (e.g. Buttigieg, Obama — both joined in 2025;
+Mamdani — old account, but his following exploded during the 2025 NYC
+race) are ~99% captured. Accounts that built their base in 2023–24 (AOC,
+NYTimes, Stephen King) show only ~30%, because their pre-2025 followers
+are invisible to the snapshot. The shortfall is an artifact of the
+2025-01-01 edge cutoff, not missing data.
+
+So this analysis bins every account by **followers-since-2025** on a
+**log10 scale** and asks what shape that distribution takes. Binning is
+done in log space (a fixed number of bins per decade) so bars have equal
+width in log10 and any humps are directly comparable. The x-axis is
+plotted in log10-dex with tick labels rendered back in human counts
+(1, 10, 100, 1K, …). Accounts with zero post-2025 followers have no log10
+and are reported separately rather than forced into the first bin.
 
 Public entrypoint: `run(con, snapshot_date) -> (html_bytes, sidecar_dict)`.
 """
@@ -27,6 +37,11 @@ from .common import (
     built_at_utc, fig_html, fmt_int, install_template,
     plotlyjs_inline, timed_query,
 )
+
+# The follow-edge cutoff baked into the snapshot. Edges before this date
+# are absent, so `followers` means "followers gained on or after it".
+# Verified from the snapshot's follows.created_at histogram.
+SINCE_DATE = "2025-01-01"
 
 # Bins per decade for the log10 histogram. 10 ⇒ 0.1-dex bars, fine
 # enough to resolve separate modes without turning into noise.
@@ -262,11 +277,11 @@ def run(con, snapshot_date: str, *, log: bool = True) -> tuple[bytes, dict]:
     fig_hist.update_layout(
         template="bsky",
         title=dict(
-            text="<b>Follower distribution across all accounts</b>  ·  "
+            text=f"<b>Followers gained since {SINCE_DATE[:4]}, across all accounts</b>  ·  "
                  "log10 scale, " + (
                      "multi-modal" if is_multimodal else "single mode"),
             x=0.02, xanchor="left"),
-        xaxis=dict(title="Followers (log scale)",
+        xaxis=dict(title=f"New followers since {SINCE_DATE[:4]} (log scale)",
                    tickmode="array", tickvals=tickvals, ticktext=ticktext),
         yaxis=dict(title="Number of accounts"),
         bargap=0.0,
@@ -288,9 +303,9 @@ def run(con, snapshot_date: str, *, log: bool = True) -> tuple[bytes, dict]:
     ))
     fig_decade.update_layout(
         template="bsky",
-        title=dict(text="<b>Accounts by order of magnitude of followers</b>",
+        title=dict(text=f"<b>Accounts by order of magnitude of new followers since {SINCE_DATE[:4]}</b>",
                    x=0.02, xanchor="left"),
-        xaxis=dict(title="Follower count"),
+        xaxis=dict(title=f"New followers since {SINCE_DATE[:4]}"),
         yaxis=dict(title="Number of accounts (log)", type="log"),
         height=400,
     )
@@ -310,25 +325,26 @@ def run(con, snapshot_date: str, *, log: bool = True) -> tuple[bytes, dict]:
         lo, hi = sorted((m0, m1))
         mode_sentence = (
             f"The distribution is <strong>multi-modal</strong>: a peak near "
-            f"<strong>{_human(round(lo))}</strong> followers and a second "
+            f"<strong>{_human(round(lo))}</strong> new followers and a second "
             f"near <strong>{_human(round(hi))}</strong>."
         )
         verdict = "bimodal"
     elif modes:
         mode_sentence = (
             f"The distribution is <strong>single-peaked</strong>, cresting "
-            f"around <strong>{_human(round(modes[0][0]))}</strong> followers."
+            f"around <strong>{_human(round(modes[0][0]))}</strong> new followers."
         )
         verdict = "unimodal"
     else:  # pragma: no cover - empty snapshot
-        mode_sentence = "No accounts with followers were found in this snapshot."
+        mode_sentence = ("No accounts gained followers since "
+                         f"{SINCE_DATE} in this snapshot.")
         verdict = "empty"
 
     html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>The shape of Bluesky's follower distribution</title>
+<title>Distribution of followers gained since {SINCE_DATE[:4]}</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>{SHARED_CSS}</style>
 <script>{plotlyjs}</script>
@@ -337,45 +353,47 @@ def run(con, snapshot_date: str, *, log: bool = True) -> tuple[bytes, dict]:
 <div class="wrap">
 
 <div class="eyebrow">An analysis · snapshot {snapshot_date}</div>
-<h1>The shape of Bluesky's <span class="accent">follower distribution</span>.</h1>
+<h1>Followers gained <span class="accent">since {SINCE_DATE[:4]}</span>, across every Bluesky account.</h1>
 <p class="lede">
-  Every account on Bluesky, binned by follower count on a log10 scale.
-  Plotting in log space stops the enormous pile of low-follower accounts
-  from collapsing the chart into a single spike — and lets any separate
-  "humps" in the population stand out. {mode_sentence}
+  This snapshot's follow graph only contains edges created on or after
+  <strong>{SINCE_DATE}</strong>, so each account's count here is the number
+  of <strong>new followers it has gained since the start of {SINCE_DATE[:4]}</strong>
+  — not its lifetime total. Binned on a log10 scale so the enormous pile of
+  low-growth accounts doesn't collapse the chart into a single spike, and so
+  any separate "humps" in the population stand out. {mode_sentence}
 </p>
 
 <div class="stats">
   <div class="stat">
     <div class="v">{fmt_int(total_actors)}</div>
     <div class="l">accounts in the snapshot</div>
-    <div class="sub">{fmt_int(with_followers)} have ≥1 follower</div>
+    <div class="sub">{fmt_int(with_followers)} gained ≥1 since {SINCE_DATE[:4]}</div>
   </div>
   <div class="stat">
     <div class="v bad">{pct_zero:.1f}%</div>
-    <div class="l">have zero followers</div>
+    <div class="l">gained zero followers since {SINCE_DATE[:4]}</div>
     <div class="sub">{fmt_int(zero_followers)} accounts</div>
   </div>
   <div class="stat">
     <div class="v">{fmt_int(median_all or 0)}</div>
-    <div class="l">median followers (all accounts)</div>
+    <div class="l">median new followers (all accounts)</div>
     <div class="sub">{fmt_int(median_pos or 0)} among those with ≥1</div>
   </div>
   <div class="stat">
     <div class="v brand">{fmt_int(max_f or 0)}</div>
-    <div class="l">most-followed account</div>
+    <div class="l">most new followers (since {SINCE_DATE[:4]})</div>
     <div class="sub">mean {(mean_all or 0):,.0f} · p99 {fmt_int(p99_all or 0)}</div>
   </div>
 </div>
 
 <section>
   <div class="kicker">The main event</div>
-  <h2>Follower counts on a log10 scale.</h2>
+  <h2>Followers-gained-since-{SINCE_DATE[:4]} on a log10 scale.</h2>
   <p>
-    Each bar is a 0.1-decade slice of the follower axis, so bars are equal
-    width in log space and any two peaks are directly comparable in height.
-    The dark line is a Gaussian-smoothed guide; pink dots mark detected
-    local maxima (modes). Accounts with exactly zero followers
+    Each bar is a 0.1-decade slice of the axis, so bars are equal width in
+    log space and any two peaks are directly comparable in height. The dark
+    line is a Gaussian-smoothed guide; pink dots mark detected local maxima
+    (modes). Accounts that gained no followers since {SINCE_DATE}
     ({pct_zero:.1f}% of the total) have no log10 and are excluded from this
     chart — see the breakdown below for them.
   </p>
@@ -386,32 +404,46 @@ def run(con, snapshot_date: str, *, log: bool = True) -> tuple[bytes, dict]:
   <div class="kicker">For reference</div>
   <h2>Accounts by order of magnitude.</h2>
   <p>
-    The same population bucketed into clean powers of ten, including the
-    zero-follower group in red. The y-axis is logarithmic so the smaller
-    high-follower tiers stay visible next to the low-follower masses.
+    The same population bucketed into clean powers of ten (new followers
+    since {SINCE_DATE[:4]}), including the zero group in red. The y-axis is
+    logarithmic so the smaller high-growth tiers stay visible next to the
+    low-growth masses.
   </p>
   <div class="figure">{plot_html["decade"]}</div>
 </section>
 
 <footer>
   <p>
-    <strong>Methodology.</strong> Follower counts come from the
-    <code>followers</code> column of the <code>actor_aggs</code> table in
-    the at-snapshot Bluesky DuckDB build, snapshot date
-    <code>{snapshot_date}</code> — each account's count of inbound edges in
-    the <code>follows</code> graph. The headline histogram bins
-    <code>log10(followers)</code> at {bpd} bins per decade over accounts
-    with at least one follower; zero-follower accounts are reported
-    separately. Mode detection takes local maxima of a Gaussian-smoothed
-    (σ ≈ 1.6 bins) version of the histogram, keeping peaks at least 5% as
-    tall as the global maximum. Verdict: <strong>{verdict}</strong>.
-    Built {built_at}.
+    <strong>What this measures.</strong> The snapshot's <code>follows</code>
+    table only contains edges created on or after <code>{SINCE_DATE}</code>
+    — verified from its <code>created_at</code> histogram, where pre-{SINCE_DATE[:4]}
+    months hold a handful of backdated rows each and {SINCE_DATE[:7]} jumps to
+    ~13M edges. So the <code>followers</code> column of <code>actor_aggs</code>
+    counts <strong>followers gained since {SINCE_DATE}</strong>, not lifetime
+    followers. Spot-checking the top accounts against the live AppView gave
+    capture ratios of 27–100%, tracking exactly when each account's audience
+    arrived: accounts that grew after the cutoff are near-fully captured,
+    while those that built their base in 2023–24 show only ~30%.
   </p>
   <p>
-    <strong>Caveats.</strong> The snapshot reflects the follow graph as
-    crawled by constellation; very recent follows lag. Suspended or
-    deactivated accounts still appear if their edges remain indexed, which
-    inflates the low-follower mass. Follower counts are not de-spammed.
+    <strong>Methodology.</strong> Counts come from the <code>followers</code>
+    column of <code>actor_aggs</code> in the at-snapshot Bluesky DuckDB build,
+    snapshot date <code>{snapshot_date}</code>. The headline histogram bins
+    <code>log10(followers)</code> at {bpd} bins per decade over accounts with
+    at least one post-{SINCE_DATE[:4]} follower; the zero group is reported
+    separately. Mode detection takes local maxima of a Gaussian-smoothed
+    (σ ≈ {SMOOTH_SIGMA_BINS} bins) histogram, keeping peaks ≥5% of the global
+    maximum and merging any within {MIN_MODE_SEP_DEX} dex of a taller one.
+    Verdict: <strong>{verdict}</strong>. Built {built_at}.
+  </p>
+  <p>
+    <strong>Caveats.</strong> Because the cutoff truncates each account's
+    history differently, this distribution is biased by <em>when</em> an
+    account's following grew, not just how large it is — older accounts are
+    systematically pushed toward the low end. Read the shape as "recent
+    follower growth," and do not read absolute values as true follower
+    counts. Suspended/deactivated accounts still appear if their edges remain
+    indexed; counts are not de-spammed.
   </p>
 </footer>
 
@@ -423,6 +455,8 @@ def run(con, snapshot_date: str, *, log: bool = True) -> tuple[bytes, dict]:
     sidecar = {
         "snapshot_date": snapshot_date,
         "built_at_utc": built_at,
+        "metric": "followers_gained_since",
+        "since_date": SINCE_DATE,
         "bins_per_decade": bpd,
         "total_actors": int(total_actors or 0),
         "with_followers": int(with_followers or 0),

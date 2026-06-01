@@ -8,12 +8,15 @@ def test_followers_runs_and_produces_html(synthetic_con, snapshot_date):
 
     assert isinstance(html, bytes) and len(html) > 10_000
     assert b"<!DOCTYPE html>" in html
-    assert b"follower distribution" in html.lower()
+    # Reframed around "followers gained since <year>", not lifetime totals.
+    assert b"gained" in html.lower() and b"since 2025" in html.lower()
     # The log10 framing is the whole point of the chart.
     assert b"log10" in html or b"log scale" in html
 
     # Sidecar shape + sanity bounds.
     assert sidecar["snapshot_date"] == snapshot_date
+    assert sidecar["metric"] == "followers_gained_since"
+    assert sidecar["since_date"] == "2025-01-01"
     assert sidecar["total_actors"] > 0
     assert sidecar["with_followers"] > 0
     assert sidecar["with_followers"] <= sidecar["total_actors"]
