@@ -83,13 +83,18 @@ def run(con, snapshot_date: str, *, log: bool = True) -> tuple[bytes, dict]:
     )
 
     # --- by order of magnitude (clean, labelled secondary view) -----------
+    # "1" is split out from "2–9": an account following exactly one other
+    # account is almost certainly just sitting on the signup default (the
+    # auto-followed bsky.app), not actively curating — worth distinguishing
+    # from accounts that have made ≥2 deliberate follows.
     decade_rows = q(
         """
         SELECT bucket, n FROM (
           SELECT
             CASE
               WHEN follows = 0          THEN '0'
-              WHEN follows < 10         THEN '1–9'
+              WHEN follows = 1          THEN '1 (default)'
+              WHEN follows < 10         THEN '2–9'
               WHEN follows < 100        THEN '10–99'
               WHEN follows < 1000       THEN '100–999'
               WHEN follows < 10000      THEN '1K–9.9K'
@@ -99,13 +104,14 @@ def run(con, snapshot_date: str, *, log: bool = True) -> tuple[bytes, dict]:
             END AS bucket,
             CASE
               WHEN follows = 0          THEN 0
-              WHEN follows < 10         THEN 1
-              WHEN follows < 100        THEN 2
-              WHEN follows < 1000       THEN 3
-              WHEN follows < 10000      THEN 4
-              WHEN follows < 100000     THEN 5
-              WHEN follows < 1000000    THEN 6
-              ELSE 7
+              WHEN follows = 1          THEN 1
+              WHEN follows < 10         THEN 2
+              WHEN follows < 100        THEN 3
+              WHEN follows < 1000       THEN 4
+              WHEN follows < 10000      THEN 5
+              WHEN follows < 100000     THEN 6
+              WHEN follows < 1000000    THEN 7
+              ELSE 8
             END AS ord,
             COUNT(*) AS n
           FROM actor_aggs
@@ -192,9 +198,19 @@ def run(con, snapshot_date: str, *, log: bool = True) -> tuple[bytes, dict]:
     d_buckets = [r[0] for r in decade_rows]
     d_counts = [r[1] for r in decade_rows]
     d_pct = [100 * c / total_actors for c in d_counts] if total_actors else []
+    # Red for the zero bucket, amber for the "1 (default)" bucket (signup
+    # default, not active curation), brand blue for everyone with ≥2 follows.
+    d_colors = []
+    for b in d_buckets:
+        if b == "0":
+            d_colors.append("#ef4444")
+        elif b.startswith("1 ("):
+            d_colors.append("#f59e0b")
+        else:
+            d_colors.append(BRAND)
     fig_decade = go.Figure(go.Bar(
         x=d_buckets, y=d_counts,
-        marker=dict(color=["#ef4444"] + [BRAND] * (len(d_buckets) - 1)),
+        marker=dict(color=d_colors),
         text=[f"{c:,}<br>{p:.1f}%" for c, p in zip(d_counts, d_pct)],
         textposition="outside",
         hovertemplate="%{x} accounts followed<br>%{y:,} accounts<extra></extra>",
@@ -215,6 +231,12 @@ def run(con, snapshot_date: str, *, log: bool = True) -> tuple[bytes, dict]:
     plotlyjs = plotlyjs_inline()
 
     pct_zero = 100 * zero_follows / total_actors if total_actors else 0.0
+    # Accounts following exactly one other account — the signup default
+    # (auto-followed bsky.app), a proxy for "registered but never curated".
+    default_follow = next(
+        (n for b, n in decade_rows if str(b).startswith("1 (")), 0
+    )
+    pct_default = 100 * default_follow / total_actors if total_actors else 0.0
     built_at = built_at_utc()
 
     if is_multimodal:
@@ -303,9 +325,17 @@ def run(con, snapshot_date: str, *, log: bool = True) -> tuple[bytes, dict]:
   <h2>Accounts by order of magnitude.</h2>
   <p>
     The same population bucketed into clean powers of ten (accounts followed
-    since {SINCE_DATE[:4]}), including the zero group in red. The y-axis is
-    logarithmic so the smaller high-activity tiers stay visible next to the
-    low-activity masses.
+    since {SINCE_DATE[:4]}). The zero group is red; the
+    <strong>"1 (default)"</strong> bucket is amber and split out on purpose:
+    an account following exactly one other account is almost certainly just
+    sitting on the signup default — Bluesky auto-follows its own
+    <code>bsky.app</code> account on sign-up — rather than actively curating
+    a feed. That single bucket holds <strong>{fmt_int(default_follow)}</strong>
+    accounts ({pct_default:.1f}% of all accounts). Together with the
+    {pct_zero:.1f}% who follow nobody, that's a large slice of the network
+    that has made effectively zero deliberate follow decisions since
+    {SINCE_DATE[:4]}. The y-axis is logarithmic so the smaller high-activity
+    tiers stay visible next to the low-activity masses.
   </p>
   <div class="figure">{plot_html["decade"]}</div>
 </section>
@@ -363,6 +393,8 @@ def run(con, snapshot_date: str, *, log: bool = True) -> tuple[bytes, dict]:
         "mean_follows": float(mean_all or 0),
         "p99_follows": int(p99_all or 0),
         "max_follows": int(max_f or 0),
+        "default_follow_only": int(default_follow),
+        "pct_default_follow_only": pct_default,
         "is_multimodal": is_multimodal,
         "verdict": verdict,
         "modes": [
