@@ -6,6 +6,7 @@ Each analysis lives in its own submodule:
   analysis/ratio.py      analyze_ratio
   analysis/attrition.py  analyze_attrition
   analysis/followers.py  analyze_followers
+  analysis/following.py  analyze_following
   analysis/blocks.py     analyze_blocks  (needs scipy)
 
 This file is just the Modal glue: it defines the app, the per-image
@@ -226,6 +227,21 @@ def analyze_followers(snapshot_date: str = "2026-04-28") -> bytes:
 
 
 @app.function(
+    image=analysis_image,
+    volumes={"/vol-out": volume_out},
+    timeout=60 * 60,
+    cpu=8.0,
+    memory=32 * 1024,
+    ephemeral_disk=512 * 1024,
+)
+def analyze_following(snapshot_date: str = "2026-04-28") -> bytes:
+    from analysis.following import run
+    con = _open_snapshot(snapshot_date, memory_limit="28GiB")
+    html, sidecar = run(con, snapshot_date)
+    return _persist(snapshot_date, "following_distribution", html, sidecar)
+
+
+@app.function(
     image=spectral_image,
     volumes={"/vol-out": volume_out},
     timeout=60 * 60 * 2,
@@ -284,6 +300,12 @@ _DISPATCH = {
         "vol_path": lambda d: f"/vol-out/var/analysis/{d}/followers_distribution.html",
         "kwargs": lambda d, **rest: {"snapshot_date": d},
     },
+    "following": {
+        "fn": analyze_following,
+        "out_name": lambda d: f"following_distribution_{d}.html",
+        "vol_path": lambda d: f"/vol-out/var/analysis/{d}/following_distribution.html",
+        "kwargs": lambda d, **rest: {"snapshot_date": d},
+    },
     "growth": {
         "fn": analyze_growth,
         "out_name": lambda d: f"growth_{d}.html",
@@ -323,7 +345,7 @@ def main(
 
     Args:
       analysis: which analysis to run — likes, ratio, attrition,
-        followers, blocks, growth.
+        followers, following, blocks, growth.
       snapshot_date: which snapshot in /vol-out/var/snapshot/<date>/ to read.
       window_days: time-window length for windowed analyses (ratio).
       inactivity_days: inactivity threshold for attrition.
