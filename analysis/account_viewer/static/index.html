@@ -169,8 +169,8 @@ const LABELS = [
 ];
 const API = "";
 let state = { rows:[], sel:-1, offset:0, lastQuery:null, did:null, busy:false,
-              sort:"followers", dir:"desc", cache:new Map(), inflight:new Map(),
-              prefetchN:3, pfQueue:[], pfActive:0 };
+              sort:"followers", dir:"desc", liveSort:false, cache:new Map(),
+              inflight:new Map(), prefetchN:3, pfQueue:[], pfActive:0 };
 const PF_CONCURRENCY=2;
 
 const $ = s => document.querySelector(s);
@@ -188,6 +188,8 @@ async function loadMeta(){
   $("#meta").textContent =
     `snapshot ${META.snapshot_date} · ${fmt(META.total)} accounts`;
   const sortSel=$("#sort"); sortSel.innerHTML="";
+  // Real signup date (live from the API) for the loaded view -- sorted client-side.
+  const lc=el("option","","created date (live)"); lc.value="__created_live"; sortSel.appendChild(lc);
   (META.sort_cols||["followers","follows","posts","likes_out","content"]).forEach(c=>{
     const o=el("option",null,c); o.value=c; if(c===state.sort)o.selected=true; sortSel.appendChild(o);
   });
@@ -237,8 +239,40 @@ async function runQuery(reset,append){
     state.offset += data.rows.length;
     renderList();
     $("#status").textContent=`${state.rows.length} rows`;
-    if(!append && state.rows.length){ select(0); }
+    if(state.liveSort){ applyLiveCreatedSort(); }
+    else if(!append && state.rows.length){ select(0); }
   }catch(e){$("#status").textContent="err: "+e.message;}
+}
+// Fetch real signup dates for loaded rows (getProfiles, cached) then sort them.
+async function applyLiveCreatedSort(){
+  const need=state.rows.filter(r=>r.created_live===undefined).map(r=>r.did);
+  if(need.length){
+    $("#status").textContent="fetching dates…";
+    try{
+      const res=await jget("/api/created?dids="+need.map(encodeURIComponent).join(","));
+      const m=res.created||{};
+      state.rows.forEach(r=>{ if(r.created_live===undefined) r.created_live=m[r.did]??null; });
+    }catch(e){ $("#status").textContent="err: "+e.message; return; }
+  }
+  sortLoadedByCreated();
+}
+function sortLoadedByCreated(){
+  const curDid=(state.sel>=0 && state.rows[state.sel])?state.rows[state.sel].did:null;
+  const sgn=state.dir==="asc"?1:-1;
+  state.rows.sort((a,b)=>{
+    const av=a.created_live, bv=b.created_live;
+    if(av==null && bv==null) return 0;
+    if(av==null) return 1;            // nulls last
+    if(bv==null) return -1;
+    return sgn*(av<bv?-1:av>bv?1:0);
+  });
+  state.pfQueue=[];
+  const idx=curDid?state.rows.findIndex(r=>r.did===curDid):-1;  // keep your place
+  state.sel=idx;
+  renderList();
+  $("#status").textContent=`${state.rows.length} rows · by created date`;
+  if(idx<0 && state.rows.length){ select(0); }
+  else if(idx>=0){ const e=document.querySelector(".item.sel"); if(e)e.scrollIntoView({block:"nearest"}); }
 }
 function renderList(){
   const list=$("#list"); list.innerHTML="";
@@ -250,7 +284,9 @@ function renderList(){
     if(state.labels&&state.labels[r.did]) left.innerHTML+=`<span class="lab-dot" title="${state.labels[r.did]}"></span>`;
     let numtxt=`f${fmt(r.follows)}·${fmt(r.followers)}  p${fmt(r.posts)}  ♥${fmt(r.likes_out)}`;
     const sk=state.sort;
-    if(sk==="created_est"){
+    if(sk==="__created_live"){
+      numtxt = `${r.created_live?String(r.created_live).slice(0,10):(r.created_live===null?"no date":"…")}  ·  `+numtxt;
+    } else if(sk==="created_est"){
       numtxt = `≈${r.created_est?String(r.created_est).slice(0,10):"?"}  ·  `+numtxt;
     } else if(sk && !["follows","followers","posts","likes_out"].includes(sk) && r[sk]!=null){
       numtxt = `${sk} ${fmt(r[sk])}  ·  `+numtxt;
@@ -518,11 +554,15 @@ function randomSample(){
 $("#run").onclick=()=>runQuery(true);
 $("#rand").onclick=randomSample;
 $("#more").onclick=loadMore;
-$("#sort").onchange=e=>{ state.sort=e.target.value; runQuery(true); };
+$("#sort").onchange=e=>{
+  state.sort=e.target.value;
+  if(state.sort==="__created_live"){ state.liveSort=true; applyLiveCreatedSort(); }
+  else { state.liveSort=false; runQuery(true); }
+};
 $("#dir").onclick=()=>{
   state.dir = state.dir==="desc" ? "asc" : "desc";
   $("#dir").textContent = state.dir==="desc" ? "↓ desc" : "↑ asc";
-  runQuery(true);
+  if(state.liveSort) sortLoadedByCreated(); else runQuery(true);
 };
 $("#prefetch").onchange=e=>{ state.prefetchN=+e.target.value; if(state.sel>=0)schedulePrefetch(state.sel); };
 $("#sqlmode").onchange=e=>{

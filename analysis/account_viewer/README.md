@@ -60,6 +60,13 @@ timestamps from poisoning the per-actor minimum.
 - **sort** — order the list by any facet (followers, follows, posts, likes,
   reposts, replies, quotes, blocks in/out, content, …); the **↓ desc / ↑ asc**
   button flips direction. The sorted value is shown in each row.
+- **sort → "created date (live)"** — sorts the *currently loaded* rows by each
+  account's **real** signup date, fetched live (`getProfiles`, batched 25/call,
+  cached). No precompute needed; accurate, but scoped to the loaded sample
+  (re-sample / "More" to extend). Account creation isn't in the snapshot and
+  can't be derived from the DID (it's a hash) — this reads the true date the
+  API already returns. For a *global* estimated date column instead, run
+  `add_created_est.py` (above).
 - **prefetch** — how many accounts *ahead* of the cursor to hydrate in the
   background (default 3) so arrowing down is instant. Set to `off` to disable.
 - **r** — random sample (re-roll). **Run / ⏎** — apply the filter.

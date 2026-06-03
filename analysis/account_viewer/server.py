@@ -215,6 +215,44 @@ def _quote_summary(rec: dict) -> dict | None:
     }
 
 
+def created_dates(dids: list[str]) -> dict:
+    """Map {did: createdAt} using getProfiles (batches of 25), cached per-did.
+
+    The true account creation date is in each profile -- this just fetches it
+    in bulk for the rows currently in the list so the UI can sort the loaded
+    view by real signup date without 24.7M calls.
+    """
+    out: dict = {}
+    con = _cache_conn()
+    missing = []
+    for did in dids:
+        row = con.execute(
+            "SELECT body FROM api_cache WHERE key=?", (f"created:{did}",)
+        ).fetchone()
+        if row:
+            out[did] = json.loads(row[0])
+        else:
+            missing.append(did)
+    # getProfiles takes up to 25 actors per call.
+    for i in range(0, len(missing), 25):
+        chunk = missing[i:i + 25]
+        qs = "&".join("actors=" + urllib.parse.quote(d) for d in chunk)
+        status, body = _http_get_json(f"{APPVIEW}/app.bsky.actor.getProfiles?{qs}")
+        got = {p.get("did"): p.get("createdAt") for p in body.get("profiles", [])}
+        for d in chunk:
+            created = got.get(d)  # None if profile missing/deactivated
+            out[d] = created
+            if status != 0:  # cache real answers (incl. None), not network errors
+                con.execute(
+                    "INSERT OR REPLACE INTO api_cache(key, body, status, fetched_at) "
+                    "VALUES (?,?,?,?)",
+                    (f"created:{d}", json.dumps(created), status, time.time()),
+                )
+        con.commit()
+    con.close()
+    return out
+
+
 # ----------------------------------------------------------------------------
 # duckdb queries
 # ----------------------------------------------------------------------------
@@ -407,6 +445,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(meta())
             if u.path == "/api/accounts":
                 return self._json(query_accounts(q))
+            if u.path == "/api/created":
+                dids = [d for d in (q.get("dids", "").split(",")) if d]
+                return self._json({"created": created_dates(dids)})
             if u.path == "/api/account":
                 did = q.get("did", "")
                 row = account_row(did)
