@@ -15,3 +15,5 @@ __pycache__/
 /ratio_*.html
 /attrition_*.html
 /blocks_cleavage_*.html
+/followers_distribution_*.html
+/following_distribution_*.html
