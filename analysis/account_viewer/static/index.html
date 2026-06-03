@@ -169,7 +169,7 @@ const LABELS = [
 ];
 const API = "";
 let state = { rows:[], sel:-1, offset:0, lastQuery:null, did:null, busy:false,
-              sort:"followers", dir:"desc", liveSort:false, cache:new Map(),
+              sort:"followers", dir:"desc", liveSort:false, total:null, cache:new Map(),
               inflight:new Map(), prefetchN:3, pfQueue:[], pfActive:0 };
 const PF_CONCURRENCY=2;
 
@@ -177,6 +177,16 @@ const $ = s => document.querySelector(s);
 const el = (t,c,txt)=>{const e=document.createElement(t);if(c)e.className=c;if(txt!=null)e.textContent=txt;return e;};
 const fmt = n => (n==null?"—":Number(n).toLocaleString());
 const shortDid = d => d ? d.replace("did:plc:","").slice(0,10) : "";
+function setStatus(extra){
+  const n=state.rows.length;
+  // "200 of 13,960,630 match" — the full count for the current filter, not
+  // just the rows fetched. total is null only for unfiltered/odd queries.
+  let s = (state.total!=null)
+    ? `${fmt(n)} loaded of ${fmt(state.total)} match`
+    : `${fmt(n)} rows`;
+  if(extra) s += " · "+extra;
+  $("#status").textContent=s;
+}
 
 async function jget(u){const r=await fetch(API+u);return r.json();}
 async function jpost(u,b){const r=await fetch(API+u,{method:"POST",headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});return r.json();}
@@ -235,10 +245,10 @@ async function runQuery(reset,append){
     const data=await jget(buildUrl(reset));
     if(data.error){$("#status").textContent="err: "+data.error;return;}
     if(append) state.rows=state.rows.concat(data.rows);
-    else {state.rows=data.rows; state.sel=-1; state.pfQueue=[];}
+    else {state.rows=data.rows; state.sel=-1; state.pfQueue=[]; state.total=data.total;}
     state.offset += data.rows.length;
     renderList();
-    $("#status").textContent=`${state.rows.length} rows`;
+    setStatus();
     if(state.liveSort){ applyLiveCreatedSort(); }
     else if(!append && state.rows.length){ select(0); }
   }catch(e){$("#status").textContent="err: "+e.message;}
@@ -270,7 +280,7 @@ function sortLoadedByCreated(){
   const idx=curDid?state.rows.findIndex(r=>r.did===curDid):-1;  // keep your place
   state.sel=idx;
   renderList();
-  $("#status").textContent=`${state.rows.length} rows · by created date`;
+  setStatus("by created date");
   if(idx<0 && state.rows.length){ select(0); }
   else if(idx>=0){ const e=document.querySelector(".item.sel"); if(e)e.scrollIntoView({block:"nearest"}); }
 }

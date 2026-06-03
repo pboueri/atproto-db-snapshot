@@ -291,10 +291,12 @@ def query_accounts(args: dict) -> dict:
     direction = "ASC" if str(args.get("dir", "desc")).lower() == "asc" else "DESC"
 
     cols = ", ".join(LIST_COLS)
+    count_sql = None
     if raw_sql:
         # Power mode: user-supplied SELECT. Connection is read-only so this
         # can't mutate anything. We still wrap it so we can paginate.
         sql = f"SELECT * FROM ({raw_sql}) _q LIMIT {limit} OFFSET {offset}"
+        count_sql = f"SELECT count(*) FROM ({raw_sql}) _q"
     else:
         clauses = []
         if category:
@@ -312,6 +314,7 @@ def query_accounts(args: dict) -> dict:
             f"SELECT {cols} FROM accounts{wsql} {orderby} "
             f"LIMIT {limit} OFFSET {offset}"
         )
+        count_sql = f"SELECT count(*) FROM accounts{wsql}"
 
     params = [category] if (category and not raw_sql) else []
     with _duck_lock:
@@ -324,7 +327,16 @@ def query_accounts(args: dict) -> dict:
         rows = [
             {n: _jsonable(v) for n, v in zip(names, r)} for r in cur.fetchall()
         ]
-    return {"rows": rows, "count": len(rows), "offset": offset, "limit": limit}
+        # Total matching the filter (not just this page). Only compute on the
+        # first page -- it's cheap but pointless to redo for every "More".
+        total = None
+        if offset == 0 and count_sql:
+            try:
+                total = cur.execute(count_sql, params).fetchone()[0]
+            except Exception:
+                total = None
+    return {"rows": rows, "count": len(rows), "offset": offset,
+            "limit": limit, "total": total}
 
 
 def account_row(did: str) -> dict | None:
