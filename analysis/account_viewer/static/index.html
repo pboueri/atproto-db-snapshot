@@ -1,0 +1,414 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>account viewer</title>
+<style>
+  :root{
+    --brand:#0085ff; --ink:#1d2433; --muted:#5b6472; --rule:#e6e8ec;
+    --bg:#fbfbfd; --panel:#fff; --warn:#ef4444; --ok:#16a34a; --hi:#eef6ff;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%}
+  body{
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif;
+    color:var(--ink);background:var(--bg);font-size:14px;display:flex;
+    flex-direction:column;height:100vh;overflow:hidden;
+  }
+  header{
+    display:flex;align-items:center;gap:14px;padding:8px 14px;
+    border-bottom:1px solid var(--rule);background:var(--panel);flex-wrap:wrap;
+  }
+  header .title{font-weight:700;letter-spacing:-.01em}
+  header .meta{color:var(--muted);font-size:12.5px}
+  .chips{display:flex;gap:6px;flex-wrap:wrap}
+  .chip{
+    border:1px solid var(--rule);background:#fff;border-radius:999px;
+    padding:3px 10px;font-size:12px;cursor:pointer;white-space:nowrap;color:var(--ink)
+  }
+  .chip:hover{border-color:var(--brand)}
+  .chip.active{background:var(--brand);border-color:var(--brand);color:#fff}
+  .chip .n{opacity:.65;margin-left:5px;font-variant-numeric:tabular-nums}
+  main{display:flex;flex:1;min-height:0}
+  /* left */
+  .left{width:430px;min-width:340px;border-right:1px solid var(--rule);
+        display:flex;flex-direction:column;background:var(--panel)}
+  .controls{padding:8px 10px;border-bottom:1px solid var(--rule);display:flex;
+            flex-direction:column;gap:6px}
+  .controls input,.controls textarea{
+    width:100%;border:1px solid var(--rule);border-radius:7px;padding:6px 8px;
+    font:inherit;font-size:12.5px;font-family:ui-monospace,Menlo,monospace}
+  .controls textarea{resize:vertical;min-height:34px}
+  .row{display:flex;gap:6px;align-items:center}
+  button{
+    border:1px solid var(--rule);background:#fff;border-radius:7px;padding:5px 10px;
+    font:inherit;font-size:12.5px;cursor:pointer}
+  button:hover{border-color:var(--brand)}
+  button.primary{background:var(--brand);border-color:var(--brand);color:#fff}
+  .hint{color:var(--muted);font-size:11px}
+  .list{flex:1;overflow:auto}
+  .item{
+    display:grid;grid-template-columns:1fr auto;gap:2px 8px;
+    padding:7px 10px;border-bottom:1px solid #f0f1f4;cursor:pointer}
+  .item:hover{background:#f7f9fc}
+  .item.sel{background:var(--hi);box-shadow:inset 3px 0 0 var(--brand)}
+  .item .h{font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .item .nums{color:var(--muted);font-size:11.5px;font-variant-numeric:tabular-nums;
+              text-align:right;white-space:nowrap}
+  .badge{display:inline-block;font-size:10.5px;padding:1px 6px;border-radius:999px;
+         background:#eef1f6;color:#475;margin-right:4px;vertical-align:1px}
+  .lab-dot{display:inline-block;width:8px;height:8px;border-radius:50%;
+           background:var(--brand);margin-left:5px}
+  /* right */
+  .right{flex:1;overflow:auto;padding:18px 22px;min-width:0}
+  .empty{color:var(--muted);margin-top:40px;text-align:center}
+  .phead{display:flex;gap:14px;align-items:flex-start}
+  .avatar{width:72px;height:72px;border-radius:50%;background:#e8edf3;flex:none;
+          object-fit:cover;border:1px solid var(--rule)}
+  .pname{font-size:20px;font-weight:700;letter-spacing:-.01em}
+  .phandle{color:var(--brand);font-size:13.5px}
+  .pdid{color:var(--muted);font-size:11.5px;font-family:ui-monospace,monospace;
+        word-break:break-all;margin-top:2px}
+  .statusline{margin-top:6px;font-size:12.5px;color:var(--muted)}
+  .pill{display:inline-block;padding:1px 8px;border-radius:999px;font-size:11.5px;
+        border:1px solid var(--rule)}
+  .pill.bad{background:#fef2f2;border-color:#fecaca;color:#b91c1c}
+  .pill.good{background:#f0fdf4;border-color:#bbf7d0;color:#15803d}
+  .bio{margin:14px 0;white-space:pre-wrap;line-height:1.5;max-width:680px}
+  .grid{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin:14px 0;max-width:680px}
+  .cell{border:1px solid var(--rule);border-radius:9px;padding:8px 10px;background:#fff}
+  .cell .v{font-size:18px;font-weight:700;font-variant-numeric:tabular-nums}
+  .cell .v.cmp{font-size:13px;color:var(--muted);font-weight:600}
+  .cell .l{font-size:11px;color:var(--muted)}
+  h3{margin:20px 0 8px;font-size:13px;text-transform:uppercase;letter-spacing:.06em;
+     color:var(--muted)}
+  .spark{height:40px}
+  .follows{display:flex;flex-wrap:wrap;gap:6px;max-width:760px}
+  .fchip{display:flex;align-items:center;gap:6px;border:1px solid var(--rule);
+         border-radius:999px;padding:2px 8px 2px 2px;font-size:12px;max-width:230px}
+  .fchip img{width:20px;height:20px;border-radius:50%;background:#e8edf3;object-fit:cover}
+  .fchip span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .posts{max-width:720px}
+  .post{border:1px solid var(--rule);border-radius:9px;padding:8px 11px;margin-bottom:7px;background:#fff}
+  .post .meta{color:var(--muted);font-size:11px;margin-bottom:3px}
+  .post .t{white-space:pre-wrap;line-height:1.45}
+  /* labels */
+  .labelbar{position:sticky;bottom:0;background:var(--panel);border-top:1px solid var(--rule);
+            padding:10px 22px;margin:18px -22px -18px;display:flex;flex-direction:column;gap:8px}
+  .labels{display:flex;flex-wrap:wrap;gap:6px}
+  .labels button{font-size:12px}
+  .labels button.on{background:var(--brand);border-color:var(--brand);color:#fff}
+  .labels button .k{opacity:.55;margin-right:5px}
+  .notewrap{display:flex;gap:6px}
+  .notewrap input{flex:1;border:1px solid var(--rule);border-radius:7px;padding:6px 8px;font:inherit}
+  a{color:var(--brand)}
+  .loading{color:var(--muted)}
+</style>
+</head>
+<body>
+<header>
+  <span class="title">account viewer</span>
+  <span class="meta" id="meta">loading…</span>
+  <div class="chips" id="chips"></div>
+</header>
+<main>
+  <section class="left">
+    <div class="controls">
+      <textarea id="where" rows="1" placeholder="WHERE expr, e.g.  follows < 10 AND content = 0"></textarea>
+      <div class="row">
+        <button class="primary" id="run">Run ⏎</button>
+        <button id="rand">Random (r)</button>
+        <button id="more">More ↓</button>
+        <label class="hint"><input type="checkbox" id="sqlmode" style="width:auto"> raw SQL</label>
+        <span class="hint" id="status" style="margin-left:auto"></span>
+      </div>
+    </div>
+    <div class="list" id="list"></div>
+  </section>
+  <section class="right" id="detail">
+    <div class="empty">Pick an account on the left, or hit <b>r</b> for a random sample.<br>
+      Use <b>↑ ↓</b> to flip through. Number keys <b>1–9</b> label the current account.</div>
+  </section>
+</main>
+
+<script>
+const LABELS = [
+  "bot/spam","onboarding-dropoff","non-english","real-inactive",
+  "deactivated/deleted","handle-squat","nsfw/promo","unclear","interesting"
+];
+const API = "";
+let state = { rows:[], sel:-1, offset:0, lastQuery:null, did:null, busy:false };
+
+const $ = s => document.querySelector(s);
+const el = (t,c,txt)=>{const e=document.createElement(t);if(c)e.className=c;if(txt!=null)e.textContent=txt;return e;};
+const fmt = n => (n==null?"—":Number(n).toLocaleString());
+const shortDid = d => d ? d.replace("did:plc:","").slice(0,10) : "";
+
+async function jget(u){const r=await fetch(API+u);return r.json();}
+async function jpost(u,b){const r=await fetch(API+u,{method:"POST",headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});return r.json();}
+
+// ---- meta / chips -------------------------------------------------------
+let META=null, activeCat="";
+async function loadMeta(){
+  META = await jget("/api/meta");
+  $("#meta").textContent =
+    `snapshot ${META.snapshot_date} · ${fmt(META.total)} accounts`;
+  const chips=$("#chips"); chips.innerHTML="";
+  const all=el("div","chip","all"); all.onclick=()=>{activeCat="";refreshChips();runQuery(true);};
+  chips.appendChild(all);
+  META.categories.forEach(c=>{
+    const ch=el("div","chip");
+    ch.innerHTML = `${c.category}<span class="n">${fmt(c.n)}</span>`;
+    ch.onclick=()=>{activeCat=c.category;refreshChips();runQuery(true);};
+    ch.dataset.cat=c.category;
+    chips.appendChild(ch);
+  });
+  refreshChips();
+}
+function refreshChips(){
+  document.querySelectorAll(".chip").forEach(c=>{
+    const isAll = c.textContent==="all";
+    c.classList.toggle("active",(isAll&&!activeCat)||c.dataset.cat===activeCat);
+  });
+}
+
+// ---- query / list -------------------------------------------------------
+function buildUrl(reset){
+  const where=$("#where").value.trim();
+  const sqlmode=$("#sqlmode").checked;
+  const p=new URLSearchParams();
+  if(reset)state.offset=0;
+  p.set("limit","200"); p.set("offset",String(state.offset));
+  if(state._random){p.set("random","1");p.set("seed",String(state._seed));}
+  if(sqlmode){ if(where)p.set("sql",where); }
+  else{
+    if(where)p.set("where",where);
+    if(activeCat)p.set("category",activeCat);
+  }
+  return "/api/accounts?"+p.toString();
+}
+async function runQuery(reset,append){
+  if(reset){state._random=false;}
+  $("#status").textContent="…";
+  try{
+    const data=await jget(buildUrl(reset));
+    if(data.error){$("#status").textContent="err: "+data.error;return;}
+    if(append) state.rows=state.rows.concat(data.rows);
+    else {state.rows=data.rows; state.sel=-1;}
+    state.offset += data.rows.length;
+    renderList();
+    $("#status").textContent=`${state.rows.length} rows`;
+    if(!append && state.rows.length){ select(0); }
+  }catch(e){$("#status").textContent="err: "+e.message;}
+}
+function renderList(){
+  const list=$("#list"); list.innerHTML="";
+  state.rows.forEach((r,i)=>{
+    const it=el("div","item"+(i===state.sel?" sel":""));
+    it.dataset.i=i;
+    const left=el("div","h");
+    left.innerHTML=`<span class="badge">${r.category}</span>${r.did_handle||shortDid(r.did)}`;
+    if(state.labels&&state.labels[r.did]) left.innerHTML+=`<span class="lab-dot" title="${state.labels[r.did]}"></span>`;
+    const nums=el("div","nums",
+      `f${fmt(r.follows)}·${fmt(r.followers)}  p${fmt(r.posts)}  ♥${fmt(r.likes_out)}`);
+    it.appendChild(left); it.appendChild(nums);
+    it.onclick=()=>select(i);
+    list.appendChild(it);
+  });
+}
+function select(i){
+  if(i<0||i>=state.rows.length)return;
+  state.sel=i;
+  document.querySelectorAll(".item").forEach(e=>e.classList.toggle("sel",+e.dataset.i===i));
+  const sel=document.querySelector(".item.sel");
+  if(sel)sel.scrollIntoView({block:"nearest"});
+  loadDetail(state.rows[i].did);
+  // prefetch more list when near the end
+  if(i>=state.rows.length-5 && !state.busy) loadMore();
+}
+async function loadMore(){
+  if(state.busy)return; state.busy=true;
+  await runQuery(false,true); state.busy=false;
+}
+
+// ---- detail -------------------------------------------------------------
+async function loadDetail(did){
+  state.did=did;
+  const d=$("#detail");
+  d.innerHTML='<div class="loading">hydrating '+did+' …</div>';
+  let data;
+  try{ data=await jget("/api/account?did="+encodeURIComponent(did)); }
+  catch(e){ d.innerHTML='<div class="empty">fetch failed: '+e.message+'</div>'; return; }
+  if(state.did!==did) return; // user moved on
+  renderDetail(data);
+}
+function renderDetail(data){
+  const d=$("#detail"); d.innerHTML="";
+  const snap=data.snapshot||{}, live=data.live||{}, prof=live.profile||{};
+  const err=prof.error;
+  // cache handle for the list
+  if(prof.handle){ const row=state.rows.find(r=>r.did===data.snapshot.did); if(row){row.did_handle=prof.handle; renderList();}}
+
+  const head=el("div","phead");
+  const av=el("img","avatar"); av.src=prof.avatar||""; av.onerror=()=>av.style.visibility="hidden";
+  head.appendChild(av);
+  const hd=el("div"); hd.style.minWidth="0";
+  hd.appendChild(el("div","pname",prof.displayName||(err?"(no profile)":shortDid(snap.did))));
+  if(prof.handle){const a=el("a","phandle","@"+prof.handle);a.href="https://bsky.app/profile/"+prof.handle;a.target="_blank";hd.appendChild(a);}
+  hd.appendChild(el("div","pdid",snap.did));
+  const sl=el("div","statusline");
+  const joined = prof.createdAt? new Date(prof.createdAt) : null;
+  let bits=[];
+  if(joined) bits.push("joined "+joined.toISOString().slice(0,10));
+  bits.push(`<span class="pill ${snap.active?'good':'bad'}">snapshot: ${snap.active?'active':'inactive'}</span>`);
+  if(err) bits.push(`<span class="pill bad">live: ${err}</span>`);
+  if(prof.labels&&prof.labels.length) bits.push(`<span class="pill bad">labels: ${prof.labels.map(l=>l.val).join(', ')}</span>`);
+  sl.innerHTML=bits.join(" · ");
+  hd.appendChild(sl);
+  head.appendChild(hd);
+  d.appendChild(head);
+
+  if(prof.description) {const b=el("div","bio",prof.description); d.appendChild(b);}
+
+  // counts: snapshot vs live (now)
+  const grid=el("div","grid");
+  const cell=(label,snapV,liveV)=>{
+    const c=el("div","cell");
+    c.innerHTML=`<div class="v">${fmt(snapV)}</div>`+
+      (liveV!=null?`<div class="v cmp">now ${fmt(liveV)}</div>`:``)+
+      `<div class="l">${label}</div>`;
+    return c;
+  };
+  grid.appendChild(cell("follows",snap.follows,prof.followsCount));
+  grid.appendChild(cell("followers",snap.followers,prof.followersCount));
+  grid.appendChild(cell("posts",snap.posts,prof.postsCount));
+  grid.appendChild(cell("likes out",snap.likes_out,null));
+  grid.appendChild(cell("reposts out",snap.reposts_out,null));
+  grid.appendChild(cell("replies out",snap.replies_out,null));
+  grid.appendChild(cell("blocks out",snap.blocks_out,null));
+  grid.appendChild(cell("quotes out",snap.quotes_out,null));
+  d.appendChild(grid);
+
+  // activity sparkline from recent feed
+  const feed=live.feed||[];
+  d.appendChild(el("h3",null,`recent posts (${feed.length})`));
+  if(feed.length){ d.appendChild(sparkline(feed)); }
+  const posts=el("div","posts");
+  if(!feed.length){ posts.appendChild(el("div","hint", err?"—":"no recent posts returned")); }
+  feed.slice(0,12).forEach(p=>{
+    const pe=el("div","post");
+    const when=p.createdAt?new Date(p.createdAt).toISOString().slice(0,10):"";
+    pe.appendChild(el("div","meta",`${when}${p.isRepost?" · repost":""} · ♥${p.likeCount} ↻${p.repostCount} 💬${p.replyCount}`));
+    pe.appendChild(el("div","t",p.text||"(no text)"));
+    posts.appendChild(pe);
+  });
+  d.appendChild(posts);
+
+  // who they follow
+  const follows=live.follows||[];
+  d.appendChild(el("h3",null,`follows (${prof.followsCount!=null?fmt(prof.followsCount):follows.length}${follows.length>=100?" — first 100":""})`));
+  const fwrap=el("div","follows");
+  if(!follows.length){ fwrap.appendChild(el("div","hint", err?"—":"none / not returned")); }
+  follows.forEach(f=>{
+    const fc=el("div","fchip");
+    const im=el("img"); im.src=f.avatar||""; im.onerror=()=>im.style.visibility="hidden";
+    fc.appendChild(im);
+    const a=el("a",null,f.displayName||("@"+f.handle)); a.href="https://bsky.app/profile/"+f.handle;a.target="_blank";
+    const s=el("span"); s.appendChild(a); fc.appendChild(s);
+    fwrap.appendChild(fc);
+  });
+  d.appendChild(fwrap);
+
+  // label bar
+  d.appendChild(labelBar(data));
+}
+
+function sparkline(feed){
+  const days=feed.map(p=>p.createdAt?Date.parse(p.createdAt):null).filter(Boolean).sort();
+  const svg=document.createElementNS("http://www.w3.org/2000/svg","svg");
+  svg.setAttribute("class","spark"); svg.setAttribute("width","680"); svg.setAttribute("height","40");
+  if(!days.length) return svg;
+  const min=days[0],max=days[days.length-1]||min+1;
+  const span=Math.max(max-min,86400000);
+  days.forEach(t=>{
+    const x=4+( (t-min)/span )*672, line=document.createElementNS(svg.namespaceURI,"line");
+    line.setAttribute("x1",x);line.setAttribute("x2",x);line.setAttribute("y1",4);line.setAttribute("y2",36);
+    line.setAttribute("stroke","#0085ff");line.setAttribute("stroke-width","2");line.setAttribute("opacity","0.5");
+    svg.appendChild(line);
+  });
+  return svg;
+}
+
+function labelBar(data){
+  const bar=el("div","labelbar");
+  const cur=(data.label&&data.label.label)||"";
+  const row=el("div","labels");
+  LABELS.forEach((name,idx)=>{
+    const b=el("button"); b.innerHTML=`<span class="k">${idx+1}</span>${name}`;
+    if(cur===name)b.classList.add("on");
+    b.onclick=()=>applyLabel(name);
+    row.appendChild(b);
+  });
+  bar.appendChild(row);
+  const nw=el("div","notewrap");
+  const note=el("input"); note.id="note"; note.placeholder="note (Enter to save)…";
+  note.value=(data.label&&data.label.note)||"";
+  note.onkeydown=ev=>{ if(ev.key==="Enter"){ev.preventDefault();saveNote();} ev.stopPropagation(); };
+  nw.appendChild(note);
+  const sv=el("button","primary","save note"); sv.onclick=saveNote;
+  nw.appendChild(sv);
+  bar.appendChild(nw);
+  return bar;
+}
+async function applyLabel(name){
+  if(!state.did)return;
+  const note=$("#note")?$("#note").value:"";
+  await jpost("/api/label",{did:state.did,label:name,note});
+  state.labels=state.labels||{}; state.labels[state.did]=name;
+  document.querySelectorAll(".labels button").forEach(b=>
+    b.classList.toggle("on", b.textContent.replace(/^\d/,"")===name));
+  renderList();
+}
+async function saveNote(){
+  if(!state.did)return;
+  const note=$("#note").value;
+  const cur=state.labels&&state.labels[state.did]||"";
+  await jpost("/api/label",{did:state.did,label:cur,note});
+  $("#status").textContent="note saved";
+}
+
+// ---- keys ---------------------------------------------------------------
+document.addEventListener("keydown",e=>{
+  if(e.target.tagName==="TEXTAREA"||e.target.tagName==="INPUT"){
+    if(e.key==="Enter"&&e.target.id==="where"){e.preventDefault();runQuery(true);}
+    return;
+  }
+  if(e.key==="ArrowDown"||e.key==="j"){e.preventDefault();select(Math.min(state.sel+1,state.rows.length-1));}
+  else if(e.key==="ArrowUp"||e.key==="k"){e.preventDefault();select(Math.max(state.sel-1,0));}
+  else if(e.key==="ArrowRight"){e.preventDefault();select(Math.min(state.sel+1,state.rows.length-1));}
+  else if(e.key==="ArrowLeft"){e.preventDefault();select(Math.max(state.sel-1,0));}
+  else if(e.key==="r"){e.preventDefault();randomSample();}
+  else if(e.key==="o"){const r=state.rows[state.sel];if(r){const h=r.did_handle;window.open("https://bsky.app/profile/"+(h||r.did),"_blank");}}
+  else if(/^[1-9]$/.test(e.key)){e.preventDefault();applyLabel(LABELS[+e.key-1]);}
+  else if(e.key==="/"){e.preventDefault();$("#where").focus();}
+});
+
+function randomSample(){
+  state._random=true; state._seed=Math.random();
+  state.offset=0; runQuery(false,false);
+}
+
+// ---- boot ---------------------------------------------------------------
+$("#run").onclick=()=>runQuery(true);
+$("#rand").onclick=randomSample;
+$("#more").onclick=loadMore;
+$("#sqlmode").onchange=e=>{
+  $("#where").placeholder = e.target.checked
+    ? "full SELECT, e.g.  SELECT * FROM accounts WHERE followers>1000 AND content=0"
+    : "WHERE expr, e.g.  follows < 10 AND content = 0";
+};
+(async()=>{ await loadMeta(); state.labels={}; (await jget("/api/labels")).labels.forEach(l=>state.labels[l.did]=l.label); runQuery(true); })();
+</script>
+</body>
+</html>
