@@ -262,6 +262,34 @@ def analyze_blocks(
     return _persist(snapshot_date, "blocks_cleavage", html, sidecar)
 
 
+@app.function(
+    image=analysis_image,
+    volumes={"/vol-out": volume_out},
+    timeout=60 * 60 * 2,
+    cpu=8.0,
+    # Materializes the cleaned follow edge set (~1.3B rows) plus per-source
+    # out-degree and per-target aggregates; big hash joins + group-bys spill
+    # to /tmp. 96 GiB resident + a generous temp dir keeps it off the OOM line.
+    memory=96 * 1024,
+    ephemeral_disk=1024 * 1024,
+)
+def analyze_boosters(
+    snapshot_date: str = "2026-04-28",
+    min_followers: int = 100,
+    top_n: int = 200,
+    exclude_dids: str = "",
+) -> bytes:
+    from analysis.boosters import run
+    excl = [d for d in exclude_dids.split(",") if d.strip()] or None
+    con = _open_snapshot(snapshot_date, memory_limit="84GiB")
+    con.execute("SET max_temp_directory_size='900GiB'")
+    html, sidecar = run(
+        con, snapshot_date,
+        min_followers=min_followers, top_n=top_n, exclude_dids=excl,
+    )
+    return _persist(snapshot_date, "boosters", html, sidecar)
+
+
 # Maps the public --analysis flag to (remote fn, output basename, extra
 # kwargs-derived-from-cli). Each entry lists which CLI params it consumes
 # so the dispatcher can pass through only the relevant ones.
@@ -293,6 +321,15 @@ _DISPATCH = {
         "out_name": lambda d: f"blocks_cleavage_{d}.html",
         "vol_path": lambda d: f"/vol-out/var/analysis/{d}/blocks_cleavage.html",
         "kwargs": lambda d, **rest: {"snapshot_date": d},
+    },
+    "boosters": {
+        "fn": analyze_boosters,
+        "out_name": lambda d: f"boosters_{d}.html",
+        "vol_path": lambda d: f"/vol-out/var/analysis/{d}/boosters.html",
+        "kwargs": lambda d, *, min_followers, top_n, exclude_dids, **rest: {
+            "snapshot_date": d, "min_followers": min_followers,
+            "top_n": top_n, "exclude_dids": exclude_dids,
+        },
     },
     "followers": {
         "fn": analyze_followers,
@@ -339,13 +376,19 @@ def main(
     existing_baseline_date: str = "2025-01-01",
     lookback_days: int = 0,
     emit_state_log: int = 0,
+    min_followers: int = 100,
+    top_n: int = 200,
+    exclude_dids: str = "",
     background: bool = False,
 ) -> None:
     """Dispatch to one of the snapshot analyses.
 
     Args:
       analysis: which analysis to run — likes, ratio, attrition,
-        followers, following, blocks, growth.
+        followers, following, blocks, boosters, growth.
+      min_followers/top_n/exclude_dids: boosters only — min audience to rank,
+        how many targets to list, and a comma-separated list of did:plc:… to
+        treat as bsky/default follows (empty ⇒ built-in official set).
       snapshot_date: which snapshot in /vol-out/var/snapshot/<date>/ to read.
       window_days: time-window length for windowed analyses (ratio).
       inactivity_days: inactivity threshold for attrition.
@@ -372,6 +415,9 @@ def main(
         existing_baseline_date=existing_baseline_date,
         lookback_days=lookback_days,
         emit_state_log=emit_state_log,
+        min_followers=min_followers,
+        top_n=top_n,
+        exclude_dids=exclude_dids,
     )
     out_name = spec["out_name"](snapshot_date)
     vol_path = spec["vol_path"](snapshot_date)
