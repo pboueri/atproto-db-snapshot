@@ -34,10 +34,20 @@ STATIC_DIR = os.path.join(HERE, "static")
 APPVIEW = "https://public.api.bsky.app/xrpc"
 CACHE_TTL = 7 * 24 * 3600  # re-fetch profiles older than a week
 
-# Columns returned to the list pane. Keep light -- the detail pane has the rest.
+# Columns returned to the list pane (covers every sort facet so the UI can show
+# whatever you order by). Still small per row.
 LIST_COLS = [
     "did", "did_id", "category", "active", "follows", "followers",
-    "posts", "likes_out", "reposts_out", "replies_out", "content", "any_activity",
+    "posts", "likes_out", "likes_in", "reposts_out", "reposts_in",
+    "replies_out", "quotes_out", "quoted_count", "blocks_out", "blocks_in",
+    "content", "any_activity",
+]
+
+# Facets the list can be sorted by (whitelist -- these interpolate into ORDER BY).
+SORT_COLS = [
+    "followers", "follows", "posts", "likes_out", "likes_in", "reposts_out",
+    "reposts_in", "replies_out", "quotes_out", "quoted_count", "blocks_out",
+    "blocks_in", "content", "any_activity", "did_id",
 ]
 
 # ----------------------------------------------------------------------------
@@ -143,9 +153,57 @@ def hydrate(did: str, *, force: bool = False) -> dict:
             "repostCount": post.get("repostCount", 0),
             "replyCount": post.get("replyCount", 0),
             "isRepost": it.get("reason", {}).get("$type", "").endswith("reasonRepost"),
+            "media": _extract_media(post.get("embed")),
         })
     out["feed"] = items
     return out
+
+
+def _extract_media(embed: dict | None) -> dict:
+    """Normalize a hydrated post embed view into {images, external, video, quote}.
+
+    Handles the AppView `*#view` embed types incl. recordWithMedia. URLs here
+    are bsky CDN links the browser can load directly.
+    """
+    out = {"images": [], "external": None, "video": None, "quote": None}
+    if not embed:
+        return out
+    t = embed.get("$type", "")
+    if t.endswith("recordWithMedia#view"):
+        media = _extract_media(embed.get("media"))
+        out.update({k: media[k] for k in ("images", "external", "video")})
+        rec = (embed.get("record") or {}).get("record") or {}
+        out["quote"] = _quote_summary(rec)
+        return out
+    if t.endswith("images#view"):
+        for im in embed.get("images", [])[:4]:
+            out["images"].append({
+                "thumb": im.get("thumb"), "full": im.get("fullsize"),
+                "alt": im.get("alt", ""),
+            })
+    elif t.endswith("video#view"):
+        out["video"] = {"thumb": embed.get("thumbnail"), "alt": embed.get("alt", "")}
+    elif t.endswith("external#view"):
+        ext = embed.get("external", {})
+        out["external"] = {
+            "uri": ext.get("uri"), "title": ext.get("title", ""),
+            "thumb": ext.get("thumb"),
+        }
+    elif t.endswith("record#view"):
+        out["quote"] = _quote_summary((embed.get("record") or {}))
+    return out
+
+
+def _quote_summary(rec: dict) -> dict | None:
+    """A tiny summary of a quoted post (author handle + text)."""
+    if not rec:
+        return None
+    author = rec.get("author", {})
+    val = rec.get("value", {}) or rec.get("record", {})
+    return {
+        "handle": author.get("handle"),
+        "text": (val.get("text") or "")[:200],
+    }
 
 
 # ----------------------------------------------------------------------------
@@ -177,6 +235,12 @@ def query_accounts(args: dict) -> dict:
     except ValueError:
         seed = 0.42
 
+    # Sort facet (whitelisted column + direction). Ignored when randomizing.
+    sort = args.get("sort", "followers")
+    if sort not in SORT_COLS:
+        sort = "followers"
+    direction = "ASC" if str(args.get("dir", "desc")).lower() == "asc" else "DESC"
+
     cols = ", ".join(LIST_COLS)
     if raw_sql:
         # Power mode: user-supplied SELECT. Connection is read-only so this
@@ -189,7 +253,11 @@ def query_accounts(args: dict) -> dict:
         if where:
             clauses.append(f"({where})")
         wsql = (" WHERE " + " AND ".join(clauses)) if clauses else ""
-        orderby = "ORDER BY random()" if randomize else "ORDER BY followers DESC"
+        # Secondary key on did_id keeps pagination stable across pages.
+        orderby = (
+            "ORDER BY random()" if randomize
+            else f"ORDER BY {sort} {direction}, did_id"
+        )
         sql = (
             f"SELECT {cols} FROM accounts{wsql} {orderby} "
             f"LIMIT {limit} OFFSET {offset}"
@@ -237,6 +305,7 @@ def meta() -> dict:
         "total": total,
         "categories": [{"category": c, "n": n} for c, n in cats],
         "columns": [c[1] for c in _columns()],
+        "sort_cols": SORT_COLS,
     }
 
 

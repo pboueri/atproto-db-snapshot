@@ -93,6 +93,24 @@
   .post{border:1px solid var(--rule);border-radius:9px;padding:8px 11px;margin-bottom:7px;background:#fff}
   .post .meta{color:var(--muted);font-size:11px;margin-bottom:3px}
   .post .t{white-space:pre-wrap;line-height:1.45}
+  .banner{width:100%;max-width:720px;height:120px;border-radius:10px;overflow:hidden;
+          margin-bottom:14px;background:#e8edf3;border:1px solid var(--rule)}
+  .banner img{width:100%;height:100%;object-fit:cover;display:block}
+  .media{display:flex;flex-wrap:wrap;gap:6px;margin-top:7px}
+  .mediaimg{max-height:200px;max-width:100%;border-radius:8px;border:1px solid var(--rule);
+            object-fit:cover;display:block}
+  .videowrap{position:relative}
+  .playbadge{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);
+             background:rgba(0,0,0,.55);color:#fff;border-radius:50%;width:34px;height:34px;
+             display:flex;align-items:center;justify-content:center;font-size:14px}
+  .extcard{display:flex;gap:9px;margin-top:7px;border:1px solid var(--rule);border-radius:9px;
+           overflow:hidden;text-decoration:none;color:inherit;max-width:480px}
+  .extthumb{width:84px;height:84px;object-fit:cover;flex:none;background:#e8edf3}
+  .exttext{padding:7px 9px;min-width:0}
+  .exttitle{font-weight:600;font-size:12.5px;overflow:hidden;text-overflow:ellipsis;
+            display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
+  .extdomain{color:var(--muted);font-size:11px;margin-top:3px}
+  .quote{border-left:3px solid var(--rule);margin-top:7px;padding:3px 0 3px 9px}
   /* labels */
   .labelbar{position:sticky;bottom:0;background:var(--panel);border-top:1px solid var(--rule);
             padding:10px 22px;margin:18px -22px -18px;display:flex;flex-direction:column;gap:8px}
@@ -123,6 +141,18 @@
         <label class="hint"><input type="checkbox" id="sqlmode" style="width:auto"> raw SQL</label>
         <span class="hint" id="status" style="margin-left:auto"></span>
       </div>
+      <div class="row">
+        <span class="hint">sort</span>
+        <select id="sort"></select>
+        <button id="dir" title="toggle direction">↓ desc</button>
+        <span class="hint">prefetch</span>
+        <select id="prefetch" title="how many accounts ahead to warm">
+          <option value="0">off</option>
+          <option value="3" selected>3</option>
+          <option value="6">6</option>
+          <option value="10">10</option>
+        </select>
+      </div>
     </div>
     <div class="list" id="list"></div>
   </section>
@@ -138,7 +168,10 @@ const LABELS = [
   "deactivated/deleted","handle-squat","nsfw/promo","unclear","interesting"
 ];
 const API = "";
-let state = { rows:[], sel:-1, offset:0, lastQuery:null, did:null, busy:false };
+let state = { rows:[], sel:-1, offset:0, lastQuery:null, did:null, busy:false,
+              sort:"followers", dir:"desc", cache:new Map(), inflight:new Map(),
+              prefetchN:3, pfQueue:[], pfActive:0 };
+const PF_CONCURRENCY=2;
 
 const $ = s => document.querySelector(s);
 const el = (t,c,txt)=>{const e=document.createElement(t);if(c)e.className=c;if(txt!=null)e.textContent=txt;return e;};
@@ -154,6 +187,10 @@ async function loadMeta(){
   META = await jget("/api/meta");
   $("#meta").textContent =
     `snapshot ${META.snapshot_date} · ${fmt(META.total)} accounts`;
+  const sortSel=$("#sort"); sortSel.innerHTML="";
+  (META.sort_cols||["followers","follows","posts","likes_out","content"]).forEach(c=>{
+    const o=el("option",null,c); o.value=c; if(c===state.sort)o.selected=true; sortSel.appendChild(o);
+  });
   const chips=$("#chips"); chips.innerHTML="";
   const all=el("div","chip","all"); all.onclick=()=>{activeCat="";refreshChips();runQuery(true);};
   chips.appendChild(all);
@@ -185,6 +222,7 @@ function buildUrl(reset){
   else{
     if(where)p.set("where",where);
     if(activeCat)p.set("category",activeCat);
+    if(!state._random){ p.set("sort",state.sort||"followers"); p.set("dir",state.dir||"desc"); }
   }
   return "/api/accounts?"+p.toString();
 }
@@ -195,7 +233,7 @@ async function runQuery(reset,append){
     const data=await jget(buildUrl(reset));
     if(data.error){$("#status").textContent="err: "+data.error;return;}
     if(append) state.rows=state.rows.concat(data.rows);
-    else {state.rows=data.rows; state.sel=-1;}
+    else {state.rows=data.rows; state.sel=-1; state.pfQueue=[];}
     state.offset += data.rows.length;
     renderList();
     $("#status").textContent=`${state.rows.length} rows`;
@@ -210,8 +248,11 @@ function renderList(){
     const left=el("div","h");
     left.innerHTML=`<span class="badge">${r.category}</span>${r.did_handle||shortDid(r.did)}`;
     if(state.labels&&state.labels[r.did]) left.innerHTML+=`<span class="lab-dot" title="${state.labels[r.did]}"></span>`;
-    const nums=el("div","nums",
-      `f${fmt(r.follows)}·${fmt(r.followers)}  p${fmt(r.posts)}  ♥${fmt(r.likes_out)}`);
+    let numtxt=`f${fmt(r.follows)}·${fmt(r.followers)}  p${fmt(r.posts)}  ♥${fmt(r.likes_out)}`;
+    const sk=state.sort;
+    if(sk && !["follows","followers","posts","likes_out"].includes(sk) && r[sk]!=null)
+      numtxt = `${sk} ${fmt(r[sk])}  ·  `+numtxt;
+    const nums=el("div","nums",numtxt);
     it.appendChild(left); it.appendChild(nums);
     it.onclick=()=>select(i);
     list.appendChild(it);
@@ -224,8 +265,37 @@ function select(i){
   const sel=document.querySelector(".item.sel");
   if(sel)sel.scrollIntoView({block:"nearest"});
   loadDetail(state.rows[i].did);
-  // prefetch more list when near the end
+  // warm the next N accounts so flipping down is instant
+  schedulePrefetch(i);
+  // prefetch more list rows when near the end
   if(i>=state.rows.length-5 && !state.busy) loadMore();
+}
+// --- hydration cache + prefetch queue ---
+async function fetchAccount(did){
+  if(state.cache.has(did)) return state.cache.get(did);
+  if(state.inflight.has(did)) return state.inflight.get(did);
+  const p=jget("/api/account?did="+encodeURIComponent(did))
+    .then(data=>{ state.cache.set(did,data); state.inflight.delete(did); return data; })
+    .catch(e=>{ state.inflight.delete(did); throw e; });
+  state.inflight.set(did,p);
+  return p;
+}
+function schedulePrefetch(i){
+  const n=state.prefetchN; if(!n)return;
+  for(let j=i+1;j<=i+n && j<state.rows.length;j++){
+    const did=state.rows[j].did;
+    if(state.cache.has(did)||state.inflight.has(did)||state.pfQueue.includes(did))continue;
+    state.pfQueue.push(did);
+  }
+  pumpPrefetch();
+}
+function pumpPrefetch(){
+  while(state.pfActive<PF_CONCURRENCY && state.pfQueue.length){
+    const did=state.pfQueue.shift();
+    if(state.cache.has(did))continue;
+    state.pfActive++;
+    fetchAccount(did).catch(()=>{}).finally(()=>{ state.pfActive--; pumpPrefetch(); });
+  }
 }
 async function loadMore(){
   if(state.busy)return; state.busy=true;
@@ -236,9 +306,11 @@ async function loadMore(){
 async function loadDetail(did){
   state.did=did;
   const d=$("#detail");
+  const cached=state.cache.get(did);
+  if(cached){ renderDetail(cached); return; }   // instant from prefetch
   d.innerHTML='<div class="loading">hydrating '+did+' …</div>';
   let data;
-  try{ data=await jget("/api/account?did="+encodeURIComponent(did)); }
+  try{ data=await fetchAccount(did); }
   catch(e){ d.innerHTML='<div class="empty">fetch failed: '+e.message+'</div>'; return; }
   if(state.did!==did) return; // user moved on
   renderDetail(data);
@@ -250,6 +322,10 @@ function renderDetail(data){
   // cache handle for the list
   if(prof.handle){ const row=state.rows.find(r=>r.did===data.snapshot.did); if(row){row.did_handle=prof.handle; renderList();}}
 
+  if(prof.banner){
+    const bn=el("div","banner"); const bi=el("img"); bi.src=prof.banner; bi.loading="lazy";
+    bi.onerror=()=>bn.remove(); bn.appendChild(bi); d.appendChild(bn);
+  }
   const head=el("div","phead");
   const av=el("img","avatar"); av.src=prof.avatar||""; av.onerror=()=>av.style.visibility="hidden";
   head.appendChild(av);
@@ -300,7 +376,41 @@ function renderDetail(data){
     const pe=el("div","post");
     const when=p.createdAt?new Date(p.createdAt).toISOString().slice(0,10):"";
     pe.appendChild(el("div","meta",`${when}${p.isRepost?" · repost":""} · ♥${p.likeCount} ↻${p.repostCount} 💬${p.replyCount}`));
-    pe.appendChild(el("div","t",p.text||"(no text)"));
+    if(p.text) pe.appendChild(el("div","t",p.text));
+    const m=p.media||{};
+    if(m.images&&m.images.length){
+      const g=el("div","media");
+      m.images.forEach(im=>{
+        const a=el("a"); a.href=im.full||im.thumb; a.target="_blank";
+        const img=el("img","mediaimg"); img.src=im.thumb||im.full; img.loading="lazy";
+        img.title=im.alt||""; img.onerror=()=>a.remove();
+        a.appendChild(img); g.appendChild(a);
+      });
+      pe.appendChild(g);
+    }
+    if(m.video){
+      const a=el("a"); a.href="https://bsky.app/profile/"+(prof.handle||snap.did); a.target="_blank";
+      const img=el("img","mediaimg"); img.src=m.video.thumb||""; img.loading="lazy";
+      img.onerror=()=>a.remove();
+      const wrap=el("div","media videowrap"); wrap.appendChild(a); a.appendChild(img);
+      a.appendChild(el("span","playbadge","▶")); pe.appendChild(wrap);
+    }
+    if(m.external){
+      const ex=el("a","extcard"); ex.href=m.external.uri||"#"; ex.target="_blank";
+      if(m.external.thumb){const t=el("img","extthumb");t.src=m.external.thumb;t.loading="lazy";t.onerror=()=>t.remove();ex.appendChild(t);}
+      const tx=el("div","exttext");
+      tx.appendChild(el("div","exttitle",m.external.title||m.external.uri||""));
+      try{tx.appendChild(el("div","extdomain",new URL(m.external.uri).hostname));}catch(_){}
+      ex.appendChild(tx); pe.appendChild(ex);
+    }
+    if(m.quote){
+      const q=el("div","quote");
+      q.appendChild(el("div","meta","↪ @"+(m.quote.handle||"?")));
+      if(m.quote.text)q.appendChild(el("div","t",m.quote.text));
+      pe.appendChild(q);
+    }
+    if(!p.text && !(m.images&&m.images.length) && !m.video && !m.external && !m.quote)
+      pe.appendChild(el("div","t","(no text)"));
     posts.appendChild(pe);
   });
   d.appendChild(posts);
@@ -366,6 +476,7 @@ async function applyLabel(name){
   const note=$("#note")?$("#note").value:"";
   await jpost("/api/label",{did:state.did,label:name,note});
   state.labels=state.labels||{}; state.labels[state.did]=name;
+  const c=state.cache.get(state.did); if(c)c.label={did:state.did,label:name,note};
   document.querySelectorAll(".labels button").forEach(b=>
     b.classList.toggle("on", b.textContent.replace(/^\d/,"")===name));
   renderList();
@@ -403,6 +514,13 @@ function randomSample(){
 $("#run").onclick=()=>runQuery(true);
 $("#rand").onclick=randomSample;
 $("#more").onclick=loadMore;
+$("#sort").onchange=e=>{ state.sort=e.target.value; runQuery(true); };
+$("#dir").onclick=()=>{
+  state.dir = state.dir==="desc" ? "asc" : "desc";
+  $("#dir").textContent = state.dir==="desc" ? "↓ desc" : "↑ asc";
+  runQuery(true);
+};
+$("#prefetch").onchange=e=>{ state.prefetchN=+e.target.value; if(state.sel>=0)schedulePrefetch(state.sel); };
 $("#sqlmode").onchange=e=>{
   $("#where").placeholder = e.target.checked
     ? "full SELECT, e.g.  SELECT * FROM accounts WHERE followers>1000 AND content=0"

@@ -35,8 +35,14 @@ reason as you flip through them.
   cohort under investigation (joined, <10 follows, no posts/likes).
 - **WHERE box**: type a SQL predicate against the `accounts` columns, e.g.
   `followers > 1000 AND content = 0`. Tick **raw SQL** to paste a full SELECT.
+- **sort** — order the list by any facet (followers, follows, posts, likes,
+  reposts, replies, quotes, blocks in/out, content, …); the **↓ desc / ↑ asc**
+  button flips direction. The sorted value is shown in each row.
+- **prefetch** — how many accounts *ahead* of the cursor to hydrate in the
+  background (default 3) so arrowing down is instant. Set to `off` to disable.
 - **r** — random sample (re-roll). **Run / ⏎** — apply the filter.
-- **↑ / ↓** (or j/k) — flip through accounts; the detail pane hydrates live.
+- **↑ / ↓** (or j/k) — flip through accounts; the detail pane hydrates live
+  (instant for already-prefetched rows).
 - **1–9** — tag the current account with a reason. **/** focuses the query box.
   **o** opens the account on bsky.app.
 - Labels + notes are saved to `viewer.sqlite` (table `labels`) — that's the
@@ -44,10 +50,12 @@ reason as you flip through them.
 
 ## What the detail pane shows
 
-Live from bsky: avatar, display name, handle, bio, **join date**, current
-follow/follower/post counts (next to the snapshot counts), recent posts +
-a small activity sparkline, and **who they follow**. If the profile call fails
-(deactivated / deleted / takedown) that status is shown — itself a diagnosis.
+Live from bsky: profile **banner** + avatar, display name, handle, bio,
+**join date**, current follow/follower/post counts (next to the snapshot
+counts), recent posts **with their media** (images, video thumbnails, link
+cards, quoted posts) + a small activity sparkline, and **who they follow**.
+If the profile call fails (deactivated / deleted / takedown) that status is
+shown — itself a diagnosis.
 
 Note: bsky has no structured location field; any location lives in the bio text.
 
