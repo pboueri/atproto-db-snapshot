@@ -250,8 +250,11 @@ function renderList(){
     if(state.labels&&state.labels[r.did]) left.innerHTML+=`<span class="lab-dot" title="${state.labels[r.did]}"></span>`;
     let numtxt=`f${fmt(r.follows)}·${fmt(r.followers)}  p${fmt(r.posts)}  ♥${fmt(r.likes_out)}`;
     const sk=state.sort;
-    if(sk && !["follows","followers","posts","likes_out"].includes(sk) && r[sk]!=null)
+    if(sk==="created_est"){
+      numtxt = `≈${r.created_est?String(r.created_est).slice(0,10):"?"}  ·  `+numtxt;
+    } else if(sk && !["follows","followers","posts","likes_out"].includes(sk) && r[sk]!=null){
       numtxt = `${sk} ${fmt(r[sk])}  ·  `+numtxt;
+    }
     const nums=el("div","nums",numtxt);
     it.appendChild(left); it.appendChild(nums);
     it.onclick=()=>select(i);
@@ -337,6 +340,7 @@ function renderDetail(data){
   const joined = prof.createdAt? new Date(prof.createdAt) : null;
   let bits=[];
   if(joined) bits.push("joined "+joined.toISOString().slice(0,10));
+  if(snap.created_est) bits.push(`<span class="pill" title="estimated from earliest follow in snapshot">est. signup ≈ ${String(snap.created_est).slice(0,10)}</span>`);
   bits.push(`<span class="pill ${snap.active?'good':'bad'}">snapshot: ${snap.active?'active':'inactive'}</span>`);
   if(err) bits.push(`<span class="pill bad">live: ${err}</span>`);
   if(prof.labels&&prof.labels.length) bits.push(`<span class="pill bad">labels: ${prof.labels.map(l=>l.val).join(', ')}</span>`);

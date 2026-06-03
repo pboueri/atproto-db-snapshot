@@ -15,6 +15,8 @@ reason as you flip through them.
 - `server.py` — zero-dependency stdlib server (DuckDB for the list, bsky public
   AppView for the detail pane, sqlite for API cache + your labels).
 - `static/index.html` — the two-pane UI.
+- `add_created_est.py` — *optional* enrichment: adds an estimated signup-date
+  column (`created_est`) so you can sort by creation date. See below.
 - `accounts.duckdb` — generated; the data the viewer queries.
 - `viewer.sqlite` — generated; API cache + your labels.
 
@@ -28,6 +30,26 @@ reason as you flip through them.
 .venv/bin/python analysis/account_viewer/server.py
 # open http://127.0.0.1:8765
 ```
+
+### Optional: sort by estimated creation date
+
+Account creation time is **not** in the snapshot. `add_created_est.py`
+approximates it as each actor's earliest *plausible* follow (the `follows`
+table is full-history, and onboarding follows land near signup), adding a
+`created_est` column that becomes a sort facet. It does a heavy one-time scan
+of the ~1.33B-row `follows` table over the network (**multiple hours**) into a
+side file, then merges in a few seconds — the viewer stays usable throughout
+(stop the server briefly only for the final merge). Restart the server after
+it finishes to pick up the new facet.
+
+```bash
+.venv/bin/python analysis/account_viewer/add_created_est.py    # ~hours, resumable
+```
+
+`created_est` is an estimate; ~16% of accounts (fully-inert + like-only
+lurkers, which have no follow edge) are null and sort last. The TID
+plausibility filter (`2022-11-01`..snapshot) keeps bogus 1970/future
+timestamps from poisoning the per-actor minimum.
 
 ## Using it
 

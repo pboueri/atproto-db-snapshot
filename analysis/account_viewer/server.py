@@ -40,14 +40,16 @@ LIST_COLS = [
     "did", "did_id", "category", "active", "follows", "followers",
     "posts", "likes_out", "likes_in", "reposts_out", "reposts_in",
     "replies_out", "quotes_out", "quoted_count", "blocks_out", "blocks_in",
-    "content", "any_activity",
+    "content", "any_activity", "created_est",
 ]
 
 # Facets the list can be sorted by (whitelist -- these interpolate into ORDER BY).
+# created_est = estimated signup date (earliest plausible follow); may be absent
+# if add_created_est.py hasn't been run, so it's filtered against the schema below.
 SORT_COLS = [
-    "followers", "follows", "posts", "likes_out", "likes_in", "reposts_out",
-    "reposts_in", "replies_out", "quotes_out", "quoted_count", "blocks_out",
-    "blocks_in", "content", "any_activity", "did_id",
+    "created_est", "followers", "follows", "posts", "likes_out", "likes_in",
+    "reposts_out", "reposts_in", "replies_out", "quotes_out", "quoted_count",
+    "blocks_out", "blocks_in", "content", "any_activity", "did_id",
 ]
 
 # ----------------------------------------------------------------------------
@@ -56,6 +58,13 @@ SORT_COLS = [
 
 _duck_lock = threading.Lock()
 _duck = duckdb.connect(DB_PATH, read_only=True)
+
+# Some columns (created_est) only exist after the optional enrichment scripts
+# run. Filter the list/sort whitelists down to what's actually in the table so
+# the server works whether or not those have been built.
+_ACCOUNT_COLS = {r[1] for r in _duck.execute("PRAGMA table_info('accounts')").fetchall()}
+LIST_COLS = [c for c in LIST_COLS if c in _ACCOUNT_COLS]
+SORT_COLS = [c for c in SORT_COLS if c in _ACCOUNT_COLS]
 
 
 def _cache_conn() -> sqlite3.Connection:
@@ -214,6 +223,8 @@ def _jsonable(v):
     # did_id is u64 and can exceed JS-safe ints -> send as string
     if isinstance(v, int) and abs(v) > 2**53:
         return str(v)
+    if hasattr(v, "isoformat"):  # date / datetime (created_est) -> ISO string
+        return v.isoformat()
     return v
 
 
@@ -254,9 +265,10 @@ def query_accounts(args: dict) -> dict:
             clauses.append(f"({where})")
         wsql = (" WHERE " + " AND ".join(clauses)) if clauses else ""
         # Secondary key on did_id keeps pagination stable across pages.
+        # NULLS LAST so accounts with no estimated date (e.g. created_est) sink.
         orderby = (
             "ORDER BY random()" if randomize
-            else f"ORDER BY {sort} {direction}, did_id"
+            else f"ORDER BY {sort} {direction} NULLS LAST, did_id"
         )
         sql = (
             f"SELECT {cols} FROM accounts{wsql} {orderby} "

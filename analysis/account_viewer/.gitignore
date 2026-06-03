@@ -1,3 +1,3 @@
-accounts.duckdb
+accounts.duckdb*
 viewer.sqlite
 __pycache__/
