@@ -52,6 +52,9 @@ async fn end_to_end_synthetic_rocks() -> Result<()> {
         hydrate_chunk_dry_run: None,
         hydrate_window_days_back: None,
         hydrate_window_days_lag: None,
+        plc_export_url: "https://plc.directory".into(),
+        skip_plc: true,
+        plc_page_size: 1000,
     };
 
     let stage = at_snapshot::stage::run(&cfg, "2026-04-27").await?;

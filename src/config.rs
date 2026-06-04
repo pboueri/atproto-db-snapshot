@@ -59,6 +59,18 @@ pub struct Config {
     pub hydrate_window_days_back: Option<u32>,
     #[serde(default)]
     pub hydrate_window_days_lag: Option<u32>,
+    /// PLC directory base URL for the `plc` phase. The `/export`
+    /// endpoint is appended. Default is the canonical directory.
+    #[serde(default = "default_plc_export_url")]
+    pub plc_export_url: String,
+    /// Skip the PLC fetch. The phase still writes one empty schema-correct
+    /// shard so hydrate's enrichment glob resolves and `created_at` exists
+    /// (all NULL) — stable schema either way.
+    #[serde(default)]
+    pub skip_plc: bool,
+    /// PLC export page size (`count` query param, max 1000).
+    #[serde(default = "default_plc_page_size")]
+    pub plc_page_size: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -122,6 +134,14 @@ fn default_upload_include() -> Vec<String> {
 
 fn default_rocks_block_cache() -> String {
     "1GiB".to_string()
+}
+
+fn default_plc_export_url() -> String {
+    "https://plc.directory".to_string()
+}
+
+fn default_plc_page_size() -> usize {
+    1000
 }
 
 fn default_stage_threads() -> usize {
@@ -205,6 +225,9 @@ impl Config {
             hydrate_chunk_dry_run: None,
             hydrate_window_days_back: None,
             hydrate_window_days_lag: None,
+            plc_export_url: default_plc_export_url(),
+            skip_plc: false,
+            plc_page_size: default_plc_page_size(),
         }
     }
 

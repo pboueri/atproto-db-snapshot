@@ -54,6 +54,13 @@ spectral_image = (
     .add_local_python_source("analysis")
 )
 
+# Graph image adds python-igraph for the booster / farm analysis.
+graph_image = (
+    _base_pkgs
+    .pip_install("python-igraph==0.11.8")
+    .add_local_python_source("analysis")
+)
+
 app = modal.App("at-snapshot-analysis")
 
 
@@ -262,6 +269,39 @@ def analyze_blocks(
     return _persist(snapshot_date, "blocks_cleavage", html, sidecar)
 
 
+@app.function(
+    image=graph_image,
+    volumes={"/vol-out": volume_out},
+    timeout=60 * 60 * 3,
+    cpu=16.0,
+    memory=96 * 1024,
+    ephemeral_disk=512 * 1024,
+)
+def analyze_graph_boosters(
+    snapshot_date: str = "2026-05-11",
+    created_after: str = "2025-01-01",
+    booster_max_outdeg: int = 3,
+    min_target_support: int = 5,
+    top_targets: int = 100,
+    build_full_graph: bool = False,
+) -> bytes:
+    # Default path (build_full_graph=False) classifies boosters + farms with
+    # DuckDB + an igraph subgraph and fits comfortably in this container. The
+    # full 1.33B-edge igraph build (build_full_graph=True) needs far more RAM —
+    # run it on a dedicated high-memory function, not this one.
+    from analysis.graph_boosters import run
+    con = _open_snapshot(snapshot_date, memory_limit="80GiB")
+    html, sidecar = run(
+        con, snapshot_date,
+        created_after=created_after,
+        booster_max_outdeg=booster_max_outdeg,
+        min_target_support=min_target_support,
+        top_targets=top_targets,
+        build_full_graph=build_full_graph,
+    )
+    return _persist(snapshot_date, "graph_boosters", html, sidecar)
+
+
 # Maps the public --analysis flag to (remote fn, output basename, extra
 # kwargs-derived-from-cli). Each entry lists which CLI params it consumes
 # so the dispatcher can pass through only the relevant ones.
@@ -306,6 +346,20 @@ _DISPATCH = {
         "vol_path": lambda d: f"/vol-out/var/analysis/{d}/following_distribution.html",
         "kwargs": lambda d, **rest: {"snapshot_date": d},
     },
+    "graph": {
+        "fn": analyze_graph_boosters,
+        "out_name": lambda d: f"graph_boosters_{d}.html",
+        "vol_path": lambda d: f"/vol-out/var/analysis/{d}/graph_boosters.html",
+        "kwargs": lambda d, *, created_after, booster_max_outdeg,
+                          min_target_support, top_targets, build_full_graph, **rest: {
+            "snapshot_date": d,
+            "created_after": created_after,
+            "booster_max_outdeg": booster_max_outdeg,
+            "min_target_support": min_target_support,
+            "top_targets": top_targets,
+            "build_full_graph": build_full_graph,
+        },
+    },
     "growth": {
         "fn": analyze_growth,
         "out_name": lambda d: f"growth_{d}.html",
@@ -339,6 +393,11 @@ def main(
     existing_baseline_date: str = "2025-01-01",
     lookback_days: int = 0,
     emit_state_log: int = 0,
+    created_after: str = "2025-01-01",
+    booster_max_outdeg: int = 3,
+    min_target_support: int = 5,
+    top_targets: int = 100,
+    build_full_graph: bool = False,
     background: bool = False,
 ) -> None:
     """Dispatch to one of the snapshot analyses.
@@ -372,6 +431,11 @@ def main(
         existing_baseline_date=existing_baseline_date,
         lookback_days=lookback_days,
         emit_state_log=emit_state_log,
+        created_after=created_after,
+        booster_max_outdeg=booster_max_outdeg,
+        min_target_support=min_target_support,
+        top_targets=top_targets,
+        build_full_graph=build_full_graph,
     )
     out_name = spec["out_name"](snapshot_date)
     vol_path = spec["vol_path"](snapshot_date)

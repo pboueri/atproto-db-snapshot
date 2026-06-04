@@ -99,6 +99,29 @@ pub async fn run(cfg: &Config, snapshot_date: &str) -> Result<HydrateOutcome> {
             "build_post_aggs" => {
                 run_chunked_table(&conn, label, "post_aggs", &body, chunk_buckets, dry_run)?
             }
+            "enrich_actors_created" => {
+                // Only enrich when the `plc` phase produced shards. A
+                // snapshot built without it simply lacks created_at
+                // rather than failing the read_parquet glob.
+                let plc_dir = raw.join("plc");
+                let has_shard = std::fs::read_dir(&plc_dir)
+                    .ok()
+                    .map(|rd| {
+                        rd.filter_map(|e| e.ok()).any(|e| {
+                            e.path().extension().and_then(|x| x.to_str()) == Some("parquet")
+                        })
+                    })
+                    .unwrap_or(false);
+                if has_shard {
+                    conn.execute_batch(&body)
+                        .with_context(|| format!("hydrate sql: {label}"))?
+                } else {
+                    tracing::warn!(
+                        plc_dir = %plc_dir.display(),
+                        "no plc shards; skipping actors created_at enrichment"
+                    );
+                }
+            }
             _ => {
                 // Single-shot stages (load_raw, build_posts, macros) —
                 // strip chunk placeholders so files that still mention

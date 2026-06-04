@@ -5,6 +5,7 @@ pub mod hydrate;
 pub mod inspect;
 pub mod metadata;
 pub mod mirror;
+pub mod plc;
 pub mod repair;
 pub mod rocks;
 pub mod stage;
