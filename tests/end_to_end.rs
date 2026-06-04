@@ -27,6 +27,50 @@ const COL_REPOST: &str = "app.bsky.feed.repost";
 const COL_FOLLOW: &str = "app.bsky.graph.follow";
 const COL_BLOCK: &str = "app.bsky.graph.block";
 
+/// Spawn a one-shot HTTP mock of the PLC `/export` endpoint on a random
+/// local port, serving `body` (JSONL) to every request. The dataset is
+/// smaller than the page size, so `plc::run` makes a single request and
+/// stops on the short page. Returns the bound port.
+fn spawn_plc_mock(body: String) -> u16 {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind plc mock");
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let mut stream = match stream {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let mut buf = [0u8; 8192];
+            let _ = stream.read(&mut buf); // drain request headers (GET, no body)
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/jsonl\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+    port
+}
+
+/// Canned PLC export: genesis for alice/bob/carol/eve, a tombstone for carol,
+/// and NO row for dave (so dave stays unknown-age / created_at NULL). `eve` is
+/// not a staged actor, so it must be inserted as a PLC-only account.
+fn plc_export_body() -> String {
+    [
+        r#"{"did":"did:plc:alice","createdAt":"2025-01-15T00:00:00.000Z","operation":{"prev":null,"type":"create"}}"#,
+        r#"{"did":"did:plc:bob","createdAt":"2025-02-20T00:00:00.000Z","operation":{"prev":null,"type":"create"}}"#,
+        r#"{"did":"did:plc:carol","createdAt":"2025-03-01T00:00:00.000Z","operation":{"prev":null,"type":"create"}}"#,
+        r#"{"did":"did:plc:carol","createdAt":"2025-06-01T00:00:00.000Z","operation":{"prev":"bafyprev","type":"plc_tombstone"}}"#,
+        r#"{"did":"did:plc:eve","createdAt":"2025-04-10T00:00:00.000Z","operation":{"prev":null,"type":"create"}}"#,
+    ]
+    .join("\n")
+}
+
 #[tokio::test]
 async fn end_to_end_synthetic_rocks() -> Result<()> {
     let tmp = TempDir::new()?;
@@ -35,6 +79,8 @@ async fn end_to_end_synthetic_rocks() -> Result<()> {
     std::fs::write(work_dir.join("rocks/.cursor"), b"{}")?;
 
     populate_fixture(&work_dir.join("rocks"))?;
+
+    let plc_port = spawn_plc_mock(plc_export_body());
 
     let cfg = Config {
         source_url: "test://".into(),
@@ -52,12 +98,13 @@ async fn end_to_end_synthetic_rocks() -> Result<()> {
         hydrate_chunk_dry_run: None,
         hydrate_window_days_back: None,
         hydrate_window_days_lag: None,
-        plc_export_url: "https://plc.directory".into(),
-        skip_plc: true,
+        plc_export_url: format!("http://127.0.0.1:{plc_port}"),
+        skip_plc: false,
         plc_page_size: 1000,
     };
 
     let stage = at_snapshot::stage::run(&cfg, "2026-04-27").await?;
+    let plc = at_snapshot::plc::run(&cfg, "2026-04-27").await?;
     let hydrate = at_snapshot::hydrate::run(&cfg, "2026-04-27").await?;
 
     assert_counts(&hydrate.row_counts);
@@ -65,6 +112,8 @@ async fn end_to_end_synthetic_rocks() -> Result<()> {
     let conn = Connection::open(&hydrate.duckdb_path)?;
     assert_validation_queries(&conn)?;
     assert_metadata(&conn, "2026-04-27", &cfg)?;
+    assert_plc_enrichment(&conn)?;
+    assert_eq!(plc.rows, 5, "plc captured 4 creates + 1 tombstone");
 
     println!("stage counts: {:?}", stage.counts);
     println!("hydrate counts: {:?}", hydrate.row_counts);
@@ -174,7 +223,8 @@ fn assert_counts(counts: &[(String, u64)]) {
             .map(|(_, v)| *v)
             .unwrap_or_else(|| panic!("missing count for {t}"))
     };
-    assert_eq!(get("actors"), 4, "expected 4 actors");
+    // 4 staged actors + 1 PLC-only (eve) inserted by 07_enrich_actors_created.
+    assert_eq!(get("actors"), 5, "expected 4 staged actors + 1 PLC-only");
     assert_eq!(get("follows"), 5, "expected 5 follows");
     assert_eq!(get("blocks"), 1, "expected 1 block");
     assert_eq!(get("likes"), 4, "expected 4 likes");
@@ -193,6 +243,46 @@ fn assert_metadata(conn: &Connection, snapshot_date: &str, cfg: &Config) -> Resu
     )?;
     assert_eq!(date_str, snapshot_date);
     assert_eq!(source_url, cfg.source_url);
+    Ok(())
+}
+
+fn assert_plc_enrichment(conn: &Connection) -> Result<()> {
+    // eve (in PLC, not in microcosm) was inserted as a fresh actor.
+    let total: i64 = conn.query_row("SELECT COUNT(*) FROM actors", [], |r| r.get(0))?;
+    assert_eq!(total, 5, "4 staged + eve (PLC-only)");
+
+    // alice/bob/carol/eve have created_at; dave (absent from export) stays NULL.
+    let with_created: i64 =
+        conn.query_row("SELECT COUNT(*) FROM actors WHERE created_at IS NOT NULL", [], |r| r.get(0))?;
+    assert_eq!(with_created, 4, "alice,bob,carol,eve dated; dave NULL");
+    let dave_null: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM actors WHERE did='did:plc:dave' AND created_at IS NULL",
+        [],
+        |r| r.get(0),
+    )?;
+    assert_eq!(dave_null, 1, "dave has no PLC genesis -> created_at NULL");
+
+    // carol has a tombstone (deactivation) timestamp.
+    let carol_tomb: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM actors WHERE did='did:plc:carol' AND tombstoned_at IS NOT NULL",
+        [],
+        |r| r.get(0),
+    )?;
+    assert_eq!(carol_tomb, 1, "carol tombstoned");
+
+    // eve: PLC-only (in_microcosm=FALSE) with a fresh did_id past the staged max (4).
+    let (eve_micro, eve_id): (bool, i64) = conn.query_row(
+        "SELECT in_microcosm, did_id::BIGINT FROM actors WHERE did='did:plc:eve'",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    assert!(!eve_micro, "eve is PLC-only");
+    assert!(eve_id > 4, "eve gets a fresh did_id beyond the staged max, got {eve_id}");
+
+    // the 4 staged actors are flagged in_microcosm.
+    let micro_true: i64 =
+        conn.query_row("SELECT COUNT(*) FROM actors WHERE in_microcosm", [], |r| r.get(0))?;
+    assert_eq!(micro_true, 4, "the 4 staged actors are in_microcosm");
     Ok(())
 }
 
