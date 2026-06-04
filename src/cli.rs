@@ -249,9 +249,16 @@ async fn run_build(args: CommonArgs) -> Result<()> {
         "build start"
     );
 
-    do_mirror(&p).await?;
-    do_stage(&p).await?;
-    do_plc(&p).await?;
+    // The PLC fetch only talks to plc.directory — it's independent of the
+    // rocks mirror and stage, so run it concurrently with the mirror→stage
+    // chain (which is sequential: stage needs the mirrored rocksdb). Hydrate
+    // waits on both: it needs the staged parquets AND the plc shards.
+    let mirror_then_stage = async {
+        do_mirror(&p).await?;
+        do_stage(&p).await?;
+        Ok::<(), anyhow::Error>(())
+    };
+    tokio::try_join!(do_plc(&p), mirror_then_stage)?;
     do_hydrate(&p).await?;
 
     Ok(())
