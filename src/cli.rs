@@ -20,6 +20,10 @@ pub enum Cmd {
     Mirror(CommonArgs),
     /// Convert the local rocks mirror into per-entity parquet files.
     Stage(CommonArgs),
+    /// Fetch account creation/deactivation dates from the PLC directory
+    /// export into raw/<date>/plc/ (checkpointed + resumable). Consumed
+    /// by hydrate's 07_enrich_actors_created stage.
+    Plc(CommonArgs),
     /// Build snapshot.duckdb from the staged parquet files.
     Hydrate(CommonArgs),
     /// Upload raw + snapshot artifacts to the configured object store.
@@ -121,6 +125,15 @@ pub struct CommonArgs {
     pub window_days_back: Option<u32>,
     #[arg(long)]
     pub window_days_lag: Option<u32>,
+    /// PLC directory base URL (the `/export` endpoint is appended).
+    #[arg(long)]
+    pub plc_export_url: Option<String>,
+    /// Skip the PLC fetch; hydrate still adds a (NULL) created_at column.
+    #[arg(long)]
+    pub skip_plc: bool,
+    /// PLC export page size (`count`, max 1000).
+    #[arg(long)]
+    pub plc_page_size: Option<usize>,
 }
 
 pub async fn run() -> Result<()> {
@@ -130,6 +143,7 @@ pub async fn run() -> Result<()> {
         Cmd::Build(args) => run_build(args).await,
         Cmd::Mirror(args) => run_mirror(args).await,
         Cmd::Stage(args) => run_stage(args).await,
+        Cmd::Plc(args) => run_plc(args).await,
         Cmd::Hydrate(args) => run_hydrate(args).await,
         Cmd::Upload(args) => run_upload(args).await,
         Cmd::Inspect(args) => run_inspect(args).await,
@@ -215,6 +229,15 @@ fn apply_overrides(cfg: &mut Config, args: &CommonArgs) {
     if let Some(l) = args.window_days_lag {
         cfg.hydrate_window_days_lag = Some(l);
     }
+    if let Some(u) = &args.plc_export_url {
+        cfg.plc_export_url = u.clone();
+    }
+    if args.skip_plc {
+        cfg.skip_plc = true;
+    }
+    if let Some(n) = args.plc_page_size {
+        cfg.plc_page_size = n;
+    }
 }
 
 async fn run_build(args: CommonArgs) -> Result<()> {
@@ -226,8 +249,16 @@ async fn run_build(args: CommonArgs) -> Result<()> {
         "build start"
     );
 
-    do_mirror(&p).await?;
-    do_stage(&p).await?;
+    // The PLC fetch only talks to plc.directory — it's independent of the
+    // rocks mirror and stage, so run it concurrently with the mirror→stage
+    // chain (which is sequential: stage needs the mirrored rocksdb). Hydrate
+    // waits on both: it needs the staged parquets AND the plc shards.
+    let mirror_then_stage = async {
+        do_mirror(&p).await?;
+        do_stage(&p).await?;
+        Ok::<(), anyhow::Error>(())
+    };
+    tokio::try_join!(do_plc(&p), mirror_then_stage)?;
     do_hydrate(&p).await?;
 
     Ok(())
@@ -242,6 +273,12 @@ async fn run_mirror(args: CommonArgs) -> Result<()> {
 async fn run_stage(args: CommonArgs) -> Result<()> {
     let p = prepare(&args)?;
     do_stage(&p).await?;
+    Ok(())
+}
+
+async fn run_plc(args: CommonArgs) -> Result<()> {
+    let p = prepare(&args)?;
+    do_plc(&p).await?;
     Ok(())
 }
 
@@ -287,6 +324,17 @@ async fn do_stage(p: &Prepared) -> Result<()> {
         meta.stage_counts = s.counts.clone();
     })?;
     tracing::info!(path = %path.display(), counts = ?s.counts, "stage complete; metadata updated");
+    Ok(())
+}
+
+async fn do_plc(p: &Prepared) -> Result<()> {
+    let o = crate::plc::run(&p.cfg, &p.snapshot_date).await?;
+    tracing::info!(
+        rows = o.rows,
+        shards = o.shards,
+        completed = o.completed,
+        "plc phase complete"
+    );
     Ok(())
 }
 

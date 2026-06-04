@@ -335,6 +335,7 @@ dependencies = [
  "object_store",
  "parquet",
  "rand 0.8.6",
+ "reqwest",
  "rocksdb",
  "serde",
  "serde_json",
