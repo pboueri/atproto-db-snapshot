@@ -27,7 +27,7 @@ import time
 
 from .common import (
     BRAND, SHARED_CSS,
-    built_at_utc, fig_html, fmt_int, install_template, plotlyjs_inline,
+    built_at_utc, fmt_int, install_template,
 )
 
 BSKY_APP_DID = "did:plc:z72i7hdynmk6r22z27h6tvur"
@@ -379,6 +379,19 @@ def _resolve_handles(dids: list[str], say) -> dict:
     return out
 
 
+def _png_img(fig, width: int, height: int) -> str:
+    """Render a plotly figure to a static base64 PNG <img>. Self-contained and
+    JS-free, so it displays in any HTML viewer (incl. ones that don't run
+    JavaScript). Falls back to a note if kaleido is unavailable."""
+    import base64
+    try:
+        png = fig.to_image(format="png", width=width, height=height, scale=2)
+    except Exception as e:  # kaleido missing / render error
+        return f"<div class='sub' style='color:var(--muted)'>[chart unavailable: {e}]</div>"
+    b64 = base64.b64encode(png).decode("ascii")
+    return f'<img alt="chart" style="width:100%;height:auto" src="data:image/png;base64,{b64}">'
+
+
 def _render_html(snapshot_date, sc, order, pre_vals, post_vals, top_rows, handles,
                  b1, b2, b3, go) -> bytes:
     pct = sc["booster_pct_of_total_pop"]
@@ -435,8 +448,7 @@ def _render_html(snapshot_date, sc, order, pre_vals, post_vals, top_rows, handle
 table {{ width:100%; border-collapse:collapse; font-size:13px; margin-top:10px; }}
 th,td {{ text-align:left; padding:6px 10px; border-bottom:1px solid var(--rule); }}
 td.did {{ font-family:ui-monospace,monospace; color:var(--muted); font-size:11px; }}
-</style>
-<script>{plotlyjs_inline()}</script></head>
+</style></head>
 <body><div class="wrap">
 <div class="eyebrow">atproto snapshot · {snapshot_date}</div>
 <h1>The <span class="accent">booster</span> accounts</h1>
@@ -452,7 +464,7 @@ Creation dates from the PLC directory ({sc['created_at_source']}).</p>
 <p>Raw follow counts vs. post-strip out-degree across the population. Removing
 the universal <strong>bsky.app</strong> follow shifts a large mass into the
 0/1/2 buckets — the booster zone.</p>
-<div class="figure">{fig_html(fig_dist, 'dist')}</div>
+<div class="figure">{_png_img(fig_dist, 1040, 400)}</div>
 </section>
 
 <section>
@@ -462,7 +474,7 @@ the universal <strong>bsky.app</strong> follow shifts a large mass into the
 non-default accounts they follow. {fmt_int(sc['boosters_no_likes_either'])} of
 them have never even liked a post; {fmt_int(sc['boosters_tombstoned'])} are
 already deactivated (PLC tombstone).</p>
-<div class="figure">{fig_html(fig_split, 'split')}</div>
+<div class="figure">{_png_img(fig_split, 1040, 380)}</div>
 </section>
 
 <section>
@@ -471,7 +483,7 @@ already deactivated (PLC tombstone).</p>
 <p>Accounts ranked by how many booster accounts follow them
 (≥ {sc['min_target_support']} support; {fmt_int(sc['boosted_targets_ge_support'])}
 qualify).</p>
-<div class="figure">{fig_html(fig_top, 'top')}</div>
+<div class="figure">{_png_img(fig_top, 1040, 580)}</div>
 <table><thead><tr><th>#</th><th>handle</th><th>did</th>
 <th>booster followers</th><th>total followers</th><th>booster ratio</th></tr></thead>
 <tbody>{rows_html}</tbody></table>

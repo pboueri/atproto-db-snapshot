@@ -302,6 +302,38 @@ def analyze_graph_boosters(
     return _persist(snapshot_date, "graph_boosters", html, sidecar)
 
 
+@app.function(
+    image=graph_image,
+    volumes={"/vol-out": volume_out},
+    timeout=60 * 60 * 4,
+    cpu=16.0,
+    memory=200 * 1024,
+    ephemeral_disk=512 * 1024,
+)
+def analyze_graph_boosters_full(
+    snapshot_date: str = "2026-05-11",
+    created_after: str = "2025-01-01",
+    booster_max_outdeg: int = 3,
+    min_target_support: int = 5,
+    top_targets: int = 100,
+) -> bytes:
+    # The full path: everything the cheap path does, PLUS materializing the
+    # entire ~1.33B-edge directed follow graph in igraph (C-level
+    # Read_Edgelist) for global structure (weak components / giant component).
+    # Needs a high-memory container; DuckDB is pinned low so igraph has room.
+    from analysis.graph_boosters import run
+    con = _open_snapshot(snapshot_date, memory_limit="48GiB")
+    html, sidecar = run(
+        con, snapshot_date,
+        created_after=created_after,
+        booster_max_outdeg=booster_max_outdeg,
+        min_target_support=min_target_support,
+        top_targets=top_targets,
+        build_full_graph=True,
+    )
+    return _persist(snapshot_date, "graph_boosters", html, sidecar)
+
+
 # Maps the public --analysis flag to (remote fn, output basename, extra
 # kwargs-derived-from-cli). Each entry lists which CLI params it consumes
 # so the dispatcher can pass through only the relevant ones.
@@ -358,6 +390,19 @@ _DISPATCH = {
             "min_target_support": min_target_support,
             "top_targets": top_targets,
             "build_full_graph": build_full_graph,
+        },
+    },
+    "graph-full": {
+        "fn": analyze_graph_boosters_full,
+        "out_name": lambda d: f"graph_boosters_{d}.html",
+        "vol_path": lambda d: f"/vol-out/var/analysis/{d}/graph_boosters.html",
+        "kwargs": lambda d, *, created_after, booster_max_outdeg,
+                          min_target_support, top_targets, **rest: {
+            "snapshot_date": d,
+            "created_after": created_after,
+            "booster_max_outdeg": booster_max_outdeg,
+            "min_target_support": min_target_support,
+            "top_targets": top_targets,
         },
     },
     "growth": {
