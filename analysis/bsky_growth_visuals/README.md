@@ -17,6 +17,7 @@ every computed aggregate behind the charts.
 | 06 | `06_flow_attribution` | weekly in/out flow, churn split by tenure (new <90d vs active ≥90d) |
 | 07 | `07_retention_metrics` | new-user 28-day activation vs. weekly active-base churn |
 | 08 | `08_projection_*` | engaged-base projections to Dec-2027: vary retention / churn / volume / all-three (10×) |
+| 09 | `09_active_survival` | cohort survival — % of active/super users still retained over 12 weeks (~80% at 3 months) |
 
 ## Regenerate
 

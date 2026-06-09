@@ -186,6 +186,35 @@ def compute() -> dict:
     res["proj"] = {"B0": B0, "c": st.mean(cs), "N": st.mean(ns),
                    "R": st.mean(infl) - st.mean(ns)}
 
+    # ===== 09 ACTIVE-COHORT SURVIVAL ======================================
+    # Of users active/super at an anchor week, what % are still retained
+    # (not churned) h weeks later — averaged over 8 anchors, each with >=12
+    # weeks of runway. Equi-join only (cohort membership is a scalar-filter
+    # scan; first-churn-after is an equi-join on did_id), no inequality
+    # join blowup. Flat 100% for the first ~4 weeks is structural: a
+    # 30-day churn window means an active user can't be marked churned
+    # until ~4.3 weeks of silence.
+    con.execute("CREATE TEMP TABLE ce AS SELECT did_id, h AS churn_h FROM iv WHERE state = 4")
+    HORIZON = 12
+    anchors = [snap_h - WEEK * (HORIZON + k) for k in range(8)]
+    surv = [[] for _ in range(HORIZON + 1)]
+    s_sizes = []
+    for a in anchors:
+        con.execute(f"CREATE OR REPLACE TEMP TABLE scoh AS "
+                    f"SELECT did_id FROM iv WHERE state IN (1,2) AND h <= {a} AND {a} < h_next")
+        s_sizes.append(con.execute("SELECT COUNT(*) FROM scoh").fetchone()[0])
+        con.execute(f"CREATE OR REPLACE TEMP TABLE sfc AS "
+                    f"SELECT c.did_id, MIN(e.churn_h) fch FROM scoh c "
+                    f"LEFT JOIN ce e ON e.did_id = c.did_id AND e.churn_h >= {a} GROUP BY c.did_id")
+        for hh in range(HORIZON + 1):
+            thr = a + hh * WEEK
+            surv[hh].append(con.execute(
+                f"SELECT AVG(CASE WHEN fch IS NULL OR fch > {thr} THEN 1.0 ELSE 0 END) FROM sfc"
+            ).fetchone()[0])
+    res["survival"] = {"horizon": list(range(HORIZON + 1)),
+                       "retained_pct": [round(100 * st.mean(surv[hh]), 1) for hh in range(HORIZON + 1)],
+                       "avg_cohort": int(st.mean(s_sizes))}
+
     # ===== 02/03/05 CHURN DIAGNOSTIC (2026-Q1 cohort) =====================
     lo_q = _h(dt.datetime(2026, 1, 1)); hi_q = _h(dt.datetime(2026, 4, 1))
     con.execute(f"CREATE TEMP TABLE coh AS SELECT * FROM u WHERE first_h>={lo_q} AND first_h<{hi_q}")
@@ -413,6 +442,29 @@ def render(data):
             "08_projection_optimistic",
             [("Today's trajectory", proj(c, N), "#6b7280", "dash"),
              (f"Optimistic → {opt[-1]/1e6:.0f}M", opt, "#7c3aed", "solid")], hline=10 * B0)
+
+    # 09 active-cohort survival
+    sv = data["survival"]
+    hor = sv["horizon"]; ret = sv["retained_pct"]
+    fig = go.Figure(go.Scatter(
+        x=hor, y=ret, mode="lines+markers", line=dict(color=BRAND, width=3),
+        marker=dict(size=8), fill="tozeroy", fillcolor="rgba(0,133,255,0.08)",
+        hovertemplate="+%{x} weeks<br>%{y}% still retained<extra></extra>"))
+    fig.update_layout(
+        title=dict(text="<b>Engaged users actually retain well</b>  ·  "
+                        f"% of the active/super cohort still retained over time "
+                        f"(avg {sv['avg_cohort']/1e6:.1f}M/cohort, 8 anchors)",
+                   x=0.02, xanchor="left"),
+        xaxis=dict(title="Weeks after being active", dtick=1),
+        yaxis=dict(title="% still retained (not churned)", range=[0, 105]),
+        template="plotly_white", showlegend=False,
+        annotations=[
+            dict(x=2, y=100, text="flat 100% ≈ 4 weeks:<br>30-day churn window means an<br>"
+                                  "active user can't be churned yet",
+                 showarrow=True, arrowhead=2, ax=70, ay=40, font=dict(size=10, color="#6b7280")),
+            dict(x=12, y=ret[-1], text=f"{ret[-1]:.0f}% at 3 months", showarrow=True,
+                 arrowhead=2, ax=-10, ay=30, font=dict(size=11, color=BRAND))])
+    _save(fig, "09_active_survival")
 
     return sorted(os.listdir(FOLDER))
 
