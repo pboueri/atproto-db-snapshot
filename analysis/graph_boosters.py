@@ -314,6 +314,37 @@ def run(
     """).fetchall()
     say(f"self-hosted PDSes: {sh_pds_n:,} hosts, {sh_acct:,} accounts, {sh_boost:,} boosters")
 
+    # --- PLC-wide registry view: ALL did:plc by current PDS (catches the
+    #     mass-registration / ghost PDSes that never enter the follow graph,
+    #     e.g. pds.trump.com). plc_acct is one-row-per-DID and already carries
+    #     the current pds (arg_max); the baked path reads actors directly. ----
+    reg_src = "plc_acct" if plc_built else ("actors" if have_baked else None)
+    pds_registry = None
+    if reg_src:
+        SELFC = ("(pds IS NOT NULL AND pds NOT LIKE '%bsky.network%' "
+                 "AND pds NOT LIKE '%bsky.social%')")
+        (reg_total, reg_std, reg_self, reg_nopds) = con.execute(f"""
+            SELECT count(*),
+              count(*) FILTER (WHERE pds LIKE '%bsky.network%' OR pds LIKE '%bsky.social%'),
+              count(*) FILTER (WHERE {SELFC}),
+              count(*) FILTER (WHERE pds IS NULL)
+            FROM {reg_src}
+        """).fetchone()
+        reg_rows = con.execute(f"""
+            SELECT pds, count(*) n FROM {reg_src}
+            WHERE {SELFC} GROUP BY pds ORDER BY n DESC LIMIT 40
+        """).fetchall()
+        pds_registry = {
+            "total_dids": int(reg_total),
+            "standard": int(reg_std),
+            "self_hosted": int(reg_self),
+            "no_pds": int(reg_nopds),
+            "top_self_hosted": [{"pds": r[0], "registrations": int(r[1])} for r in reg_rows],
+        }
+        say(f"PLC registry: {reg_self:,} self-hosted of {reg_total:,} dids; "
+            f"top host {reg_rows[0][0] if reg_rows else '-'} "
+            f"({reg_rows[0][1] if reg_rows else 0:,})")
+
     # --- render --------------------------------------------------------------
     sidecar = {
         "snapshot_date": snapshot_date,
@@ -349,6 +380,7 @@ def run(
                 for r in pds_top
             ],
         },
+        "pds_registry": pds_registry,
         "full_graph": full_graph_stats,
         "top_targets": [
             {"did_id": int(r[0]), "did": r[1], "handle": handles.get(r[1]),
@@ -511,6 +543,40 @@ ranked by the accounts (grey) and boosters (red) they carry.</p>
 <tbody>{pds_rows_html}</tbody></table>
 </section>"""
 
+    # PLC-wide registry-pollution view (all did:plc by current PDS).
+    reg = sc.get("pds_registry")
+    registry_section = ""
+    if reg and reg["top_self_hosted"]:
+        rt = reg["top_self_hosted"]
+        rn = min(15, len(rt))
+        r_labels = [x["pds"].replace("https://", "").replace("http://", "")[:40]
+                    for x in rt[:rn]][::-1]
+        r_vals = [x["registrations"] for x in rt[:rn]][::-1]
+        fig_reg = go.Figure()
+        fig_reg.add_bar(x=r_vals, y=r_labels, orientation="h", marker_color="#ef4444")
+        fig_reg.update_layout(height=560, margin=dict(l=260),
+                              xaxis_title="did:plc registrations (log scale)")
+        fig_reg.update_xaxes(type="log")
+        reg_rows_html = "\n".join(
+            f"<tr><td>{i+1}</td><td class='did'>{x['pds']}</td>"
+            f"<td>{fmt_int(x['registrations'])}</td></tr>"
+            for i, x in enumerate(rt[:50])
+        )
+        pct_self = (100.0 * reg["self_hosted"] / reg["total_dids"]) if reg["total_dids"] else 0
+        registry_section = f"""
+<section>
+<div class="kicker">Registry pollution</div>
+<h2>The whole PLC registry by PDS</h2>
+<p>Across <strong>{fmt_int(reg['total_dids'])}</strong> did:plc identities,
+<strong>{fmt_int(reg['self_hosted'])}</strong> ({pct_self:.0f}%) sit on non-bsky
+PDSes. Most are <em>edgeless ghosts</em> — registered but never in the follow
+graph — so they don't appear in the booster facet above. This view catches the
+mass-registration hosts (note the log scale).</p>
+<div class="figure">{_png_img(fig_reg, 1040, 580)}</div>
+<table><thead><tr><th>#</th><th>PDS</th><th>registrations</th></tr></thead>
+<tbody>{reg_rows_html}</tbody></table>
+</section>"""
+
     def stat(v, label, sub="", cls=""):
         return (f"<div class='stat'><div class='v {cls}'>{v}</div>"
                 f"<div class='l'>{label}</div>"
@@ -572,6 +638,7 @@ qualify).</p>
 <th>booster followers</th><th>total followers</th><th>booster ratio</th></tr></thead>
 <tbody>{rows_html}</tbody></table>
 </section>
+{registry_section}
 {pds_section}
 <p class="sub" style="color:var(--muted);margin-top:40px">
 Built {built_at_utc()} · {sc['elapsed_secs']}s ·
