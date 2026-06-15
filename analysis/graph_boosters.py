@@ -80,27 +80,34 @@ def run(
         say("using baked actors.created_at (snapshot built with plc phase)")
         in_microcosm_expr = "COALESCE(a.in_microcosm, TRUE)"
         tomb_expr = "a.tombstoned_at" if "tombstoned_at" in actor_cols else "CAST(NULL AS TIMESTAMP)"
+        pds_expr = "a.pds" if "pds" in actor_cols else "CAST(NULL AS VARCHAR)"
+        handle_expr = "a.handle" if "handle" in actor_cols else "CAST(NULL AS VARCHAR)"
         con.execute(f"""
             CREATE OR REPLACE TEMP TABLE acct AS
               SELECT a.did_id, a.did, a.created_at, {tomb_expr} AS tombstoned_at,
-                     {in_microcosm_expr} AS in_microcosm
+                     {in_microcosm_expr} AS in_microcosm,
+                     {pds_expr} AS pds, {handle_expr} AS handle
               FROM actors a
         """)
         age_enabled = True
     elif _has_plc_shards(con, plc_glob):
         say(f"reading PLC shards from {plc_glob}")
         plc_built = True
+        # pds/handle: latest op that carries one (arg_max over ts) -> current.
         con.execute(f"""
             CREATE OR REPLACE TEMP TABLE plc_acct AS
               SELECT did,
-                     MIN(ts) FILTER (WHERE kind='create')    AS created_at,
-                     MAX(ts) FILTER (WHERE kind='tombstone') AS tombstoned_at
+                     MIN(ts) FILTER (WHERE kind='create')          AS created_at,
+                     MAX(ts) FILTER (WHERE kind='tombstone')        AS tombstoned_at,
+                     arg_max(pds, ts)    FILTER (WHERE pds IS NOT NULL)    AS pds,
+                     arg_max(handle, ts) FILTER (WHERE handle IS NOT NULL) AS handle
               FROM read_parquet('{plc_glob}')
               GROUP BY did
         """)
         con.execute("""
             CREATE OR REPLACE TEMP TABLE acct AS
-              SELECT a.did_id, a.did, p.created_at, p.tombstoned_at, TRUE AS in_microcosm
+              SELECT a.did_id, a.did, p.created_at, p.tombstoned_at, TRUE AS in_microcosm,
+                     p.pds, p.handle
               FROM actors a LEFT JOIN plc_acct p ON p.did = a.did
         """)
         age_enabled = True
@@ -109,7 +116,8 @@ def run(
         con.execute("""
             CREATE OR REPLACE TEMP TABLE acct AS
               SELECT a.did_id, a.did, CAST(NULL AS TIMESTAMP) AS created_at,
-                     CAST(NULL AS TIMESTAMP) AS tombstoned_at, TRUE AS in_microcosm
+                     CAST(NULL AS TIMESTAMP) AS tombstoned_at, TRUE AS in_microcosm,
+                     CAST(NULL AS VARCHAR) AS pds, CAST(NULL AS VARCHAR) AS handle
               FROM actors a
         """)
         age_enabled = False
@@ -128,7 +136,7 @@ def run(
                  COALESCE(ag.posts + ag.replies_out + ag.reposts_out + ag.quotes_out, 0) AS content,
                  COALESCE(ag.likes_out, 0) AS likes_out,
                  COALESCE(ag.follows, 0) - (CASE WHEN fb.did_id IS NOT NULL THEN 1 ELSE 0 END) AS adj_out,
-                 ac.created_at, ac.tombstoned_at, ac.in_microcosm
+                 ac.created_at, ac.tombstoned_at, ac.in_microcosm, ac.pds, ac.handle
           FROM acct ac
           LEFT JOIN actor_aggs ag USING(did_id)
           LEFT JOIN follows_bsky fb ON fb.did_id = ac.did_id
@@ -281,6 +289,31 @@ def run(
     pre_vals = [dmap.get(o, (0, 0))[0] for o in order]
     post_vals = [dmap.get(o, (0, 0))[1] for o in order]
 
+    # --- PDS facet: standard (bsky-hosted) vs self-hosted -------------------
+    say("pds facet")
+    STD = "(pds IS NOT NULL AND (pds LIKE '%bsky.network%' OR pds LIKE '%bsky.social%'))"
+    SELF = "(pds IS NOT NULL AND NOT (pds LIKE '%bsky.network%' OR pds LIKE '%bsky.social%'))"
+    (sh_acct, sh_boost, sh_pds_n, std_acct, no_pds) = con.execute(f"""
+        SELECT
+          count(*) FILTER (WHERE {in_pop} AND {SELF})      AS sh_acct,
+          count(*) FILTER (WHERE {booster} AND {SELF})     AS sh_boost,
+          count(DISTINCT pds) FILTER (WHERE {SELF})        AS sh_pds_n,
+          count(*) FILTER (WHERE {in_pop} AND {STD})       AS std_acct,
+          count(*) FILTER (WHERE {in_pop} AND pds IS NULL) AS no_pds
+        FROM node
+    """).fetchone()
+    pds_top = con.execute(f"""
+        SELECT pds,
+               count(*) FILTER (WHERE {in_pop})  AS accounts,
+               count(*) FILTER (WHERE {booster}) AS boosters
+        FROM node WHERE {SELF}
+        GROUP BY pds
+        HAVING count(*) FILTER (WHERE {in_pop}) > 0
+        ORDER BY accounts DESC
+        LIMIT 40
+    """).fetchall()
+    say(f"self-hosted PDSes: {sh_pds_n:,} hosts, {sh_acct:,} accounts, {sh_boost:,} boosters")
+
     # --- render --------------------------------------------------------------
     sidecar = {
         "snapshot_date": snapshot_date,
@@ -304,6 +337,18 @@ def run(
         "min_target_support": min_target_support,
         "farms": int(n_farms),
         "largest_farm": int(largest_farm),
+        "pds_breakdown": {
+            "self_hosted_accounts": int(sh_acct),
+            "self_hosted_boosters": int(sh_boost),
+            "self_hosted_pds_count": int(sh_pds_n),
+            "standard_accounts": int(std_acct),
+            "no_pds_accounts": int(no_pds),
+            "top_self_hosted": [
+                {"pds": r[0], "accounts": int(r[1]), "boosters": int(r[2]),
+                 "booster_share": (round(r[2] / r[1], 4) if r[1] else None)}
+                for r in pds_top
+            ],
+        },
         "full_graph": full_graph_stats,
         "top_targets": [
             {"did_id": int(r[0]), "did": r[1], "handle": handles.get(r[1]),
@@ -316,7 +361,7 @@ def run(
     }
 
     html = _render_html(snapshot_date, sidecar, order, pre_vals, post_vals,
-                        top_rows, handles, b1, b2, b3, go)
+                        top_rows, handles, b1, b2, b3, pds_top, go)
     say(f"done in {sidecar['elapsed_secs']}s")
     return html, sidecar
 
@@ -393,7 +438,7 @@ def _png_img(fig, width: int, height: int) -> str:
 
 
 def _render_html(snapshot_date, sc, order, pre_vals, post_vals, top_rows, handles,
-                 b1, b2, b3, go) -> bytes:
+                 b1, b2, b3, pds_top, go) -> bytes:
     pct = sc["booster_pct_of_total_pop"]
     age_note = (f"created on/after {sc['created_after']}" if sc["age_filter_enabled"]
                 else "ALL ages (age filter disabled — PLC dates unavailable)")
@@ -426,6 +471,45 @@ def _render_html(snapshot_date, sc, order, pre_vals, post_vals, top_rows, handle
         f"<td>{(f'{r[4]*100:.1f}%' if r[4] is not None else '—')}</td></tr>"
         for i, r in enumerate(top_rows[:50])
     )
+
+    # PDS facet — only render the section when there are self-hosted hosts.
+    pb = sc["pds_breakdown"]
+    pds_section = ""
+    if pds_top:
+        n_pds = min(15, len(pds_top))
+        p_labels = [r[0].replace("https://", "").replace("http://", "")[:40]
+                    for r in pds_top[:n_pds]][::-1]
+        p_acct = [r[1] for r in pds_top[:n_pds]][::-1]
+        p_boost = [r[2] for r in pds_top[:n_pds]][::-1]
+        fig_pds = go.Figure()
+        fig_pds.add_bar(x=p_acct, y=p_labels, orientation="h", name="accounts",
+                        marker_color="#94a3b8")
+        fig_pds.add_bar(x=p_boost, y=p_labels, orientation="h", name="boosters",
+                        marker_color="#ef4444")
+        fig_pds.update_layout(height=560, barmode="overlay", margin=dict(l=270),
+                              xaxis_title="accounts on host (self-hosted PDSes)",
+                              legend=dict(orientation="h", y=1.07))
+        pds_rows_html = "\n".join(
+            f"<tr><td>{i+1}</td><td class='did'>{r[0]}</td><td>{fmt_int(r[1])}</td>"
+            f"<td>{fmt_int(r[2])}</td>"
+            f"<td>{(f'{r[2]/r[1]*100:.0f}%' if r[1] else '—')}</td></tr>"
+            for i, r in enumerate(pds_top[:50])
+        )
+        pds_section = f"""
+<section>
+<div class="kicker">Hosting</div>
+<h2>Self-hosted PDSes</h2>
+<p><strong>{fmt_int(pb['self_hosted_accounts'])}</strong> accounts in the
+population run on <strong>{fmt_int(pb['self_hosted_pds_count'])}</strong>
+self-hosted PDSes (not <code>*.bsky.network</code> / <code>bsky.social</code>),
+including <strong>{fmt_int(pb['self_hosted_boosters'])}</strong> boosters.
+Self-hosting is legitimate for many users — this surfaces hosts for review,
+ranked by the accounts (grey) and boosters (red) they carry.</p>
+<div class="figure">{_png_img(fig_pds, 1040, 580)}</div>
+<table><thead><tr><th>#</th><th>PDS</th><th>accounts</th><th>boosters</th>
+<th>booster share</th></tr></thead>
+<tbody>{pds_rows_html}</tbody></table>
+</section>"""
 
     def stat(v, label, sub="", cls=""):
         return (f"<div class='stat'><div class='v {cls}'>{v}</div>"
@@ -488,7 +572,7 @@ qualify).</p>
 <th>booster followers</th><th>total followers</th><th>booster ratio</th></tr></thead>
 <tbody>{rows_html}</tbody></table>
 </section>
-
+{pds_section}
 <p class="sub" style="color:var(--muted);margin-top:40px">
 Built {built_at_utc()} · {sc['elapsed_secs']}s ·
 boosters out-deg 1/2/3 = {fmt_int(b1)}/{fmt_int(b2)}/{fmt_int(b3)} ·

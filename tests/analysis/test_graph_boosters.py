@@ -72,6 +72,51 @@ def test_booster_classification_and_concentration():
     assert sc["created_at_source"] == "none"
 
 
+def test_pds_facet_flags_self_hosted():
+    # Baked-style snapshot: actors already carry created_at + pds + handle, so
+    # the analysis uses them directly and computes the PDS facet.
+    con = duckdb.connect()
+    con.execute("""CREATE TABLE actors(
+        did_id BIGINT, did VARCHAR, active BOOLEAN, created_at TIMESTAMP,
+        tombstoned_at TIMESTAMP, in_microcosm BOOLEAN, pds VARCHAR, handle VARCHAR)""")
+    BNET = "https://shard.us-west.host.bsky.network"
+    EVIL = "https://pds.evil.example"
+    rows = [
+        (0, BSKY_APP_DID, BNET, "bsky.app"),
+        (1, "did:plc:target1", BNET, "target1"),
+        (30, "did:plc:normal", BNET, "normal"),
+    ]
+    rows += [(i, f"did:plc:booster{i}", EVIL, f"booster{i}") for i in range(10, 15)]
+    con.executemany(
+        "INSERT INTO actors VALUES (?,?,TRUE,TIMESTAMP '2025-03-01',NULL,TRUE,?,?)",
+        rows,
+    )
+    con.execute("""CREATE TABLE actor_aggs(
+        did_id BIGINT, follows BIGINT, followers BIGINT, posts BIGINT,
+        replies_out BIGINT, reposts_out BIGINT, quotes_out BIGINT, likes_out BIGINT)""")
+    aggs = [(0, 0, 5, 0, 0, 0, 0, 0), (1, 1, 6, 100, 0, 0, 0, 0),
+            (30, 50, 3, 10, 2, 0, 0, 5)]
+    aggs += [(i, 2, 0, 0, 0, 0, 0, 0) for i in range(10, 15)]
+    con.executemany("INSERT INTO actor_aggs VALUES (?,?,?,?,?,?,?,?)", aggs)
+    con.execute("CREATE TABLE follows(src_did_id BIGINT, dst_did_id BIGINT, created_at TIMESTAMP)")
+    edges = []
+    for i in range(10, 15):
+        edges += [(i, 0), (i, 1)]
+    edges += [(30, 1)]
+    con.executemany("INSERT INTO follows VALUES (?,?,NULL)", edges)
+
+    _, sc = run(con, "synthetic", hydrate_handles=False, min_target_support=1,
+                build_full_graph=False, log=False)
+    pb = sc["pds_breakdown"]
+    # the 5 boosters sit on the self-hosted host; bsky.network ones don't count.
+    assert pb["self_hosted_boosters"] == 5
+    assert pb["self_hosted_accounts"] == 5
+    assert pb["self_hosted_pds_count"] == 1
+    top = {r["pds"]: r for r in pb["top_self_hosted"]}
+    assert EVIL in top and top[EVIL]["accounts"] == 5
+    assert BNET not in top  # bsky.network is "standard", not self-hosted
+
+
 def test_farms_detected_when_igraph_present():
     igraph = pytest.importorskip("igraph")
     assert igraph  # silence unused

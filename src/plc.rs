@@ -69,6 +69,66 @@ struct OpInner {
     prev: Option<String>,
     #[serde(rename = "type", default)]
     op_type: Option<String>,
+    /// Legacy `create` op: PDS endpoint as a bare string.
+    #[serde(default)]
+    service: Option<String>,
+    /// Legacy `create` op: handle.
+    #[serde(default)]
+    handle: Option<String>,
+    /// Modern `plc_operation`: nested service map.
+    #[serde(default)]
+    services: Option<Services>,
+    /// Modern `plc_operation`: `["at://<handle>"]`.
+    #[serde(rename = "alsoKnownAs", default)]
+    also_known_as: Option<Vec<String>>,
+}
+
+#[derive(Deserialize)]
+struct Services {
+    #[serde(default)]
+    atproto_pds: Option<ServiceEndpoint>,
+}
+
+#[derive(Deserialize)]
+struct ServiceEndpoint {
+    #[serde(default)]
+    endpoint: Option<String>,
+}
+
+/// `create` (genesis), `tombstone` (deactivation), or `update`
+/// (migration/rotation — carries the then-current PDS).
+fn kind_of(op: &OpInner) -> &'static str {
+    if op.op_type.as_deref() == Some("plc_tombstone") {
+        "tombstone"
+    } else if op.prev.is_none() {
+        "create"
+    } else {
+        "update"
+    }
+}
+
+/// PDS endpoint at this op: legacy `service`, else modern
+/// `services.atproto_pds.endpoint`. None for tombstones.
+fn pds_of(op: &OpInner) -> Option<String> {
+    if let Some(s) = &op.service {
+        return Some(s.clone());
+    }
+    op.services
+        .as_ref()
+        .and_then(|s| s.atproto_pds.as_ref())
+        .and_then(|p| p.endpoint.clone())
+}
+
+/// Handle at this op: legacy `handle`, else first `alsoKnownAs` with the
+/// `at://` prefix stripped.
+fn handle_of(op: &OpInner) -> Option<String> {
+    if let Some(h) = &op.handle {
+        return Some(h.clone());
+    }
+    op.also_known_as
+        .as_ref()
+        .and_then(|v| v.first())
+        .map(|h| h.strip_prefix("at://").unwrap_or(h).to_string())
 }
 
 fn load_cursor(path: &Path) -> Option<PlcCursor> {
@@ -206,23 +266,22 @@ pub async fn run(cfg: &Config, snapshot_date: &str) -> Result<PlcOutcome> {
                     continue;
                 }
             };
-            let kind = if parsed.operation.prev.is_none() {
-                "create"
-            } else if parsed.operation.op_type.as_deref() == Some("plc_tombstone") {
-                "tombstone"
-            } else {
-                continue;
-            };
+            let kind = kind_of(&parsed.operation);
+            let pds = pds_of(&parsed.operation);
+            let handle = handle_of(&parsed.operation);
             if writer.is_none() {
                 writer = Some(PlcOpWriter::create(
                     shard_path(&plc_dir, cur.shards),
                     cfg.batch_size,
                 )?);
             }
-            writer
-                .as_mut()
-                .unwrap()
-                .push(&parsed.did, kind, ts_ms(&parsed.created_at))?;
+            writer.as_mut().unwrap().push(
+                &parsed.did,
+                kind,
+                ts_ms(&parsed.created_at),
+                pds.as_deref(),
+                handle.as_deref(),
+            )?;
             cur.rows += 1;
             rows_since_flush += 1;
         }
@@ -279,15 +338,13 @@ mod tests {
     use super::*;
 
     /// Classify a JSON export line the way the fetch loop does.
-    fn classify(line: &str) -> Option<&'static str> {
-        let p: ExportLine = serde_json::from_str(line).ok()?;
-        if p.operation.prev.is_none() {
-            Some("create")
-        } else if p.operation.op_type.as_deref() == Some("plc_tombstone") {
-            Some("tombstone")
-        } else {
-            None
-        }
+    fn classify(line: &str) -> &'static str {
+        let p: ExportLine = serde_json::from_str(line).unwrap();
+        kind_of(&p.operation)
+    }
+
+    fn parse(line: &str) -> OpInner {
+        serde_json::from_str::<ExportLine>(line).unwrap().operation
     }
 
     #[test]
@@ -295,22 +352,48 @@ mod tests {
         // prev: null => genesis, regardless of type ("create" or "plc_operation").
         let legacy = r#"{"did":"did:plc:aaa","createdAt":"2022-11-17T00:35:16.391Z","operation":{"prev":null,"type":"create"}}"#;
         let modern = r#"{"did":"did:plc:bbb","createdAt":"2023-01-02T04:07:13.767Z","operation":{"prev":null,"type":"plc_operation"}}"#;
-        assert_eq!(classify(legacy), Some("create"));
-        assert_eq!(classify(modern), Some("create"));
+        assert_eq!(classify(legacy), "create");
+        assert_eq!(classify(modern), "create");
     }
 
     #[test]
     fn tombstone_op_is_tombstone() {
         let tomb = r#"{"did":"did:plc:ccc","createdAt":"2024-05-01T00:00:00.000Z","operation":{"prev":"bafyrei...","type":"plc_tombstone"}}"#;
-        assert_eq!(classify(tomb), Some("tombstone"));
+        assert_eq!(classify(tomb), "tombstone");
     }
 
     #[test]
-    fn rotation_op_is_ignored() {
-        // A non-genesis plc_operation (handle/key rotation) carries a prev
-        // and a non-tombstone type => not captured.
-        let rot = r#"{"did":"did:plc:ddd","createdAt":"2024-06-01T00:00:00.000Z","operation":{"prev":"bafyrei...","type":"plc_operation"}}"#;
-        assert_eq!(classify(rot), None);
+    fn migration_op_is_update() {
+        // A non-genesis plc_operation (handle/key rotation or PDS migration)
+        // carries a prev and a non-tombstone type => kind "update".
+        let mig = r#"{"did":"did:plc:ddd","createdAt":"2024-06-01T00:00:00.000Z","operation":{"prev":"bafyrei...","type":"plc_operation"}}"#;
+        assert_eq!(classify(mig), "update");
+    }
+
+    #[test]
+    fn pds_and_handle_parse_both_formats() {
+        // legacy create: bare `service` + `handle`.
+        let legacy = parse(
+            r#"{"did":"did:plc:a","createdAt":"2022-11-17T00:00:00.000Z","operation":{"prev":null,"type":"create","handle":"paul.bsky.social","service":"https://bsky.social"}}"#,
+        );
+        assert_eq!(pds_of(&legacy).as_deref(), Some("https://bsky.social"));
+        assert_eq!(handle_of(&legacy).as_deref(), Some("paul.bsky.social"));
+
+        // modern: nested services + alsoKnownAs (at:// stripped).
+        let modern = parse(
+            r#"{"did":"did:plc:b","createdAt":"2025-06-01T00:00:00.000Z","operation":{"prev":"bafy","type":"plc_operation","alsoKnownAs":["at://gametheory.blog"],"services":{"atproto_pds":{"type":"AtprotoPersonalDataServer","endpoint":"https://psathyrella.us-west.host.bsky.network"}}}}"#,
+        );
+        assert_eq!(
+            pds_of(&modern).as_deref(),
+            Some("https://psathyrella.us-west.host.bsky.network")
+        );
+        assert_eq!(handle_of(&modern).as_deref(), Some("gametheory.blog"));
+
+        // tombstone: no PDS.
+        let tomb = parse(
+            r#"{"did":"did:plc:c","createdAt":"2024-05-01T00:00:00.000Z","operation":{"prev":"bafy","type":"plc_tombstone"}}"#,
+        );
+        assert_eq!(pds_of(&tomb), None);
     }
 
     #[test]

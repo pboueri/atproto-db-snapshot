@@ -51,8 +51,9 @@ EXPORT_URL = "https://plc.directory/export"
     cpu=2.0,
     memory=8 * 1024,
 )
-def backfill(page_size: int = 1000, flush_every: int = 1_000_000) -> dict:
+def backfill(page_size: int = 1000, flush_every: int = 1_000_000, reset: bool = False) -> dict:
     import datetime as dt
+    import glob as _glob
 
     import pyarrow as pa
     import pyarrow.parquet as pq
@@ -60,6 +61,15 @@ def backfill(page_size: int = 1000, flush_every: int = 1_000_000) -> dict:
 
     os.makedirs(PLC_DIR, exist_ok=True)
     cursor_path = f"{PLC_DIR}/.cursor.json"
+
+    if reset:
+        for f in _glob.glob(f"{PLC_DIR}/part-*.parquet") + [cursor_path]:
+            try:
+                os.remove(f)
+            except FileNotFoundError:
+                pass
+        volume_out.commit()
+        print("=== reset: cleared existing shards + cursor ===", flush=True)
 
     cur: dict = {}
     if os.path.exists(cursor_path):
@@ -80,10 +90,14 @@ def backfill(page_size: int = 1000, flush_every: int = 1_000_000) -> dict:
         ("did", pa.string()),
         ("kind", pa.string()),
         ("ts", pa.timestamp("ms")),
+        ("pds", pa.string()),
+        ("handle", pa.string()),
     ])
     buf_did: list[str] = []
     buf_kind: list[str] = []
     buf_ts: list = []
+    buf_pds: list = []
+    buf_handle: list = []
 
     def parse_ts(s: str):
         # PLC createdAt is ISO-8601 UTC ("...Z", variable fractional digits).
@@ -91,8 +105,25 @@ def backfill(page_size: int = 1000, flush_every: int = 1_000_000) -> dict:
         d = dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
         return d.astimezone(dt.timezone.utc).replace(tzinfo=None)
 
+    def op_pds(inner: dict):
+        # legacy create -> "service"; modern plc_operation -> services.atproto_pds.endpoint
+        pds = inner.get("service")
+        if not pds:
+            svc = (inner.get("services") or {}).get("atproto_pds") or {}
+            pds = svc.get("endpoint")
+        return pds
+
+    def op_handle(inner: dict):
+        h = inner.get("handle")
+        if not h:
+            aka = inner.get("alsoKnownAs") or []
+            h = aka[0] if aka else None
+        if h and h.startswith("at://"):
+            h = h[len("at://"):]
+        return h
+
     def flush():
-        nonlocal shards, buf_did, buf_kind, buf_ts
+        nonlocal shards, buf_did, buf_kind, buf_ts, buf_pds, buf_handle
         if not buf_did:
             return
         path = f"{PLC_DIR}/part-{shards:05d}.parquet"
@@ -102,13 +133,15 @@ def backfill(page_size: int = 1000, flush_every: int = 1_000_000) -> dict:
                 "did": pa.array(buf_did, pa.string()),
                 "kind": pa.array(buf_kind, pa.string()),
                 "ts": pa.array(buf_ts, pa.timestamp("ms")),
+                "pds": pa.array(buf_pds, pa.string()),
+                "handle": pa.array(buf_handle, pa.string()),
             },
             schema=schema,
         )
         pq.write_table(tbl, tmp, compression="zstd")
         os.replace(tmp, path)
         shards += 1
-        buf_did, buf_kind, buf_ts = [], [], []
+        buf_did, buf_kind, buf_ts, buf_pds, buf_handle = [], [], [], [], []
 
     def save_cursor(completed: bool = False):
         payload = {
@@ -160,15 +193,17 @@ def backfill(page_size: int = 1000, flush_every: int = 1_000_000) -> dict:
         for ln in lines:
             op = json.loads(ln)
             inner = op.get("operation", {})
-            if inner.get("prev") is None:
-                kind = "create"
-            elif inner.get("type") == "plc_tombstone":
+            if inner.get("type") == "plc_tombstone":
                 kind = "tombstone"
+            elif inner.get("prev") is None:
+                kind = "create"
             else:
-                continue
+                kind = "update"   # migration / rotation; carries the current PDS
             buf_did.append(op["did"])
             buf_kind.append(kind)
             buf_ts.append(parse_ts(op["createdAt"]))
+            buf_pds.append(op_pds(inner))
+            buf_handle.append(op_handle(inner))
             rows += 1
             rows_since_flush += 1
 
@@ -196,8 +231,8 @@ def backfill(page_size: int = 1000, flush_every: int = 1_000_000) -> dict:
 
 
 @app.local_entrypoint()
-def main(page_size: int = 1000, flush_every: int = 1_000_000) -> None:
-    call = backfill.spawn(page_size=page_size, flush_every=flush_every)
+def main(page_size: int = 1000, flush_every: int = 1_000_000, reset: bool = False) -> None:
+    call = backfill.spawn(page_size=page_size, flush_every=flush_every, reset=reset)
     print(f"[spawn] FunctionCall {call.object_id} — PLC backfill running server-side.")
     print("[progress] modal volume get at-snapshot-output var/plc/.cursor.json -")
     print("[logs]     modal app logs at-plc-backfill")

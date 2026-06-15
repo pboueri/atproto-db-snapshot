@@ -59,14 +59,18 @@ fn spawn_plc_mock(body: String) -> u16 {
 
 /// Canned PLC export: genesis for alice/bob/carol/eve, a tombstone for carol,
 /// and NO row for dave (so dave stays unknown-age / created_at NULL). `eve` is
-/// not a staged actor, so it must be inserted as a PLC-only account.
+/// not a staged actor, so it must be inserted as a PLC-only account. `alice`
+/// also has a later migration op moving her PDS to a self-hosted host — the
+/// enrichment must reflect the *current* (migrated) PDS, not the genesis one.
 fn plc_export_body() -> String {
     [
-        r#"{"did":"did:plc:alice","createdAt":"2025-01-15T00:00:00.000Z","operation":{"prev":null,"type":"create"}}"#,
-        r#"{"did":"did:plc:bob","createdAt":"2025-02-20T00:00:00.000Z","operation":{"prev":null,"type":"create"}}"#,
-        r#"{"did":"did:plc:carol","createdAt":"2025-03-01T00:00:00.000Z","operation":{"prev":null,"type":"create"}}"#,
+        // alice: genesis on bsky.social, then migrate to a self-hosted PDS.
+        r#"{"did":"did:plc:alice","createdAt":"2025-01-15T00:00:00.000Z","operation":{"prev":null,"type":"create","handle":"alice.bsky.social","service":"https://bsky.social"}}"#,
+        r#"{"did":"did:plc:alice","createdAt":"2025-05-01T00:00:00.000Z","operation":{"prev":"bafyalice","type":"plc_operation","alsoKnownAs":["at://alice.bsky.social"],"services":{"atproto_pds":{"type":"AtprotoPersonalDataServer","endpoint":"https://pds.evil.example"}}}}"#,
+        r#"{"did":"did:plc:bob","createdAt":"2025-02-20T00:00:00.000Z","operation":{"prev":null,"type":"create","handle":"bob.bsky.social","service":"https://bsky.social"}}"#,
+        r#"{"did":"did:plc:carol","createdAt":"2025-03-01T00:00:00.000Z","operation":{"prev":null,"type":"create","handle":"carol.bsky.social","service":"https://bsky.social"}}"#,
         r#"{"did":"did:plc:carol","createdAt":"2025-06-01T00:00:00.000Z","operation":{"prev":"bafyprev","type":"plc_tombstone"}}"#,
-        r#"{"did":"did:plc:eve","createdAt":"2025-04-10T00:00:00.000Z","operation":{"prev":null,"type":"create"}}"#,
+        r#"{"did":"did:plc:eve","createdAt":"2025-04-10T00:00:00.000Z","operation":{"prev":null,"type":"plc_operation","alsoKnownAs":["at://eve.bsky.social"],"services":{"atproto_pds":{"type":"AtprotoPersonalDataServer","endpoint":"https://pds.eve.example"}}}}"#,
     ]
     .join("\n")
 }
@@ -113,7 +117,7 @@ async fn end_to_end_synthetic_rocks() -> Result<()> {
     assert_validation_queries(&conn)?;
     assert_metadata(&conn, "2026-04-27", &cfg)?;
     assert_plc_enrichment(&conn)?;
-    assert_eq!(plc.rows, 5, "plc captured 4 creates + 1 tombstone");
+    assert_eq!(plc.rows, 6, "plc captured 4 creates + 1 migration + 1 tombstone");
 
     println!("stage counts: {:?}", stage.counts);
     println!("hydrate counts: {:?}", hydrate.row_counts);
@@ -283,6 +287,30 @@ fn assert_plc_enrichment(conn: &Connection) -> Result<()> {
     let micro_true: i64 =
         conn.query_row("SELECT COUNT(*) FROM actors WHERE in_microcosm", [], |r| r.get(0))?;
     assert_eq!(micro_true, 4, "the 4 staged actors are in_microcosm");
+
+    // PDS: alice migrated -> current pds is the self-hosted host (arg_max picks
+    // the latest op), with her handle preserved.
+    let (alice_pds, alice_handle): (String, String) = conn.query_row(
+        "SELECT pds, handle FROM actors WHERE did='did:plc:alice'",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    assert_eq!(alice_pds, "https://pds.evil.example", "alice's current (migrated) PDS");
+    assert_eq!(alice_handle, "alice.bsky.social");
+
+    // carol: only the genesis carried a PDS (tombstone has none) -> bsky.social.
+    let carol_pds: String =
+        conn.query_row("SELECT pds FROM actors WHERE did='did:plc:carol'", [], |r| r.get(0))?;
+    assert_eq!(carol_pds, "https://bsky.social");
+
+    // eve (PLC-only) carries its pds + handle too.
+    let (eve_pds, eve_handle): (String, String) = conn.query_row(
+        "SELECT pds, handle FROM actors WHERE did='did:plc:eve'",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    assert_eq!(eve_pds, "https://pds.eve.example");
+    assert_eq!(eve_handle, "eve.bsky.social");
     Ok(())
 }
 
