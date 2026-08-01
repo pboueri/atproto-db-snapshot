@@ -696,6 +696,10 @@ def stage_phase(
         work_dir=TMP_WORK_DIR,
         stage_drop_rocks=True,
     )
+    # Same staleness hazard as hydrate: pick up whatever mirror committed,
+    # rather than the version this container happened to mount with.
+    volume_rocks.reload()
+
     print("=== copy rocks: rocks volume -> /tmp ===", flush=True)
     _copy_concurrent(
         f"{ROCKS_VOL_DIR}/rocks",
@@ -771,6 +775,15 @@ def hydrate_phase(
         window_days_back=window_days_back,
         window_days_lag=window_days_lag,
     )
+    # A container sees the Volume as of the moment it mounted, so a
+    # hydrate that starts while stage's commit is still landing reads a
+    # half-written raw/<date> — the parquet footers aren't there yet and
+    # load_raw dies with "No magic bytes found at end of file". reload()
+    # pulls the latest committed version before we measure or copy
+    # anything. Cheap, and the only thing standing between a stale mount
+    # and a 2 h hydrate on truncated input.
+    volume_out.reload()
+
     print("=== copy raw: output volume -> /tmp ===", flush=True)
     _copy_concurrent(
         f"{OUT_VOL_DIR}/raw/{date}",
@@ -1320,6 +1333,9 @@ def upload(
     `r2-credentials` Modal Secret. All other settings (bucket,
     account_id, prefix) come from the at-snapshot config file.
     """
+    # Upload reads snapshot/<date> straight off the Volume, so it needs
+    # the version hydrate committed, not the one this container mounted.
+    volume_out.reload()
     common = _common_args(
         backup_id=None,
         snapshot_date=snapshot_date,
