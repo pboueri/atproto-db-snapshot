@@ -24,6 +24,7 @@ Upload requires a Modal Secret named `r2-credentials` exposing
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -49,6 +50,14 @@ DUCKDB_VERSION = "1.5.2"
 # pattern of the pipeline.
 ROCKS_VOL_DIR = "/vol-rocks/var"
 OUT_VOL_DIR = "/vol-out/var"
+
+# Canonical PLC shard store, on the output volume but outside any
+# `<date>/` namespace. The PLC operation log is append-only and global —
+# it isn't a property of a single snapshot — so shards persist here and
+# every build seeds its `raw/<date>/plc/` working dir from them. Without
+# this, each build would re-walk the whole ~100M-op export from scratch
+# (many hours) instead of resuming at the tail (minutes).
+PLC_STORE_DIR = f"{OUT_VOL_DIR}/plc"
 
 # Ephemeral local storage. Modal's dataset-ingestion guide explicitly
 # recommends `/tmp` for transform working dirs ("Transformations should
@@ -364,6 +373,109 @@ def _raw_outputs_complete(raw_dir: str) -> bool:
     return True
 
 
+def _plc_shards(dirpath: str) -> list[str]:
+    """Sorted part-NNNNN.parquet basenames in `dirpath` (empty if absent)."""
+    if not os.path.isdir(dirpath):
+        return []
+    return sorted(f for f in os.listdir(dirpath) if f.endswith(".parquet"))
+
+
+def _read_plc_cursor(dirpath: str) -> dict | None:
+    """Load a PLC cursor from `dirpath`.
+
+    plc.rs writes `.cursor`; an earlier revision of the phase wrote
+    `.cursor.json`, and the shard store on the volume still carries that
+    name. Read either, preferring the current one.
+    """
+    for name in (".cursor", ".cursor.json"):
+        path = os.path.join(dirpath, name)
+        if os.path.isfile(path):
+            with open(path) as fh:
+                return json.load(fh)
+    return None
+
+
+def _copy_plc_shards(src: str, dst: str, label: str) -> int:
+    """Copy `part-*.parquet` from src to dst, skipping same-size files
+    already present. Returns the number of files actually copied. Small
+    enough (~100 files) that the threaded copier isn't worth it."""
+    os.makedirs(dst, exist_ok=True)
+    copied = 0
+    for name in _plc_shards(src):
+        s, d = os.path.join(src, name), os.path.join(dst, name)
+        if os.path.isfile(d) and os.path.getsize(d) == os.path.getsize(s):
+            continue
+        shutil.copy2(s, d)
+        copied += 1
+    print(f"[plc:{label}] {src} -> {dst}: {copied} shard(s) copied", flush=True)
+    return copied
+
+
+def _seed_plc_workdir(date: str) -> str:
+    """Prepare `raw/<date>/plc/` so the `plc` subcommand resumes from the
+    canonical store instead of re-fetching the whole export.
+
+    The store's cursor is written back with `completed` cleared: plc.rs
+    treats `completed` as terminal and short-circuits on it, but for us
+    it only means "caught up as of the last run" — a new build wants to
+    walk from that `after` cursor to the present tail. Shard numbering
+    continues past `shards`, so existing parts are never clobbered.
+
+    Idempotent: if the work dir already holds a cursor (a previous
+    attempt on this date), it's left alone so the retry resumes there.
+    """
+    work = f"{OUT_VOL_DIR}/raw/{date}/plc"
+    os.makedirs(work, exist_ok=True)
+
+    if _read_plc_cursor(work) is not None:
+        print(
+            f"[plc:seed] {work} already has a cursor "
+            f"({len(_plc_shards(work))} shards); resuming in place",
+            flush=True,
+        )
+        return work
+
+    cursor = _read_plc_cursor(PLC_STORE_DIR)
+    if cursor is None:
+        print(f"[plc:seed] no store at {PLC_STORE_DIR}; cold full export", flush=True)
+        return work
+
+    _copy_plc_shards(PLC_STORE_DIR, work, "seed")
+    cursor = {**cursor, "completed": False}
+    with open(os.path.join(work, ".cursor"), "w") as fh:
+        json.dump(cursor, fh, indent=2)
+    print(
+        f"[plc:seed] resuming from after={cursor.get('after')!r} "
+        f"shards={cursor.get('shards')} rows={cursor.get('rows')}",
+        flush=True,
+    )
+    return work
+
+
+def _publish_plc_store(date: str) -> None:
+    """Push this build's PLC shards + cursor back to the canonical store
+    so the next build resumes from today's tail rather than this one's."""
+    work = f"{OUT_VOL_DIR}/raw/{date}/plc"
+    cursor = _read_plc_cursor(work)
+    if cursor is None:
+        print(f"[plc:publish] no cursor in {work}; nothing to publish", flush=True)
+        return
+    _copy_plc_shards(work, PLC_STORE_DIR, "publish")
+    # Write the cursor last: it's the marker the next seed keys off, so
+    # a crash mid-copy leaves the store pointing at the older (still
+    # valid) tail rather than claiming shards it doesn't have.
+    with open(os.path.join(PLC_STORE_DIR, ".cursor"), "w") as fh:
+        json.dump(cursor, fh, indent=2)
+    legacy = os.path.join(PLC_STORE_DIR, ".cursor.json")
+    if os.path.isfile(legacy):
+        os.remove(legacy)
+    print(
+        f"[plc:publish] store at shards={cursor.get('shards')} "
+        f"rows={cursor.get('rows')} after={cursor.get('after')!r}",
+        flush=True,
+    )
+
+
 def _drop_local_rocks() -> None:
     """Remove /tmp/var/rocks once stage is done.
 
@@ -463,6 +575,55 @@ def mirror_phase(
     )
     _run_subcommand("mirror", common)
     volume_rocks.commit()
+
+
+@app.function(
+    image=image,
+    volumes={"/vol-out": volume_out},
+    # A cold full export walks ~100M ops one 1000-row page at a time;
+    # a warm resume covers a few weeks in minutes. 6h absorbs either,
+    # plus plc.directory's rate-limit backoff.
+    timeout=60 * 60 * 6,
+    # Sequential HTTP paging with a parquet writer on the end — one
+    # core and a small buffer is the whole workload.
+    cpu=1.0,
+    memory=4 * 1024,
+    ephemeral_disk=512 * 1024,  # 512 GiB (Modal minimum; unused)
+    retries=0,
+)
+def plc_phase(
+    snapshot_date: str | None = None,
+    config: str | None = None,
+) -> None:
+    """PLC phase: plc.directory export -> raw/<date>/plc/*.parquet.
+
+    Consumed by hydrate's `07_enrich_actors_created` stage to add
+    `created_at` / `tombstoned_at` to `actors` and to insert PLC-only
+    DIDs. hydrate skips that stage when the dir holds no parquet, so
+    omitting this phase silently drops the column rather than failing —
+    which is exactly why it belongs in `build()` and not just in the
+    Rust-side `at-snapshot build`.
+
+    Talks only to plc.directory: no rocks, no raw parquet, no ordering
+    constraint against mirror/stage. `build()` runs it concurrently
+    with the mirror -> stage chain and joins before hydrate.
+
+    Runs with `--work-dir` on the output volume rather than /tmp so the
+    checkpointed cursor survives a container kill mid-export.
+    """
+    date = _resolve_date(snapshot_date)
+    _seed_plc_workdir(date)
+    common = _common_args(
+        backup_id=None,
+        snapshot_date=date,
+        mirror_concurrency=1,
+        memory_limit="2GiB",  # plc doesn't open duckdb
+        config=config,
+        work_dir=OUT_VOL_DIR,
+    )
+    _run_subcommand("plc", common)
+    _publish_plc_store(date)
+    volume_out.commit()
 
 
 @app.function(
@@ -634,16 +795,32 @@ def build(
     mirror_concurrency: int = 64,
     memory_limit: str = "auto",
     config: str | None = None,
+    upload_after: bool = False,
 ) -> None:
-    """Orchestrate mirror → stage → hydrate end-to-end.
+    """Orchestrate plc + mirror → stage → hydrate end-to-end.
 
     Each phase runs on its own purpose-sized worker via .remote(), so
     the cheap mirror download doesn't pay for stage's RAM, and hydrate
     doesn't pay for stage's 2 TiB disk. Resume-aware: if raw entity
     parquets are already on /vol-out, skip mirror+stage and go
     straight to hydrate.
+
+    PLC mirrors the Rust `build`'s tokio::try_join: it only talks to
+    plc.directory, so it's spawned up front and runs alongside the
+    mirror → stage chain, then joined before hydrate (which needs its
+    shards for the actors created_at enrichment). A PLC failure fails
+    the build rather than silently producing a snapshot without
+    created_at — mirror/stage output is already persisted at that
+    point, so a rerun resumes straight into hydrate.
+
+    `upload_after` runs the upload here, server-side, so the whole
+    chain survives the local caller disconnecting.
     """
     date = _resolve_date(snapshot_date)
+
+    print("=== phase 0: plc (spawned; joins before hydrate) ===", flush=True)
+    plc_call = plc_phase.spawn(snapshot_date=date, config=config)
+
     raw_on_vol = f"{OUT_VOL_DIR}/raw/{date}"
     if _raw_outputs_complete(raw_on_vol):
         print(
@@ -670,6 +847,10 @@ def build(
         )
         print("=== stage committed ===", flush=True)
 
+    print("=== joining plc ===", flush=True)
+    plc_call.get()
+    print("=== plc committed ===", flush=True)
+
     print("=== phase 3/3: hydrate ===", flush=True)
     hydrate_phase.remote(
         backup_id=backup_id,
@@ -678,6 +859,11 @@ def build(
         config=config,
     )
     print("=== hydrate committed; snapshot ready ===", flush=True)
+
+    if upload_after:
+        print("=== upload ===", flush=True)
+        upload.remote(snapshot_date=date, config=config)
+        print("=== upload complete ===", flush=True)
 
 
 @app.function(
@@ -1145,15 +1331,27 @@ def main(
     """Local entrypoint dispatcher.
 
     Args:
-      phase: build | mirror | stage | hydrate | upload
+      phase: build | mirror | stage | plc | hydrate | upload
       upload_after: when True and phase != upload, run upload after the
-        chosen phase completes. Skipped for `upload` itself.
+        chosen phase completes. Skipped for `upload` itself. For
+        `build` the upload is chained server-side, so it still happens
+        under --background; for a single phase the chain is driven from
+        here and needs the local process to stay alive, so --background
+        is refused rather than silently racing the upload ahead of the
+        phase it's supposed to follow.
       background: spawn the remote call instead of waiting on it. With
         `modal run --detach`, plain .remote() may be cancelled when the
         local caller disconnects; .spawn() returns a FunctionCall handle
         that survives. Use this for long builds you want to walk away
         from. Follow progress with: `modal app logs <fn-call-id>`.
     """
+    if upload_after and background and phase not in ("build", "upload"):
+        raise SystemExit(
+            f"--upload-after with --background is only chained server-side for "
+            f"--phase build; for --phase {phase} it would spawn the upload "
+            f"immediately, ahead of the phase. Drop --background, or run "
+            f"`--phase upload` separately once the phase finishes."
+        )
 
     def _kick(fn, **kwargs):
         if background:
@@ -1167,6 +1365,9 @@ def main(
         return fn.remote(**kwargs)
 
     if phase == "build":
+        # Chained inside build() so the upload survives a local
+        # disconnect under --background, instead of being spawned
+        # here in parallel with the build it should follow.
         _kick(
             build,
             backup_id=backup_id,
@@ -1174,7 +1375,9 @@ def main(
             mirror_concurrency=mirror_concurrency,
             memory_limit=memory_limit,
             config=config,
+            upload_after=upload_after,
         )
+        return
     elif phase == "mirror":
         _kick(
             mirror_phase,
@@ -1192,6 +1395,8 @@ def main(
             memory_limit=memory_limit,
             config=config,
         )
+    elif phase == "plc":
+        _kick(plc_phase, snapshot_date=snapshot_date, config=config)
     elif phase == "hydrate":
         _kick(
             hydrate_phase,
@@ -1211,7 +1416,7 @@ def main(
     else:
         raise SystemExit(
             f"unknown phase {phase!r}; expected "
-            "build/mirror/stage/hydrate/upload/inspect"
+            "build/mirror/stage/plc/hydrate/upload/inspect"
         )
 
     if upload_after:
