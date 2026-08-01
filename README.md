@@ -13,7 +13,7 @@ The current snapshot [is here](https://pub-5ef34deaa1e54c25a97cea1bcfbd6456.r2.d
 
 | Table        | What it is |
 |---|---|
-| `actors`     | One row per DID. `did_id` is a stable u64 used by every other table. |
+| `actors`     | One row per DID. `did_id` is a stable u64 used by every other table. `created_at` / `tombstoned_at` come from the PLC directory export; `in_microcosm` is FALSE for DIDs that exist on PLC but that constellation never indexed (they follow/post/like nothing we saw), so filter on it when you want only accounts with graph activity. Both timestamps are NULL for `did:web` actors, which PLC doesn't cover. |
 | `follows`    | `src_did_id` follows `dst_did_id`. |
 | `blocks`     | `src_did_id` blocks `dst_did_id`. |
 | `likes`      | `actor_did_id` liked `subject_uri_id` (NULL when the subject isn't a post). |
@@ -27,10 +27,18 @@ URI strings live only on `posts`.
 
 ## Stages
 
-1. **mirror** — copy the constellation rocksdb to `./var/rocks/`.
+1. **mirror** — copy the constellation rocksdb to `./var/rocks/`. Incremental:
+   it size-diffs against the existing mirror and pulls only what changed.
 2. **stage** — read the rocks mirror and write per-entity parquet under `./var/raw/<date>/`.
-3. **hydrate** — load the parquet into `./var/snapshot/<date>/snapshot.duckdb`.
-4. **upload** — push `raw/<date>` and `snapshot/<date>` to an S3-compatible store (R2).
+3. **plc** — stream the [PLC directory](https://plc.directory) export into
+   `./var/raw/<date>/plc/`, capturing account creation and tombstone ops.
+   Checkpointed and resumable. Independent of the rocks mirror, so it runs
+   concurrently with mirror → stage.
+4. **hydrate** — load the parquet into `./var/snapshot/<date>/snapshot.duckdb`.
+   Uses the PLC shards to add `created_at` / `tombstoned_at` to `actors`;
+   skips that enrichment (leaving the columns off) when the `plc` stage
+   didn't run.
+5. **upload** — push `raw/<date>` and `snapshot/<date>` to an S3-compatible store (R2).
 
-`at-snapshot build` runs mirror → stage → hydrate. Each stage can also be
+`at-snapshot build` runs plc + mirror → stage → hydrate. Each stage can also be
 run on its own.

@@ -43,7 +43,7 @@ modal secret create atproto-snapshot \
 
 ## Build a snapshot
 
-Full pipeline (mirror → stage → hydrate):
+Full pipeline (plc + mirror → stage → hydrate):
 
 ```sh
 modal run deploy/modal_app.py
@@ -54,8 +54,22 @@ Run a single phase against the persistent volume:
 ```sh
 modal run deploy/modal_app.py --phase mirror
 modal run deploy/modal_app.py --phase stage
+modal run deploy/modal_app.py --phase plc
 modal run deploy/modal_app.py --phase hydrate
 ```
+
+`plc` only talks to plc.directory, so `build` spawns it up front and runs
+it alongside mirror → stage, joining before hydrate. Hydrate needs its
+shards to put `created_at` / `tombstoned_at` on `actors` — and it *skips*
+that enrichment rather than failing when they're absent, so a build that
+omits `plc` silently ships a snapshot without those columns.
+
+PLC shards live in a canonical store at `/vol-out/var/plc`, outside any
+`<date>/` namespace, because the PLC operation log is global and
+append-only rather than a property of one snapshot. Each build seeds
+`raw/<date>/plc/` from the store and publishes back to it, so a run picks
+up at the previous tail (minutes) instead of re-walking the full ~100M-op
+export (hours).
 
 Pinned backup + date:
 
@@ -77,6 +91,12 @@ Or do it in one shot after a fresh build:
 ```sh
 modal run deploy/modal_app.py --upload-after --config /app/deploy/at-snapshot.toml
 ```
+
+With `--phase build` the upload is chained inside the orchestrator, so it
+still runs under `--background` after the build finishes. For a single
+phase the chain is driven locally, so `--upload-after --background` is
+refused rather than firing the upload off in parallel with the phase it
+is supposed to follow.
 
 The config file lives inside the image (added via `add_local_dir`), so
 reference it by its `/app/...` path. R2 credentials come from the
@@ -101,8 +121,8 @@ new SST files since the last backup.
 
 | Flag | Default | Notes |
 |---|---|---|
-| `--phase` | `build` | `build`, `mirror`, `stage`, `hydrate`, or `upload`. |
-| `--upload-after` | `false` | When set and `--phase` ≠ `upload`, run upload after the chosen phase. |
+| `--phase` | `build` | `build`, `mirror`, `stage`, `plc`, `hydrate`, or `upload`. |
+| `--upload-after` | `false` | When set and `--phase` ≠ `upload`, run upload after the chosen phase. Chained server-side for `build`; rejected with `--background` for a single phase. |
 | `--backup-id` | latest | Pin a constellation backup id (`meta/<id>` in the bucket). |
 | `--snapshot-date` | today UTC | Output namespace. |
 | `--mirror-concurrency` | 64 | Drop to 8–16 if Tigris rate-limits. |
