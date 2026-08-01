@@ -6,7 +6,29 @@ post-relationship graph, derived end-to-end from the
 [microcosm.blue constellation](https://tangled.org/microcosm.blue/microcosm-rs)
 RocksDB backlinks index.
 
-The current snapshot [is here](https://pub-5ef34deaa1e54c25a97cea1bcfbd6456.r2.dev/atproto-snapshot/snapshot/2026-05-11/snapshot.duckdb) it is about 60GB. It has all actors/blocks/follows and posts/likes are between 2026-02-10 and 2026-05-11 (90 days)
+The current snapshot [is here](https://pub-5ef34deaa1e54c25a97cea1bcfbd6456.r2.dev/atproto-snapshot/snapshot/2026-07-31/snapshot.duckdb)
+(2026-07-31, 60.4 GB). It has all actors/blocks/follows; posts/likes/reposts
+are windowed to 2026-05-02 → 2026-07-31 (90 days).
+
+| Table | Rows |
+|---|---:|
+| `actors` | 105,515,262 |
+| `actor_aggs` | 26,180,082 |
+| `follows` | 1,463,484,958 |
+| `blocks` | 133,295,503 |
+| `likes` | 1,626,049,718 |
+| `reposts` | 250,557,929 |
+| `posts` | 271,086,751 |
+| `post_aggs` | 271,086,751 |
+
+`actors` is much larger than `actor_aggs` because it now carries every DID in
+the PLC directory, not just the ones constellation indexed — see
+`in_microcosm` in the table notes below. Windowed counts move with the window,
+not just with time: this snapshot has slightly fewer likes than the 2026-05-11
+one because May–July was a quieter 90 days than February–May.
+
+The previous snapshot (2026-05-11, 24.7 M actors, no `created_at`) is still at
+the [same path with its own date](https://pub-5ef34deaa1e54c25a97cea1bcfbd6456.r2.dev/atproto-snapshot/snapshot/2026-05-11/snapshot.duckdb).
 
 
 ## Tables
