@@ -30,6 +30,23 @@ pub struct Config {
     pub rocks_block_cache: String,
     #[serde(default = "default_stage_threads")]
     pub stage_threads: usize,
+    /// Delete the rocks mirror as soon as the scans that read it are
+    /// done, before Phase 5's DuckDB sort-merge.
+    ///
+    /// Passes A/B/C are the only readers; `run()` already drops the DB
+    /// handle before Phase 5, leaving the full mirror (~765 GB at
+    /// 2026-07 scale) parked on disk while DuckDB needs room for its
+    /// spill, the scratch parquets and the entity outputs all at once.
+    /// On a 2 TiB worker that overflow is what kills the `likes` copy.
+    ///
+    /// Off by default and deliberately so: it destroys the mirror, and
+    /// for a local run (or any run pointed at a canonical mirror) that
+    /// is a hours-long re-download. Set it only when `rocks_dir` is a
+    /// disposable per-run copy — which is exactly the Modal stage
+    /// worker, where rocks is rsynced from a persistent Volume into
+    /// container-local /tmp.
+    #[serde(default)]
+    pub stage_drop_rocks: bool,
     /// When set to N>1, chunked stages are run as N modulo-bucketed
     /// passes and the rows are concatenated. Hash tables shrink ~N×
     /// per pass at the cost of re-scanning the input parquet N times.
@@ -221,6 +238,7 @@ impl Config {
             upload: None,
             rocks_block_cache: default_rocks_block_cache(),
             stage_threads: default_stage_threads(),
+            stage_drop_rocks: false,
             hydrate_chunk_buckets: None,
             hydrate_chunk_dry_run: None,
             hydrate_window_days_back: None,

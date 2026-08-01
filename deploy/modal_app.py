@@ -162,6 +162,7 @@ def _common_args(
     work_dir: str = TMP_WORK_DIR,
     window_days_back: int | None = None,
     window_days_lag: int | None = None,
+    stage_drop_rocks: bool = False,
 ) -> list[str]:
     args = [
         "--work-dir",
@@ -171,6 +172,8 @@ def _common_args(
         "--mirror-concurrency",
         str(mirror_concurrency),
     ]
+    if stage_drop_rocks:
+        args += ["--stage-drop-rocks"]
     if backup_id is not None:
         args += ["--backup-id", str(backup_id)]
     if snapshot_date:
@@ -647,15 +650,21 @@ def plc_phase(
     # during Phase 5 sorts and pivots. If full-scale runs hit
     # ActorMap > 20 GB, bump to 48.
     memory=32 * 1024,
-    # /tmp peak during stage:
-    #   rocks (650 GB)
-    #   + scratch lt_*.parquet + t_*_refs.parquet (~150-180 GB at LZ4)
-    #   + raw entity parquets (~200 GB)
-    #   + DuckDB sort spill during Phase 5 (~50-100 GB)
-    # ≈ 1.0-1.1 TB. 2 TiB gives comfortable headroom and Modal
-    # clamps the worker class to the disk tier, so we land on ~100
-    # GiB-RAM hosts where ActorMap won't squeeze us either.
-    ephemeral_disk=2 * 1024 * 1024,  # 2 TiB
+    # /tmp peak during stage, at 2026-07 scale:
+    #   scratch lt_*.parquet + t_*_refs.parquet (~450 GB)
+    #   + raw entity parquets (~400 GB)
+    #   + DuckDB sort spill during Phase 5 (~300 GB on the likes sort,
+    #     which is 11.8 B rows)
+    # ≈ 1.2 TB, and rocks (765 GB) is NOT in that total because
+    # --stage-drop-rocks deletes it after the scans, before Phase 5.
+    #
+    # It used to be, and that's what broke the 2026-07-31 build: rocks
+    # had grown 650 -> 765 GB and every entity had roughly doubled
+    # since the estimate above was written, so Phase 5 hit "No space
+    # left on device" partway through the likes copy after 2.4 h of
+    # scanning. 3 TiB keeps a full mirror's worth of slack on top of
+    # the drop, so the next growth step doesn't repeat that.
+    ephemeral_disk=3 * 1024 * 1024,  # 3 TiB
     retries=0,
 )
 def stage_phase(
@@ -667,9 +676,15 @@ def stage_phase(
 ) -> None:
     """Stage phase: rocks → entity parquets.
 
-    Reads /vol-rocks → /tmp, runs the binary's `stage` command, drops
-    rocks before persisting (frees ~650 GB to make room for the raw
-    write buffer), then copies raw entity parquets to /vol-out.
+    Reads /vol-rocks → /tmp, runs the binary's `stage` command, then
+    copies raw entity parquets to /vol-out.
+
+    `--stage-drop-rocks` is safe here and only here: the mirror this
+    reads is a container-local /tmp copy made at the top of this
+    function, so deleting it costs one re-copy from the Volume rather
+    than a re-download from constellation. The binary removes it once
+    the scans are done, which is what keeps Phase 5's DuckDB spill
+    inside the disk budget.
     """
     date = _resolve_date(snapshot_date)
     common = _common_args(
@@ -679,6 +694,7 @@ def stage_phase(
         memory_limit=memory_limit,
         config=config,
         work_dir=TMP_WORK_DIR,
+        stage_drop_rocks=True,
     )
     print("=== copy rocks: rocks volume -> /tmp ===", flush=True)
     _copy_concurrent(

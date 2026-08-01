@@ -94,6 +94,7 @@ async fn end_to_end_synthetic_rocks() -> Result<()> {
         upload: None,
         rocks_block_cache: "64MiB".into(),
         stage_threads: 1,
+        stage_drop_rocks: false,
         hydrate_chunk_buckets: Some(4),
         hydrate_chunk_dry_run: None,
         hydrate_window_days_back: None,

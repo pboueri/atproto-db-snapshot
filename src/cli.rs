@@ -116,6 +116,12 @@ pub struct CommonArgs {
     /// Number of worker threads for pass B (link_targets scan).
     #[arg(long)]
     pub stage_threads: Option<usize>,
+    /// Delete the rocks mirror once the scans finish, before Phase 5,
+    /// to give DuckDB's sort spill room. DESTRUCTIVE — only pass this
+    /// when the mirror is a disposable per-run copy, never against a
+    /// canonical one you'd have to re-download.
+    #[arg(long)]
+    pub stage_drop_rocks: bool,
     /// Hydrate time-window: keep events whose created_at falls in
     /// [snapshot_date - days_back, snapshot_date - days_lag]. Both
     /// flags must be set together. Applies to likes / reposts /
@@ -222,6 +228,9 @@ fn apply_overrides(cfg: &mut Config, args: &CommonArgs) {
     }
     if let Some(t) = args.stage_threads {
         cfg.stage_threads = t;
+    }
+    if args.stage_drop_rocks {
+        cfg.stage_drop_rocks = true;
     }
     if let Some(b) = args.window_days_back {
         cfg.hydrate_window_days_back = Some(b);

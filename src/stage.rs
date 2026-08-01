@@ -146,6 +146,30 @@ pub async fn run(cfg: &Config, snapshot_date: &str) -> Result<StageOutcome> {
     drop(actor_map);
     drop(db);
 
+    // Rocks is dead weight from here on — the DB handle is closed above
+    // and Phase 5 reads only the scratch parquets. On the Modal stage
+    // worker the mirror is a disposable /tmp copy, and leaving ~765 GB
+    // of it parked while DuckDB spills the `likes` sort is what puts
+    // the 2 TiB disk over the edge. Off by default; see
+    // Config::stage_drop_rocks for why this can't be unconditional.
+    if cfg.stage_drop_rocks {
+        let t0 = Instant::now();
+        match std::fs::remove_dir_all(&rocks_dir) {
+            Ok(()) => tracing::info!(
+                dir = %rocks_dir.display(),
+                elapsed_secs = t0.elapsed().as_secs_f64(),
+                "dropped rocks mirror before phase 5"
+            ),
+            // Non-fatal: we're only reclaiming space. If Phase 5 then
+            // runs out of disk it fails with its own clear error.
+            Err(e) => tracing::warn!(
+                error = %e,
+                dir = %rocks_dir.display(),
+                "drop rocks failed (continuing)"
+            ),
+        }
+    }
+
     // ---- Phase 5: DuckDB sort-merge → final entity parquets
     let phase5_t0 = Instant::now();
     let entity_counts = phase5_merge(&scratch_dir, &raw_dir, cfg)?;
