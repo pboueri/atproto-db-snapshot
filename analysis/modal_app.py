@@ -8,6 +8,7 @@ Each analysis lives in its own submodule:
   analysis/followers.py  analyze_followers
   analysis/following.py  analyze_following
   analysis/blocks.py     analyze_blocks  (needs scipy)
+  analysis/lifelines.py  analyze_lifelines
 
 This file is just the Modal glue: it defines the app, the per-image
 remote functions, and a local entrypoint that dispatches based on the
@@ -17,6 +18,7 @@ remote functions, and a local entrypoint that dispatches based on the
   modal run analysis/modal_app.py --analysis ratio --snapshot-date 2026-05-11
   modal run analysis/modal_app.py --analysis attrition --inactivity-days 30
   modal run analysis/modal_app.py --analysis blocks --background
+  modal run analysis/modal_app.py --analysis lifelines --snapshot-date 2026-07-31
 
 Each remote function reads `/vol-out/var/snapshot/<date>/snapshot.duckdb`
 from the shared output volume, calls the corresponding `run()`, writes
@@ -334,6 +336,41 @@ def analyze_graph_boosters_full(
     return _persist(snapshot_date, "graph_boosters", html, sidecar)
 
 
+@app.function(
+    image=analysis_image,
+    volumes={"/vol-out": volume_out},
+    timeout=60 * 60 * 3,
+    cpu=16.0,
+    memory=160 * 1024,
+    ephemeral_disk=1024 * 1024,
+)
+def analyze_lifelines(
+    snapshot_date: str = "2026-07-31",
+    cohort_days: int = 30,
+    horizon_hours: int = 168,
+    min_engagement: int = 50,
+    max_posts: int = 150_000,
+    n_shapes: int = 6,
+) -> bytes:
+    # The heaviest step is resolving the in-network flag: the distinct
+    # (engager, author) pairs from the event table are joined against all
+    # ~1.4B `follows` rows, which DuckDB runs as one sequential pass probing
+    # a hash set. That set is what the memory here is for — DuckDB is pinned
+    # well below the container so the pair table and the event table can
+    # both stay resident.
+    from analysis.lifelines import run
+    con = _open_snapshot(snapshot_date, memory_limit="120GiB")
+    html, sidecar = run(
+        con, snapshot_date,
+        cohort_days=cohort_days,
+        horizon_hours=horizon_hours,
+        min_engagement=min_engagement,
+        max_posts=max_posts,
+        n_shapes=n_shapes,
+    )
+    return _persist(snapshot_date, "lifelines", html, sidecar)
+
+
 # Maps the public --analysis flag to (remote fn, output basename, extra
 # kwargs-derived-from-cli). Each entry lists which CLI params it consumes
 # so the dispatcher can pass through only the relevant ones.
@@ -377,6 +414,20 @@ _DISPATCH = {
         "out_name": lambda d: f"following_distribution_{d}.html",
         "vol_path": lambda d: f"/vol-out/var/analysis/{d}/following_distribution.html",
         "kwargs": lambda d, **rest: {"snapshot_date": d},
+    },
+    "lifelines": {
+        "fn": analyze_lifelines,
+        "out_name": lambda d: f"lifelines_{d}.html",
+        "vol_path": lambda d: f"/vol-out/var/analysis/{d}/lifelines.html",
+        "kwargs": lambda d, *, cohort_days, horizon_hours, min_engagement,
+                          max_posts, n_shapes, **rest: {
+            "snapshot_date": d,
+            "cohort_days": cohort_days,
+            "horizon_hours": horizon_hours,
+            "min_engagement": min_engagement,
+            "max_posts": max_posts,
+            "n_shapes": n_shapes,
+        },
     },
     "graph": {
         "fn": analyze_graph_boosters,
@@ -443,16 +494,27 @@ def main(
     min_target_support: int = 5,
     top_targets: int = 100,
     build_full_graph: bool = False,
+    cohort_days: int = 30,
+    horizon_hours: int = 168,
+    min_engagement: int = 50,
+    max_posts: int = 150_000,
+    n_shapes: int = 6,
     background: bool = False,
 ) -> None:
     """Dispatch to one of the snapshot analyses.
 
     Args:
       analysis: which analysis to run — likes, ratio, attrition,
-        followers, following, blocks, growth.
+        followers, following, blocks, growth, lifelines.
       snapshot_date: which snapshot in /vol-out/var/snapshot/<date>/ to read.
       window_days: time-window length for windowed analyses (ratio).
       inactivity_days: inactivity threshold for attrition.
+      cohort_days: lifelines only — length of the post-creation window.
+      horizon_hours: lifelines only — observation horizon applied identically
+        to every post. The cohort ends one full horizon before the data does,
+        so raising this trades cohort recency for the ability to see slow
+        sleepers (720 = 30 days of observation).
+      min_engagement: lifelines only — floor on total engagement per post.
       emit_state_log: growth only — 1 writes the per-user state-interval
         parquet to /vol-out/var/analysis/<date>/growth_state_log.parquet.
       background: spawn the remote call instead of waiting on it.
@@ -481,6 +543,11 @@ def main(
         min_target_support=min_target_support,
         top_targets=top_targets,
         build_full_graph=build_full_graph,
+        cohort_days=cohort_days,
+        horizon_hours=horizon_hours,
+        min_engagement=min_engagement,
+        max_posts=max_posts,
+        n_shapes=n_shapes,
     )
     out_name = spec["out_name"](snapshot_date)
     vol_path = spec["vol_path"](snapshot_date)
