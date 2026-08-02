@@ -819,15 +819,21 @@ def _fetch_examples(con, feats, labels, per_archetype, hydrate_urls, say):
         pick = ok[np.argsort(d[ok])[:per_archetype]]
         chosen[arch] = [dict(feats[idxs[p]]) for p in pick]
 
-    if not hydrate_urls:
-        return chosen
+    if hydrate_urls:
+        _hydrate_urls(con, [e for exs in chosen.values() for e in exs], say)
+    return chosen
 
-    want = [e["uri_id"] for exs in chosen.values() for e in exs]
-    if not want:
-        return chosen
-    post_cols = _columns(con, "posts")
-    if "rkey" not in post_cols:
-        return chosen
+
+def _hydrate_urls(con, rows, say) -> None:
+    """Fill `url` / `author_did` / `posted_at` on example dicts, in place.
+
+    Kept separate from example selection because two callers need it and
+    only one of them should ever use it: archetype examples always link
+    out, while authenticity-flagged posts only do so on explicit request.
+    """
+    want = [r["uri_id"] for r in rows]
+    if not want or "rkey" not in _columns(con, "posts"):
+        return
     placeholders = ",".join("?" * len(want))
     # `post_url` is a macro defined by 06_url_macros.sql inside real
     # snapshots; synthetic fixtures don't have it, so fall back to the
@@ -836,20 +842,18 @@ def _fetch_examples(con, feats, labels, per_archetype, hydrate_urls, say):
     try:
         con.execute("SELECT post_url('did:plc:x', 'abc')").fetchone()
     except Exception:
-        url_expr = ("'https://bsky.app/profile/' || a.did || '/post/' || p.rkey")
-    rows = con.execute(f"""
+        url_expr = "'https://bsky.app/profile/' || a.did || '/post/' || p.rkey"
+    found = con.execute(f"""
         SELECT p.uri_id, {url_expr}, a.did, p.created_at
         FROM posts p JOIN actors a ON a.did_id = p.author_did_id
         WHERE p.uri_id IN ({placeholders})
     """, want).fetchall()
-    url_by_uri = {int(r[0]): (r[1], r[2], r[3]) for r in rows}
-    for exs in chosen.values():
-        for e in exs:
-            hit = url_by_uri.get(e["uri_id"])
-            if hit:
-                e["url"], e["author_did"], e["posted_at"] = hit
-    say(f"hydrated {len(url_by_uri)} example URLs")
-    return chosen
+    url_by_uri = {int(r[0]): (r[1], r[2], r[3]) for r in found}
+    for r in rows:
+        hit = url_by_uri.get(r["uri_id"])
+        if hit:
+            r["url"], r["author_did"], r["posted_at"] = hit
+    say(f"hydrated {len(url_by_uri)} post URLs")
 
 
 # --------------------------------------------------------------------------
@@ -1017,6 +1021,56 @@ def _fig_shapes(centroids, shape_sizes, xs, xrange=None):
     return fig
 
 
+def _fig_authenticity(feats, labels, present):
+    """Score distribution overall, and mean score per archetype.
+
+    The per-archetype panel is the standing confound check, not decoration.
+    `broadcast` is the archetype defined by an out-of-network wave — which
+    is what algorithmic distribution looks like. If it carries the top mean
+    score, the composite has drifted into measuring Discover rather than
+    coordination, and the weights need moving back toward the correlation
+    signals. That failure mode is invisible unless it is plotted.
+    """
+    import numpy as np
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+
+    vals = np.array([f["auth_score"] for f in feats
+                     if f.get("auth_score") is not None])
+    fig = make_subplots(
+        rows=1, cols=2, column_widths=[0.45, 0.55],
+        subplot_titles=("score distribution", "mean score by archetype"),
+    )
+    if len(vals):
+        fig.add_trace(go.Histogram(
+            x=vals, nbinsx=40, marker_color=BRAND, showlegend=False,
+            hovertemplate="score %{x:.2f}: %{y} posts<extra></extra>",
+        ), row=1, col=1)
+
+    names, means, colors = [], [], []
+    for arch in present:
+        sel = [f["auth_score"] for f, l in zip(feats, labels)
+               if l == arch and f.get("auth_score") is not None]
+        if not sel:
+            continue
+        names.append(arch.replace("_", " "))
+        means.append(float(np.mean(sel)))
+        colors.append(ARCHETYPE_COLORS[arch])
+    order = np.argsort(means)[::-1]
+    fig.add_trace(go.Bar(
+        x=[names[i] for i in order], y=[means[i] for i in order],
+        marker_color=[colors[i] for i in order], showlegend=False,
+        hovertemplate="%{x}: %{y:.3f}<extra></extra>",
+    ), row=1, col=2)
+
+    fig.update_layout(template="bsky", height=380,
+                      margin=dict(l=60, r=20, t=50, b=90), bargap=0.15)
+    fig.update_yaxes(title_text="posts", row=1, col=1)
+    fig.update_xaxes(title_text="composite score", row=1, col=1)
+    fig.update_yaxes(title_text="mean composite score", row=1, col=2)
+    return fig
+
+
 def _fig_crosstab(shape_labels, labels, present, n_shapes, shape_rank):
     """KSC shape x rule label — does the rule taxonomy track the real shapes?"""
     import numpy as np
@@ -1082,7 +1136,87 @@ def _examples_html(examples, present) -> str:
     return "\n".join(rows)
 
 
-def _render_html(*, snapshot_date, sidecar, figs, examples, present) -> bytes:
+def _authenticity_html(sidecar, figs, flagged, linked) -> str:
+    """The authenticity section, or an explicit note that it did not run."""
+    auth = sidecar.get("authenticity")
+    if not auth or not auth.get("signals_run"):
+        return ""
+
+    sig_rows = "".join(
+        f"<tr><td>{s['name'].replace('_', ' ')}</td>"
+        f"<td>{s['description']}</td>"
+        f"<td>{s['family']}</td>"
+        f"<td class='num'>{s['weight']:.0%}</td></tr>"
+        for s in auth["signals_run"]
+    )
+    skipped = auth.get("skipped") or {}
+    skip_html = ""
+    if skipped:
+        items = "".join(f"<li><code>{k}</code> — {v}</li>"
+                        for k, v in skipped.items())
+        skip_html = (f"<p class='muted'>Signals not run: <ul class='muted'>"
+                     f"{items}</ul></p>")
+
+    fam = auth.get("family_weights", {})
+    rows = []
+    for e in flagged:
+        cell = (f'<a href="{e["url"]}" target="_blank" rel="noopener">open post</a>'
+                if linked and e.get("url") else
+                f"<span class='muted'>post {e['rank']}</span>")
+        rows.append(
+            f"<tr><td>{cell}</td>"
+            f"<td class='num'>{e['score']:.3f}</td>"
+            f"<td class='num'>{fmt_int(e['n_total'])}</td>"
+            f"<td>{e['archetype'].replace('_', ' ')}</td>"
+            f"<td class='num'>{e['in_network_share']:.0%}</td></tr>"
+        )
+
+    return f"""
+<section>
+<div class="kicker">authenticity</div>
+<h2>Engagement that does not look like it was earned</h2>
+<p>A fourth axis, not a tenth archetype. Nobody buys engagement on a post
+that got no traction — they buy it to push something already moving — so a
+post is routinely a genuine sleeper hit <em>and</em> partly amplified.
+Forcing that into an exclusive bucket gets the common case wrong, so this
+score rides alongside the archetype label instead.</p>
+<div class="figure">{figs['authenticity']}</div>
+<p>The right-hand panel is a running check on the method rather than a
+result. <strong>broadcast</strong> is the archetype defined by an
+out-of-network wave, which is exactly what algorithmic distribution looks
+like. If it ever carries the top mean score, this composite has drifted
+into measuring Discover instead of coordination, and weight needs moving
+back toward the correlation signals.</p>
+
+<h3 style="margin:28px 0 6px">What it is built from</h3>
+<table><thead><tr><th>signal</th><th>what it measures</th>
+<th>family</th><th class="num">weight</th></tr></thead>
+<tbody>{sig_rows}</tbody></table>
+<p class="muted" style="margin-top:10px">Correlation-family signals carry
+{fam.get('correlation', 0):.0%} of the total weight against
+{fam.get('timing', 0):.0%} for timing. That split is deliberate: timing
+regularity is one line of code to jitter away, and more importantly it is
+what makes ordinary algorithmic reach look like a bot farm. The thing that
+is genuinely hard to fake is <em>who</em> shows up — a fleet works a list,
+so its accounts keep appearing together.</p>
+
+<h3 style="margin:28px 0 6px">Highest-scoring posts</h3>
+<p class="muted" style="margin:0 0 10px">Redacted deliberately. Every other
+archetype in this report links to real posts; this one does not, because
+"bought engagement" is an accusation about a named account and the
+inference here is probabilistic at best. Rates and shapes are publishable;
+names are not.</p>
+<table><thead><tr><th>post</th><th class="num">score</th>
+<th class="num">engagements</th><th>archetype</th>
+<th class="num">in-network</th></tr></thead>
+<tbody>{''.join(rows)}</tbody></table>
+{skip_html}
+</section>
+"""
+
+
+def _render_html(*, snapshot_date, sidecar, figs, examples, present,
+                 flagged=(), link_flagged=False) -> bytes:
     pop = sidecar["archetypes"]
     total = sidecar["cohort"]["posts_analyzed"]
     unclassified_pct = 100.0 * pop.get("unclassified", {}).get("n", 0) / max(total, 1)
@@ -1207,6 +1341,8 @@ off, restricted to the upper half of the archetype by engagement.</p>
 {_examples_html(examples, present)}
 </section>
 
+{_authenticity_html(sidecar, figs, flagged, link_flagged)}
+
 <div class="caveat">
 <h4>What this measurement cannot see</h4>
 <ul>
@@ -1221,6 +1357,11 @@ describes the visible tail, not the median post, which gets almost nothing.</li>
 <li><strong>Fixed horizon.</strong> Every post is observed for exactly
 {c['horizon_hours']}h, so anything still growing at the horizon is truncated
 by construction. Sleepers slower than that are counted as evergreen.</li>
+<li><strong>The authenticity score is relative, not absolute.</strong> Signals
+are combined by percentile rank <em>within this cohort</em>, so a high score
+means "unusual compared with the other posts analyzed here" and never "this
+post was boosted with probability p". A cohort with no coordination in it
+still produces a top decile.</li>
 <li><strong>Rules, not ground truth.</strong> The archetype labels are
 thresholds over features, chosen and reviewable. The
 {unclassified_pct:.0f}% unclassified bucket is the honest measure of what the
@@ -1255,6 +1396,10 @@ def run(
     seed: int = 0,
     hydrate_urls: bool = True,
     thresholds: dict | None = None,
+    authenticity: bool = True,
+    authenticity_signals: list | None = None,
+    authenticity_weights: dict | None = None,
+    link_flagged_examples: bool = False,
     log: bool = True,
 ) -> tuple[bytes, dict]:
     """Build the engagement-archetype report.
@@ -1269,6 +1414,17 @@ def run(
       max_posts: reservoir-sample down to this many posts if the cohort is
         larger, so the event extraction stays bounded.
       n_shapes: number of K-Spectral Centroid clusters for the shape axis.
+      authenticity: compute the inauthentic-amplification axis. Runs as a
+        second pass over the temp tables the lifeline extraction already
+        built, so it costs extra query time but no extra extraction.
+      authenticity_signals: explicit signal allowlist; None uses every
+        signal marked default-enabled in `authenticity.SIGNALS`.
+      authenticity_weights: per-signal weight overrides, renormalized.
+      link_flagged_examples: link out to the posts scoring highest on the
+        authenticity axis. Off by default and deliberately so — "bought
+        engagement" is an accusation about a named account and the
+        inference is probabilistic even at its best, so the report ships
+        aggregate rates and redacted rows unless this is explicitly set.
     """
     import numpy as np
 
@@ -1311,6 +1467,24 @@ def run(
     say(f"KSC shapes: " + ", ".join(
         f"{shape_rank[j] + 1}:{shape_sizes[j]:,}" for j in sorted(shape_rank, key=shape_rank.get)))
 
+    # Fourth axis. Deliberately a score attached to every post rather than
+    # an archetype of its own: a post is routinely a genuine sleeper hit
+    # *and* partly amplified, and a mutually exclusive bucket would force a
+    # wrong answer on exactly the common case.
+    auth_scores, auth_meta = {}, None
+    if authenticity:
+        from . import authenticity as auth_mod
+        auth_scores, auth_meta = auth_mod.attach(
+            con,
+            {"cohort_days": cohort_days, "horizon_hours": horizon_hours},
+            enabled=authenticity_signals,
+            weights=authenticity_weights,
+            log=log,
+        )
+        for f in feats:
+            hit = auth_scores.get(f["uri_id"])
+            f["auth_score"] = hit["score"] if hit else None
+
     present = [a for a in ARCHETYPE_ORDER if a in set(labels)]
     xs = _bin_midpoints_hours(n_bins, horizon_hours)
 
@@ -1334,6 +1508,47 @@ def run(
 
     examples = _fetch_examples(con, feats, labels, examples_per_archetype,
                                hydrate_urls, say)
+
+    # --- authenticity summary + flagged rows ------------------------------
+    auth_summary, flagged = None, []
+    if auth_meta and auth_meta.get("signals_run"):
+        scored = [(i, f["auth_score"]) for i, f in enumerate(feats)
+                  if f.get("auth_score") is not None]
+        scored.sort(key=lambda t: -t[1])
+        fam_w: dict[str, float] = {}
+        for s in auth_meta["signals_run"]:
+            fam_w[s["family"]] = fam_w.get(s["family"], 0.0) + s["weight"]
+        vals = np.array([v for _i, v in scored]) if scored else np.array([0.0])
+        cut90 = float(np.quantile(vals, 0.9)) if len(vals) else 0.0
+        auth_summary = {
+            **auth_meta,
+            "family_weights": {k: round(v, 4) for k, v in fam_w.items()},
+            "posts_scored": len(scored),
+            "median_score": float(np.median(vals)),
+            "p90_score": cut90,
+            "mean_score_by_archetype": {
+                a: float(np.mean([feats[i]["auth_score"]
+                                  for i, l in enumerate(labels)
+                                  if l == a
+                                  and feats[i].get("auth_score") is not None]
+                                 or [0.0]))
+                for a in present
+            },
+        }
+        # Redacted by default: rank, score and shape are publishable; the
+        # identity of an account we are implicitly accusing is not.
+        for rank, (i, sc_val) in enumerate(scored[:10], start=1):
+            row = {
+                "rank": rank,
+                "score": sc_val,
+                "uri_id": feats[i]["uri_id"],
+                "n_total": feats[i]["n_total"],
+                "archetype": labels[i],
+                "in_network_share": feats[i]["in_network_share"],
+            }
+            flagged.append(row)
+        if link_flagged_examples and hydrate_urls:
+            _hydrate_urls(con, flagged, say)
 
     sidecar = {
         "snapshot_date": snapshot_date,
@@ -1364,6 +1579,7 @@ def run(
         },
         "thresholds": th,
         "archetypes": arch_stats,
+        "authenticity": auth_summary,
         "examples": {
             a: [{k2: v for k2, v in e.items()
                  if k2 in ("uri_id", "url", "n_total", "t50_h", "late24",
@@ -1386,7 +1602,11 @@ def run(
         "crosstab": fig_html(
             _fig_crosstab(shape_labels, labels, present, k, shape_rank), "lf-xtab"),
     }
+    if auth_summary:
+        figs["authenticity"] = fig_html(
+            _fig_authenticity(feats, labels, present), "lf-auth")
     html = _render_html(snapshot_date=snapshot_date, sidecar=sidecar,
-                        figs=figs, examples=examples, present=present)
+                        figs=figs, examples=examples, present=present,
+                        flagged=flagged, link_flagged=link_flagged_examples)
     say(f"done in {sidecar['elapsed_s']}s")
     return html.encode("utf-8"), sidecar

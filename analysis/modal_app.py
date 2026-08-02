@@ -351,6 +351,8 @@ def analyze_lifelines(
     min_engagement: int = 50,
     max_posts: int = 150_000,
     n_shapes: int = 6,
+    authenticity: bool = True,
+    link_flagged_examples: bool = False,
 ) -> bytes:
     # The heaviest step is resolving the in-network flag: the distinct
     # (engager, author) pairs from the event table are joined against all
@@ -367,6 +369,8 @@ def analyze_lifelines(
         min_engagement=min_engagement,
         max_posts=max_posts,
         n_shapes=n_shapes,
+        authenticity=authenticity,
+        link_flagged_examples=link_flagged_examples,
     )
     return _persist(snapshot_date, "lifelines", html, sidecar)
 
@@ -420,13 +424,16 @@ _DISPATCH = {
         "out_name": lambda d: f"lifelines_{d}.html",
         "vol_path": lambda d: f"/vol-out/var/analysis/{d}/lifelines.html",
         "kwargs": lambda d, *, cohort_days, horizon_hours, min_engagement,
-                          max_posts, n_shapes, **rest: {
+                          max_posts, n_shapes, authenticity,
+                          link_flagged_examples, **rest: {
             "snapshot_date": d,
             "cohort_days": cohort_days,
             "horizon_hours": horizon_hours,
             "min_engagement": min_engagement,
             "max_posts": max_posts,
             "n_shapes": n_shapes,
+            "authenticity": authenticity,
+            "link_flagged_examples": link_flagged_examples,
         },
     },
     "graph": {
@@ -499,6 +506,8 @@ def main(
     min_engagement: int = 50,
     max_posts: int = 150_000,
     n_shapes: int = 6,
+    authenticity: bool = True,
+    link_flagged_examples: bool = False,
     background: bool = False,
 ) -> None:
     """Dispatch to one of the snapshot analyses.
@@ -515,6 +524,12 @@ def main(
         so raising this trades cohort recency for the ability to see slow
         sleepers (720 = 30 days of observation).
       min_engagement: lifelines only — floor on total engagement per post.
+      authenticity: lifelines only — compute the inauthentic-amplification
+        axis (a second pass over the extraction's temp tables).
+      link_flagged_examples: lifelines only — link out to the posts scoring
+        highest on that axis. Off by default: the report ships aggregate
+        rates and redacted rows because the inference is probabilistic and
+        the subject is a named account.
       emit_state_log: growth only — 1 writes the per-user state-interval
         parquet to /vol-out/var/analysis/<date>/growth_state_log.parquet.
       background: spawn the remote call instead of waiting on it.
@@ -548,6 +563,8 @@ def main(
         min_engagement=min_engagement,
         max_posts=max_posts,
         n_shapes=n_shapes,
+        authenticity=authenticity,
+        link_flagged_examples=link_flagged_examples,
     )
     out_name = spec["out_name"](snapshot_date)
     vol_path = spec["vol_path"](snapshot_date)

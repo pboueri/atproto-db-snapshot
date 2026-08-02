@@ -23,7 +23,7 @@ from synth_lifelines import SNAPSHOT_DATE, make_lifeline_snapshot
 
 @pytest.fixture(scope="module")
 def lifeline_snapshot(tmp_path_factory):
-    path, truth = make_lifeline_snapshot(
+    path, truth, _auth = make_lifeline_snapshot(
         tmp_path_factory.mktemp("lf") / "snapshot.duckdb")
     return path, truth
 
