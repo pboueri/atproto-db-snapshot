@@ -43,6 +43,13 @@ STRANGER_LO, STRANGER_HI = 10_000, 40_000    # out-of-network engager pool
 # to find. Deliberately small relative to the stranger pool.
 FLEET_LO, FLEET_HI = 50_000, 50_120
 
+# uri_ids start above int64's range on purpose. Real ones are the xxhash3-64
+# of the post URI, so about half of them exceed 2**63 — and a fixture using
+# small sequential ids hides every place the analysis assumes a signed 64-bit
+# integer. One did: `np.array(..., dtype=np.int64)` on the id column passed
+# every test here and then raised OverflowError on the first real snapshot.
+URI_ID_BASE = 0xF000_0000_0000_0000
+
 # TID alphabet, so generated rkeys look like real ones (the analysis only
 # uses rkey to build example URLs, but keeping it realistic costs nothing).
 _TID_ALPHABET = "234567abcdefghijklmnopqrstuvwxyz"
@@ -53,7 +60,8 @@ def _rkey(rng: random.Random) -> str:
 
 
 def _insert(con, table: str, names: list[str], columns: list, *,
-            select: str | None = None, ts_columns: tuple[str, ...] = ()) -> None:
+            select: str | None = None, ts_columns: tuple[str, ...] = (),
+            u64_columns: tuple[str, ...] = ()) -> None:
     """Bulk-insert column-oriented data through DuckDB's numpy replacement scan.
 
     `executemany` binds one row at a time and costs ~100s for the ~100k rows
@@ -76,6 +84,13 @@ def _insert(con, table: str, names: list[str], columns: list, *,
             arr = np.array(
                 [np.datetime64("NaT") if v is None else np.datetime64(v, "us")
                  for v in col], dtype="datetime64[us]")
+        elif name in u64_columns:
+            # uri_ids are xxhash3-64 values, so they routinely exceed int64
+            # and must round-trip as unsigned. 0 is the NULL sentinel here
+            # rather than -1 (which is not representable); callers unwrap it
+            # with NULLIF, and no real uri_id is 0.
+            arr = np.array([0 if v is None else int(v) for v in col],
+                           dtype=np.uint64)
         elif isinstance(first, str):
             arr = np.array(col, dtype=object)
         else:
@@ -345,7 +360,7 @@ def make_lifeline_snapshot(
     tombstoned: dict[int, datetime] = {}
     followers_of: dict[int, int] = {}
 
-    next_uri = 1
+    next_uri = URI_ID_BASE + 1
 
     for a in range(N_AUTHORS):
         actor(a)
@@ -398,7 +413,7 @@ def make_lifeline_snapshot(
         next_uri += 1
         # Fleet posts are confined to the handful of authors the fleet was
         # wired to follow, so the bought-follower graph stays coherent.
-        author = rng.randrange(4) if fleet_author else uri_id % N_AUTHORS
+        author = rng.randrange(4) if fleet_author else (uri_id - URI_ID_BASE) % N_AUTHORS
         created = lo + timedelta(seconds=rng.uniform(0, span))
         posts.append((uri_id, author, _rkey(rng), created,
                       None, None, None, "record"))
@@ -463,7 +478,7 @@ def make_lifeline_snapshot(
     # `tombstoned_at` come from the PLC directory export and are what the
     # age-clustering and tombstone-rate signals read.
     con.execute("""CREATE TABLE actors(
-        did_id BIGINT, did VARCHAR, active BOOLEAN,
+        did_id UBIGINT, did VARCHAR, active BOOLEAN,
         created_at TIMESTAMP, tombstoned_at TIMESTAMP, in_microcosm BOOLEAN)""")
     ids = list(actors.keys())
     _insert(con, "actors",
@@ -476,7 +491,7 @@ def make_lifeline_snapshot(
             ts_columns=("created_at", "tombstoned_at"))
 
     con.execute("""CREATE TABLE actor_aggs(
-        did_id BIGINT, follows BIGINT, followers BIGINT, blocks_out BIGINT,
+        did_id UBIGINT, follows BIGINT, followers BIGINT, blocks_out BIGINT,
         blocks_in BIGINT, posts BIGINT, likes_out BIGINT, likes_in BIGINT,
         reposts_out BIGINT, reposts_in BIGINT, replies_out BIGINT,
         quotes_out BIGINT, quoted_count BIGINT)""")
@@ -485,9 +500,9 @@ def make_lifeline_snapshot(
             select="did_id, 0, followers, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0")
 
     con.execute("""CREATE TABLE posts(
-        uri_id BIGINT, author_did_id BIGINT, rkey VARCHAR, created_at TIMESTAMP,
-        reply_root_uri_id BIGINT, reply_parent_uri_id BIGINT,
-        quote_uri_id BIGINT, source VARCHAR)""")
+        uri_id UBIGINT, author_did_id UBIGINT, rkey VARCHAR, created_at TIMESTAMP,
+        reply_root_uri_id UBIGINT, reply_parent_uri_id UBIGINT,
+        quote_uri_id UBIGINT, source VARCHAR)""")
     cols = list(zip(*posts))
     _insert(con, "posts",
             ["uri_id", "author_did_id", "rkey", "created_at",
@@ -498,30 +513,34 @@ def make_lifeline_snapshot(
             # avoids DuckDB's object-array inference, which fails outright on
             # a column that happens to be entirely NULL.
             select=("uri_id, author_did_id, rkey, created_at, "
-                    "NULLIF(reply_root_uri_id, -1), "
-                    "NULLIF(reply_parent_uri_id, -1), "
-                    "NULLIF(quote_uri_id, -1), source"))
+                    "NULLIF(reply_root_uri_id, 0), "
+                    "NULLIF(reply_parent_uri_id, 0), "
+                    "NULLIF(quote_uri_id, 0), source"),
+            u64_columns=("uri_id", "author_did_id", "reply_root_uri_id",
+                         "reply_parent_uri_id", "quote_uri_id"))
 
     con.execute("""CREATE TABLE post_aggs(
-        uri_id BIGINT, likes BIGINT, reposts BIGINT,
+        uri_id UBIGINT, likes BIGINT, reposts BIGINT,
         replies BIGINT, quotes BIGINT)""")
     agg_cols = list(zip(*[(u, *v) for u, v in post_aggs.items()]))
     _insert(con, "post_aggs",
-            ["uri_id", "likes", "reposts", "replies", "quotes"], agg_cols)
+            ["uri_id", "likes", "reposts", "replies", "quotes"], agg_cols,
+            u64_columns=("uri_id",))
 
     for name, rows in (("likes", likes), ("reposts", reposts)):
         con.execute(f"""CREATE TABLE {name}(
-            actor_did_id BIGINT, subject_uri_id BIGINT, created_at TIMESTAMP)""")
+            actor_did_id UBIGINT, subject_uri_id UBIGINT, created_at TIMESTAMP)""")
         _insert(con, name, ["actor_did_id", "subject_uri_id", "created_at"],
-                list(zip(*rows)))
+                list(zip(*rows)),
+                u64_columns=("actor_did_id", "subject_uri_id"))
 
     con.execute("""CREATE TABLE follows(
-        src_did_id BIGINT, dst_did_id BIGINT, created_at TIMESTAMP)""")
+        src_did_id UBIGINT, dst_did_id UBIGINT, created_at TIMESTAMP)""")
     _insert(con, "follows", ["src_did_id", "dst_did_id", "created_at"],
             list(zip(*follows)))
 
     con.execute("""CREATE TABLE blocks(
-        src_did_id BIGINT, dst_did_id BIGINT, created_at TIMESTAMP)""")
+        src_did_id UBIGINT, dst_did_id UBIGINT, created_at TIMESTAMP)""")
     con.execute("COMMIT")
     con.close()
     return path, truth, auth_truth

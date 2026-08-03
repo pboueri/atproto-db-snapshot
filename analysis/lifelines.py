@@ -711,8 +711,13 @@ def _assemble(con, n_bins: int, horizon_hours: int, thresholds, say):
     if not scalar:
         raise SystemExit("no posts survived event extraction")
 
-    uri_ids = np.array([r[0] for r in scalar], dtype=np.int64)
-    index = {int(u): i for i, u in enumerate(uri_ids)}
+    # Plain Python ints, not an int64 numpy array: `uri_id` is the
+    # xxhash3-64 of the post URI, so roughly half of all real values exceed
+    # int64's range and numpy raises OverflowError on them. Nothing here does
+    # arithmetic on these — they are only ever hashed into `index` and echoed
+    # back out — so the widest available integer type is the right one.
+    uri_ids = [int(r[0]) for r in scalar]
+    index = {u: i for i, u in enumerate(uri_ids)}
     n = len(uri_ids)
     say(f"posts with lifelines: {n:,}")
 
