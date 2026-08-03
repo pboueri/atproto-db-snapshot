@@ -1593,6 +1593,22 @@ def run(
             "sizes": {str(shape_rank[j] + 1): shape_sizes[j] for j in range(k)},
         },
         "thresholds": th,
+        # Deciles of every feature the decision list keys off. The thresholds
+        # in RULE_THRESHOLDS are only defensible against the distribution
+        # they actually face, and that distribution is not knowable from a
+        # synthetic fixture — the first real run had `pile_on` at 3 posts in
+        # 2,000 because the reply-share cut was set from invented data.
+        # Emitting the quantiles alongside the thresholds makes the next
+        # recalibration a lookup rather than another guess.
+        "feature_distributions": {
+            f: {q: float(np.quantile([ft[f] for ft in feats], v))
+                for q, v in (("p10", .10), ("p25", .25), ("p50", .50),
+                             ("p75", .75), ("p90", .90), ("p99", .99))}
+            for f in ("t50_h", "t90_h", "late24", "late72", "burst_share",
+                      "reignition", "n_waves", "like_share", "repost_share",
+                      "reply_share", "quote_share", "reply_lag_h",
+                      "reply_outperform", "oon_delta", "in_network_share")
+        },
         "archetypes": arch_stats,
         "authenticity": auth_summary,
         "examples": {
