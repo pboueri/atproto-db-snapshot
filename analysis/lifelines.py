@@ -65,6 +65,12 @@ from .common import (
 
 # Channel codes. Kept as small ints so the event table stays narrow — it is
 # the widest intermediate in the pipeline (tens of millions of rows).
+# Minimum arrivals in the early and late buckets before `oon_delta` is
+# trusted. Below this the share is dominated by sampling noise, and the
+# archetypes it feeds (pile_on, broadcast) would fire on slow posts that
+# simply had few early engagements.
+MIN_AUDIENCE_BUCKET = 20
+
 CH_LIKE, CH_REPOST, CH_REPLY, CH_QUOTE = 0, 1, 2, 3
 CH_NAMES = {CH_LIKE: "like", CH_REPOST: "repost", CH_REPLY: "reply", CH_QUOTE: "quote"}
 
@@ -109,28 +115,44 @@ ARCHETYPE_BLURB = {
 }
 
 # Thresholds for the rule decision list, gathered here so they are visible
-# and tunable in one place rather than buried in the classifier. These are
-# starting values calibrated against the shape of the distributions; expect
-# to move them after eyeballing the first run's examples.
+# and tunable in one place rather than buried in the classifier.
+#
+# Calibrated against the 2026-07-31 snapshot: 20,000 posts sampled from the
+# 467,683 with >=50 engagements. The percentile noted on each line is where
+# that value falls in the real feature distribution, which the sidecar emits
+# as `feature_distributions` on every run — so the next recalibration is a
+# lookup, not a guess.
+#
+# The first version of this table was set against a synthetic fixture and
+# two of its rules were unreachable: reply_share's p99 is 0.231, so cuts at
+# 0.32 and 0.28 could never fire, and `pile_on` and `conversation` came back
+# with 14 and 4 posts out of 20,000. Anything here that drifts above ~p95
+# should be treated as broken rather than strict.
 RULE_THRESHOLDS = {
-    "necro_late72":        0.50,   # frac of engagement arriving after 72h
-    "necro_burst_share":   0.35,   # late mass must be a *burst*, not a plateau
-    "sleeper_reignition":  0.45,   # 2nd peak height / 1st peak height
-    "sleeper_late24":      0.20,   # frac after 24h
-    "pileon_arg_share":    0.32,   # (reply + quote) share of all engagement
-    "pileon_lag_hours":    0.5,    # replies must lag likes by this much
-    "pileon_outperform":   1.0,    # likes-on-replies / likes-on-post
-    "pileon_oon_delta":    0.15,   # late minus early out-of-network share
-    "conv_reply_share":    0.28,
-    "conv_in_network":     0.55,
-    "broadcast_repost":    0.22,   # repost share of all engagement
-    "broadcast_oon_delta": 0.08,
-    "likefwd_like_share":  0.90,
-    "evergreen_t50_h":     24.0,
-    "evergreen_late24":    0.45,
-    "evergreen_burst_share": 0.35,  # mirror of necro_burst_share: flat, not peaked
-    "standard_t50_h":      8.0,
-    "standard_late24":     0.20,
+    "necro_late72":        0.35,   # p99 = 0.288 — genuinely rare by design
+    "necro_burst_share":   0.70,   # p50 = 0.750; the old 0.35 sat below p10
+                                   # and so admitted essentially everything
+    "sleeper_reignition":  0.45,   # p90 = 0.710
+    "sleeper_late24":      0.20,   # p90 = 0.214
+    "pileon_arg_share":    0.15,   # reply p90 = 0.084 + quote p90 = 0.029
+    "pileon_lag_hours":    0.5,    # p75 = 0.343, p90 = 3.851
+    "pileon_outperform":   1.0,    # p99 = 1.196 — kept at 1.0 because the
+                                   # claim is literal: the replies outscore
+                                   # the post. The OR with oon_delta is what
+                                   # keeps the rule reachable.
+    "pileon_oon_delta":    0.15,   # p75 = 0.205
+    "conv_reply_share":    0.12,   # ~p94; must sit clear of pileon_arg_share
+    "conv_in_network":     0.50,   # p75 = 0.491 — real in-network share
+                                   # medians at 0.32, so the old 0.55 was
+                                   # asking for a majority that rarely exists
+    "broadcast_repost":    0.25,   # p75 = 0.236
+    "broadcast_oon_delta": 0.08,   # p50 = 0.075
+    "likefwd_like_share":  0.90,   # p90 = 0.911
+    "evergreen_t50_h":     16.0,   # ~p95 (p90 = 8.0, p99 = 36.9)
+    "evergreen_late24":    0.30,   # ~p93
+    "evergreen_burst_share": 0.60,  # p25 = 0.586 — mirror of the necro cut
+    "standard_t50_h":      6.0,    # ~p85 (p75 = 4.1)
+    "standard_late24":     0.15,   # ~p85 (p75 = 0.098)
 }
 
 
@@ -627,6 +649,14 @@ def _build_scalar_features(con, say):
                      FILTER (WHERE e.dt <= 3600), NULL)      AS in_net_early,
           COALESCE(AVG(CASE WHEN {_IN_NET} THEN 1.0 ELSE 0.0 END)
                      FILTER (WHERE e.dt > 21600), NULL)      AS in_net_late,
+          -- Bucket sizes, so `oon_delta` can refuse to answer rather than
+          -- answer from noise. A slow-burn post spreads its arrivals over
+          -- days and may land three events in its first hour; a share
+          -- computed from three events swings tens of points on one
+          -- account, which was enough to push evergreen posts through the
+          -- pile-on rule's out-of-network branch.
+          COUNT(*) FILTER (WHERE e.dt <= 3600)               AS n_early,
+          COUNT(*) FILTER (WHERE e.dt > 21600)               AS n_late,
           COUNT(DISTINCT e.actor)                            AS n_actors
         FROM lf_ev e
         LEFT JOIN lf_follow fe
@@ -699,7 +729,7 @@ def _assemble(con, n_bins: int, horizon_hours: int, thresholds, say):
         SELECT s.uri_id, s.n_total, s.n_like, s.n_repost, s.n_reply, s.n_quote,
                s.t50_s, s.t90_s, s.t50_like_s, s.t50_arg_s,
                s.late24, s.late72, s.in_network_share,
-               s.in_net_early, s.in_net_late, s.n_actors,
+               s.in_net_early, s.in_net_late, s.n_early, s.n_late, s.n_actors,
                c.agg_likes, COALESCE(rp.reply_likes, 0) AS reply_likes,
                COALESCE(bu.burst_share, 1.0) AS burst_share
         FROM lf_scalar s
@@ -752,14 +782,18 @@ def _assemble(con, n_bins: int, horizon_hours: int, thresholds, say):
     for i, row in enumerate(scalar):
         (_uri, n_total, n_like, n_repost, n_reply, n_quote,
          t50_s, t90_s, t50_like_s, t50_arg_s, late24, late72,
-         in_net, in_early, in_late, n_actors, agg_likes, reply_likes,
-         burst_share) = row
+         in_net, in_early, in_late, n_early, n_late, n_actors,
+         agg_likes, reply_likes, burst_share) = row
         tot = float(n_total) or 1.0
         n_waves, reignition = _wave_features(counts[i])
         # Out-of-network delta: how much *more* out-of-network the late
         # audience is than the early one. Positive means strangers arrived
         # after the followers did.
-        if in_early is None or in_late is None:
+        # Both buckets must be big enough to mean something; otherwise
+        # report no turnover rather than a number drawn from a handful of
+        # events. MIN_BUCKET is the same guard the authenticity signals use.
+        if (in_early is None or in_late is None
+                or n_early < MIN_AUDIENCE_BUCKET or n_late < MIN_AUDIENCE_BUCKET):
             oon_delta = 0.0
         else:
             oon_delta = float(in_early) - float(in_late)

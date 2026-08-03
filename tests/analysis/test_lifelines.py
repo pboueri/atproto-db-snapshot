@@ -68,15 +68,23 @@ def test_audience_axis_separates_in_and_out_of_network(report):
     `oon_delta` is (in-network share of the first hour) minus (in-network
     share after six hours), so a positive value means the followers came
     first and strangers arrived later — the algorithmic-distribution
-    signature. The recipes that were built with an audience turnover are
-    exactly broadcast / pile_on / sleeper / necro.
+    signature.
+
+    `necro` is deliberately absent from both lists. It puts ~94% of its
+    engagement in a burst four days out and lands single digits in its first
+    hour, so there is no early bucket to compare a late one against, and
+    `MIN_AUDIENCE_BUCKET` makes it report no turnover rather than a figure
+    derived from a handful of events. That is the correct answer for a post
+    shaped like this, and asserting a turnover for it would be asserting
+    that noise gets through.
     """
     _html, sc, _truth = report
     a = sc["archetypes"]
-    for arch in ("broadcast", "pile_on", "sleeper", "necro"):
+    for arch in ("broadcast", "pile_on", "sleeper"):
         assert a[arch]["mean_oon_delta"] > 0.25, (arch, a[arch])
     for arch in ("standard", "conversation", "evergreen", "like_forward"):
         assert abs(a[arch]["mean_oon_delta"]) < 0.15, (arch, a[arch])
+    assert a["necro"]["mean_oon_delta"] == 0.0
     # Conversation was built in-network; pile-on was built from strangers.
     assert a["conversation"]["mean_in_network"] > a["pile_on"]["mean_in_network"]
 

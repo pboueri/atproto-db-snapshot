@@ -221,7 +221,12 @@ def _events_necro(rng, n, horizon_s):
 
 def _events_evergreen(rng, n, horizon_s):
     """Uniform accumulation over four days — late mass, but never bursty."""
-    mix = [(0, 0.75), (1, 0.12), (2, 0.10), (3, 0.03)]
+    # Reply weight sits near the real p85 rather than on the conversation
+    # rule's cut. Evergreen is defined by *timing*, not by being reply-heavy,
+    # so a recipe that brushes another archetype's mix threshold is testing
+    # the wrong thing — at 0.10 it was one sampling standard deviation from
+    # `conv_reply_share` and leaked posts into conversation.
+    mix = [(0, 0.79), (1, 0.12), (2, 0.06), (3, 0.03)]
     out = []
     span = min(96 * 3600, horizon_s - 60)
     for ch in _draw_channels(rng, n, mix):
