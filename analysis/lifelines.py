@@ -1201,11 +1201,13 @@ is genuinely hard to fake is <em>who</em> shows up — a fleet works a list,
 so its accounts keep appearing together.</p>
 
 <h3 style="margin:28px 0 6px">Highest-scoring posts</h3>
-<p class="muted" style="margin:0 0 10px">Redacted deliberately. Every other
-archetype in this report links to real posts; this one does not, because
-"bought engagement" is an accusation about a named account and the
-inference here is probabilistic at best. Rates and shapes are publishable;
-names are not.</p>
+<p class="muted" style="margin:0 0 10px">These are the ten posts this
+composite ranks highest, linked like every other example in the report.
+Read them as <em>ranked candidates for inspection, not findings</em>: the
+score is a percentile within this cohort built from correlational proxies,
+and none of its inputs observes a purchase. A high rank says the engagement
+pattern is unusual next to the rest of the cohort — an author with a tight
+regular community can land here without having bought anything.</p>
 <table><thead><tr><th>post</th><th class="num">score</th>
 <th class="num">engagements</th><th>archetype</th>
 <th class="num">in-network</th></tr></thead>
@@ -1216,7 +1218,7 @@ names are not.</p>
 
 
 def _render_html(*, snapshot_date, sidecar, figs, examples, present,
-                 flagged=(), link_flagged=False) -> bytes:
+                 flagged=(), link_flagged=True) -> bytes:
     pop = sidecar["archetypes"]
     total = sidecar["cohort"]["posts_analyzed"]
     unclassified_pct = 100.0 * pop.get("unclassified", {}).get("n", 0) / max(total, 1)
@@ -1399,7 +1401,7 @@ def run(
     authenticity: bool = True,
     authenticity_signals: list | None = None,
     authenticity_weights: dict | None = None,
-    link_flagged_examples: bool = False,
+    link_flagged_examples: bool = True,
     log: bool = True,
 ) -> tuple[bytes, dict]:
     """Build the engagement-archetype report.
@@ -1421,10 +1423,11 @@ def run(
         signal marked default-enabled in `authenticity.SIGNALS`.
       authenticity_weights: per-signal weight overrides, renormalized.
       link_flagged_examples: link out to the posts scoring highest on the
-        authenticity axis. Off by default and deliberately so — "bought
-        engagement" is an accusation about a named account and the
-        inference is probabilistic even at its best, so the report ships
-        aggregate rates and redacted rows unless this is explicitly set.
+        authenticity axis, as every other example table does. On by
+        default. The score is a within-cohort percentile over correlational
+        proxies and observes no purchase, so the section labels these as
+        ranked candidates for inspection rather than findings; set False to
+        publish the rates and shapes without the links.
     """
     import numpy as np
 
@@ -1535,8 +1538,10 @@ def run(
                 for a in present
             },
         }
-        # Redacted by default: rank, score and shape are publishable; the
-        # identity of an account we are implicitly accusing is not.
+        # The ten highest-ranked posts, linked like every other example
+        # table unless the caller turns links off. These are candidates for
+        # inspection: the score is a within-cohort percentile over
+        # correlational proxies and none of its inputs observes a purchase.
         for rank, (i, sc_val) in enumerate(scored[:10], start=1):
             row = {
                 "rank": rank,
@@ -1545,10 +1550,15 @@ def run(
                 "n_total": feats[i]["n_total"],
                 "archetype": labels[i],
                 "in_network_share": feats[i]["in_network_share"],
+                **{k: v for k, v in (auth_scores.get(feats[i]["uri_id"]) or {}).items()
+                   if k != "score"},
             }
             flagged.append(row)
         if link_flagged_examples and hydrate_urls:
             _hydrate_urls(con, flagged, say)
+        # Carried in the sidecar too, so the ranking is reviewable without
+        # re-running: per-signal percentiles show *why* each post ranked.
+        auth_summary["flagged"] = flagged
 
     sidecar = {
         "snapshot_date": snapshot_date,

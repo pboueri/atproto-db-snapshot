@@ -352,7 +352,7 @@ def analyze_lifelines(
     max_posts: int = 150_000,
     n_shapes: int = 6,
     authenticity: bool = True,
-    link_flagged_examples: bool = False,
+    link_flagged_examples: bool = True,
 ) -> bytes:
     # The heaviest step is resolving the in-network flag: the distinct
     # (engager, author) pairs from the event table are joined against all
@@ -507,7 +507,7 @@ def main(
     max_posts: int = 150_000,
     n_shapes: int = 6,
     authenticity: bool = True,
-    link_flagged_examples: bool = False,
+    link_flagged_examples: bool = True,
     background: bool = False,
 ) -> None:
     """Dispatch to one of the snapshot analyses.
@@ -527,9 +527,9 @@ def main(
       authenticity: lifelines only — compute the inauthentic-amplification
         axis (a second pass over the extraction's temp tables).
       link_flagged_examples: lifelines only — link out to the posts scoring
-        highest on that axis. Off by default: the report ships aggregate
-        rates and redacted rows because the inference is probabilistic and
-        the subject is a named account.
+        highest on that axis, as every other example table does. On by
+        default; the section labels them ranked candidates for inspection
+        rather than findings, since the score observes no purchase.
       emit_state_log: growth only — 1 writes the per-user state-interval
         parquet to /vol-out/var/analysis/<date>/growth_state_log.parquet.
       background: spawn the remote call instead of waiting on it.

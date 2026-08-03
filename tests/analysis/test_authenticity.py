@@ -171,21 +171,44 @@ def test_weights_can_be_overridden_and_are_renormalized(tmp_path_factory):
         {"co_engagement": 0.75, "tombstone_rate": 0.25}, abs=1e-3)
 
 
-def test_flagged_examples_are_linked_only_on_explicit_opt_in(tmp_path_factory):
-    """Naming accounts we are implicitly accusing takes an explicit flag.
+def test_flagged_posts_are_linked_by_default_and_suppressible(tmp_path_factory):
+    """Flagged posts link out like every other example table.
 
-    Every other archetype in the report links to real posts. This one links
-    only when the caller sets `link_flagged_examples`, because "bought
-    engagement" is an accusation and the inference is probabilistic.
+    They can still be suppressed for a publication that wants the rates and
+    shapes without the links, so both directions of the flag are pinned.
     """
     path, _truth, _auth = make_lifeline_snapshot(
         tmp_path_factory.mktemp("link") / "snapshot.duckdb",
         include_auth_posts=True)
     con = duckdb.connect(path, read_only=True)
-    html, _sc = run(con, SNAPSHOT_DATE, max_posts=100_000,
-                    link_flagged_examples=True, log=False)
-    section = html.split(b"Highest-scoring posts")[1]
-    assert b"open post" in section
+
+    html, sc = run(con, SNAPSHOT_DATE, max_posts=100_000, log=False)
+    assert b"open post" in html.split(b"Highest-scoring posts")[1]
+    flagged = sc["authenticity"]["flagged"]
+    assert len(flagged) == 10
+    for row in flagged:
+        assert row["url"].startswith("https://bsky.app/profile/did:plc:")
+
+    html_off, _sc = run(con, SNAPSHOT_DATE, max_posts=100_000,
+                        link_flagged_examples=False, log=False)
+    assert b"open post" not in html_off.split(b"Highest-scoring posts")[1]
+
+
+def test_flagged_rows_carry_per_signal_percentiles(tmp_path_factory):
+    """A ranking that names posts has to show its work.
+
+    Publishing a rank without the components behind it is unreviewable —
+    anyone looking at a named post needs to see which signals put it there
+    and whether one of them is doing all the lifting.
+    """
+    path, _truth, _auth = make_lifeline_snapshot(
+        tmp_path_factory.mktemp("why") / "snapshot.duckdb",
+        include_auth_posts=True)
+    con = duckdb.connect(path, read_only=True)
+    _html, sc = run(con, SNAPSHOT_DATE, max_posts=100_000, log=False)
+    ran = {s["name"] for s in sc["authenticity"]["signals_run"]}
+    for row in sc["authenticity"]["flagged"]:
+        assert ran <= set(row), (ran - set(row))
 
 
 def test_report_renders_the_authenticity_section(tmp_path_factory):
@@ -196,9 +219,9 @@ def test_report_renders_the_authenticity_section(tmp_path_factory):
     html, _sc = run(con, SNAPSHOT_DATE, max_posts=100_000, log=False)
     assert b"Engagement that does not look like it was earned" in html
     assert b"co engagement" in html
-    # The relativity caveat and the redaction notice are both load-bearing.
+    # Naming posts raises the stakes on the framing, so both the relativity
+    # caveat and the candidates-not-findings label are asserted rather than
+    # left to survive on good intentions through future edits.
     assert b"relative, not absolute" in html
-    assert b"Redacted deliberately" in html
-    # Redacted by default: no post links inside the authenticity table.
-    auth_section = html.split(b"Highest-scoring posts")[1]
-    assert b"open post" not in auth_section
+    assert b"ranked candidates for inspection, not findings" in html
+    assert b"none of its inputs observes a purchase" in html
