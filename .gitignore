@@ -17,3 +17,11 @@ __pycache__/
 /blocks_cleavage_*.html
 /followers_distribution_*.html
 /following_distribution_*.html
+/organic_*.html
+/organic_*.json
+/organic_*_posts.parquet
+/organic_*_posts.csv
+
+# Locally downloaded snapshots. `modal volume get` puts a ~56 GiB
+# snapshot.duckdb here; it must never reach a commit.
+analysis/snapshot/
