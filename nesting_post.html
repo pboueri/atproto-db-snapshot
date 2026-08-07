@@ -1,0 +1,489 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>The Russian Nesting Post — at-proto snapshot</title>
+<style>
+:root{color-scheme:light dark}
+*{box-sizing:border-box}
+html,body{margin:0;padding:0}
+body{
+  background:var(--plane);color:var(--ink);
+  font-family:system-ui,-apple-system,"Segoe UI",sans-serif;
+  line-height:1.55;font-size:16px;
+  --plane:#f9f9f7; --surface:#fcfcfb; --ink:#0b0b0b; --ink2:#52514e;
+  --mut:#898781; --rule:#e1e0d9; --ring:rgba(11,11,11,.10); --accent:#2a78d6;
+}
+@media (prefers-color-scheme:dark){:root:where(:not([data-theme="light"])) body{
+  --plane:#0d0d0d; --surface:#1a1a19; --ink:#fff; --ink2:#c3c2b7;
+  --mut:#898781; --rule:#2c2c2a; --ring:rgba(255,255,255,.10); --accent:#3987e5;}}
+:root[data-theme="dark"] body{
+  --plane:#0d0d0d; --surface:#1a1a19; --ink:#fff; --ink2:#c3c2b7;
+  --mut:#898781; --rule:#2c2c2a; --ring:rgba(255,255,255,.10); --accent:#3987e5;}
+
+.wrap{max-width:1000px;margin:0 auto;padding:56px 24px 96px}
+.eyebrow{font-size:12px;letter-spacing:.12em;text-transform:uppercase;
+  color:var(--mut);margin-bottom:14px}
+h1{font-size:46px;line-height:1.06;letter-spacing:-.025em;margin:0 0 18px;font-weight:700}
+h1 em{font-style:normal;color:var(--accent)}
+.lede{font-size:19px;color:var(--ink2);margin:0 0 8px;max-width:760px}
+.lede strong{color:var(--ink)}
+.tower-sec{margin:76px 0 0;padding-top:44px;border-top:1px solid var(--rule)}
+.kicker{font-size:12.5px;font-weight:650;color:var(--accent);
+  text-transform:uppercase;letter-spacing:.09em;margin-bottom:8px}
+h2{font-size:29px;letter-spacing:-.015em;margin:0 0 10px;font-weight:700}
+.lede2{color:var(--ink2);margin:0 0 26px;max-width:760px}
+.lede2 strong{color:var(--ink)}
+p.note{color:var(--ink2);max-width:760px}
+p.note strong{color:var(--ink)}
+a{color:var(--accent)}
+code{font-size:13px;background:var(--surface);border:1px solid var(--ring);
+  border-radius:4px;padding:1px 5px}
+
+.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:0 0 30px}
+.stat{background:var(--surface);border:1px solid var(--ring);border-radius:10px;
+  padding:15px 16px}
+.stat .v{font-size:29px;font-weight:700;letter-spacing:-.02em}
+.stat .l{font-size:12.5px;color:var(--ink2);margin-top:2px}
+
+.tower{display:grid;grid-template-columns:300px 1fr;gap:0 22px;margin:0;
+  align-items:start}
+.stackfig{grid-template-columns:1fr;max-width:720px}
+.funnel{display:block;overflow:visible}
+.band{stroke:var(--surface);stroke-width:2;transition:filter .12s;cursor:default}
+.band:hover,.band:focus,.band.on{filter:brightness(1.12);outline:none}
+.blabel{font-size:15px;font-weight:650;fill:var(--ink);
+  font-variant-numeric:tabular-nums}
+
+.cards{list-style:none;margin:0;padding:0}
+.card{height:var(--card-h);padding:11px 16px;background:var(--surface);
+  border:1px solid var(--ring);border-radius:10px;margin-bottom:var(--row-gap);
+  display:flex;flex-direction:column;gap:4px;overflow:hidden;
+  transition:border-color .12s}
+.card:last-child{margin-bottom:0}
+.cards.loose .card{height:auto;min-height:0;margin-bottom:6px;padding:12px 16px}
+.cards.loose .minibar{display:block}
+.card.on{border-color:var(--accent)}
+.card.missing{border-style:dashed;color:var(--mut)}
+.card.gapmark{height:auto;background:none;border:1px dashed var(--rule);
+  align-items:center;justify-content:center;gap:2px;padding:14px;
+  color:var(--mut);font-size:13px;text-align:center}
+.card.gapmark span:first-child,.card.gapmark span:last-child{
+  font-size:17px;line-height:.8;letter-spacing:.2em}
+p.who{font-size:14px;color:var(--mut);margin:-14px 0 22px;
+  font-variant-numeric:tabular-nums}
+.chead{display:flex;align-items:baseline;gap:9px;flex-wrap:wrap;font-size:13px}
+.rank{font-weight:700;color:var(--mut);font-variant-numeric:tabular-nums}
+.who{font-weight:650;text-decoration:none}
+.who:hover{text-decoration:underline}
+.badge{font-size:11px;letter-spacing:.04em;text-transform:uppercase;
+  color:var(--ink2);border:1px solid var(--rule);border-radius:999px;padding:1px 8px}
+.badge.origin{border-color:var(--accent);color:var(--accent)}
+.gap{font-size:12px;color:var(--mut)}
+.ctext{margin:0;font-size:14.5px;color:var(--ink);overflow:hidden;
+  display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;flex:1 1 auto}
+.card.missing .ctext{color:var(--mut);font-style:italic}
+.cfoot{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;margin-top:auto}
+.likes{font-weight:700;font-variant-numeric:tabular-nums}
+.sub{font-size:12px;color:var(--mut)}
+.minibar{display:none;height:4px;background:var(--rule);border-radius:2px;
+  margin-top:6px}
+.minibar i{display:block;height:100%;background:var(--accent);border-radius:0 2px 2px 0}
+.cap{font-size:13px;color:var(--mut);margin:14px 0 0;max-width:820px}
+
+.tableview{margin:22px 0 0}
+.tableview summary{cursor:pointer;color:var(--ink2);font-size:13px}
+table{border-collapse:collapse;width:100%;margin-top:12px;font-size:13.5px}
+th,td{text-align:left;padding:7px 10px;border-bottom:1px solid var(--rule);
+  vertical-align:middle}
+th{font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--mut);
+  font-weight:650}
+td.num,th.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+td.strong{font-weight:700}
+.mut{color:var(--mut);text-transform:none;letter-spacing:0;font-weight:400}
+.ladder .barcell{width:26%;min-width:120px;padding-right:0}
+.ladder td a{white-space:nowrap}
+.ladder .barcell i{display:block;height:11px;background:var(--accent);
+  border-radius:0 4px 4px 0;opacity:.85}
+.ladder .chain{font-variant-numeric:tabular-nums;color:var(--ink2);font-size:12.5px}
+.scroll{overflow-x:auto}
+
+.foot{margin-top:72px;padding-top:22px;border-top:1px solid var(--rule);
+  font-size:13px;color:var(--mut)}
+
+@media (max-width:820px){
+  .tower{grid-template-columns:1fr}
+  .funnel{display:none}
+  .card{height:auto;min-height:0}
+  .minibar{display:block}
+  .stats{grid-template-columns:repeat(2,1fr)}
+  h1{font-size:34px}
+}
+</style></head><body>
+<div class="wrap">
+<div class="eyebrow">at-proto snapshot · 2026-07-31</div>
+<h1>The <em>Russian Nesting Post</em></h1>
+<p class="lede">A quote post sits inside the post it quotes. Chain those together
+and you get a tower — and the interesting towers are the ones where
+<strong>every quote out-likes the thing it quotes</strong>, so the doll gets
+bigger with every layer. The bottom has to be a real original post, not another
+quote. Across 17,511,260 quote links in this snapshot,
+1,969,103 of them increasing, here are the extremes: the tower
+that goes <strong>deepest</strong>, the one carrying the <strong>most
+likes</strong>, and — dropping the like rule entirely — the deepest quote stack
+on the site.</p>
+
+
+<style>#tallest{--step-0:#86b6ef;--step-1:#256abf;--step-2:#0d366b}@media (prefers-color-scheme:dark){:root:where(:not([data-theme="light"])) #tallest{--step-0:#184f95;--step-1:#5598e7;--step-2:#cde2fb}}:root[data-theme="dark"] #tallest{--step-0:#184f95;--step-1:#5598e7;--step-2:#cde2fb}</style>
+<section class="tower-sec" id="tallest">
+  <div class="kicker">the tallest tower</div>
+  <h2>5 deep, and it never once goes down</h2>
+  <p class="lede2">5 posts, and the like count goes up at every single step — 100 likes at the original, 1,963 at the outermost quote. 4 of the 5 are one account continuing its own thread, and the rest are other people picking it up. This is the deepest strictly-increasing quote chain in the snapshot that bottoms out on a genuine original post rather than on somebody else's quote — no chain of 6 exists.</p>
+  <div class="stats"><div class="stat"><div class="v">5</div><div class="l">posts deep</div></div><div class="stat"><div class="v">4,393</div><div class="l">likes across the tower</div></div><div class="stat"><div class="v">2</div><div class="l">distinct authors</div></div><div class="stat"><div class="v">3h 26m</div><div class="l">original to outermost</div></div></div>
+  <figure class="tower">
+    <svg class="funnel" width="300" height="658" viewBox="0 0 300 658" role="img" aria-label="Funnel of like counts, 5 posts, 1,963 likes at the outermost quote down to 100 at the original post."><polygon class="band" points="74.0,0.0 300.0,0.0 278.6,130.0 95.4,130.0" fill="var(--step-2)" data-tower="tallest" data-i="5" tabindex="0"><title>#5 (the peak) — 1,963 likes</title></polygon><text class="blabel" x="62" y="65.0" text-anchor="end" dominant-baseline="central">1,963</text><polygon class="band" points="95.4,132.0 278.6,132.0 217.3,262.0 156.7,262.0" fill="var(--step-1)" data-tower="tallest" data-i="4" tabindex="0"><title>#4 (relayed) — 1,592 likes</title></polygon><text class="blabel" x="62" y="197.0" text-anchor="end" dominant-baseline="central">1,592</text><polygon class="band" points="156.7,264.0 217.3,264.0 199.1,394.0 174.9,394.0" fill="var(--step-1)" data-tower="tallest" data-i="3" tabindex="0"><title>#3 (relayed) — 527 likes</title></polygon><text class="blabel" x="62" y="329.0" text-anchor="end" dominant-baseline="central">527</text><polygon class="band" points="174.9,396.0 199.1,396.0 192.8,526.0 181.2,526.0" fill="var(--step-1)" data-tower="tallest" data-i="2" tabindex="0"><title>#2 (relayed) — 211 likes</title></polygon><text class="blabel" x="62" y="461.0" text-anchor="end" dominant-baseline="central">211</text><polygon class="band" points="181.2,528.0 192.8,528.0 192.8,658.0 181.2,658.0" fill="var(--step-0)" data-tower="tallest" data-i="1" tabindex="0"><title>#1 (the original) — 100 likes</title></polygon><text class="blabel" x="62" y="593.0" text-anchor="end" dominant-baseline="central">100</text></svg>
+    <ol class="cards" style="--card-h:130px;--row-gap:2px">
+<li class="card" data-tower="tallest" data-i="5">
+  <div class="chead">
+    <span class="rank">#5</span>
+    <a class="who" href="https://bsky.app/profile/danteatkins.bsky.social/post/3mled2gi3hc2r" target="_blank" rel="noopener">@danteatkins.bsky.social</a>
+    <span class='badge'>quotes #4</span><span class='gap'>+2h 29m later</span>
+  </div>
+  <p class="ctext">One must fully understand that the Virginia Supreme Court ruling is not simply overruling the voters based on a technicality--it is overruling the voters on a technicality THAT THEY LITERALLY JUST INVENTED FOR THIS PURPOSE AND EXISTS NOWHERE ELSE IN VIRGINIA OR FEDERAL LAW</p>
+  <div class="cfoot">
+    <span class="likes">1,963 likes</span>
+    <span class="sub">649 reposts · 23 replies
+      · 11 quotes</span>
+  </div>
+  <div class="minibar" aria-hidden="true"><i style="width:100.0%"></i></div>
+</li>
+<li class="card" data-tower="tallest" data-i="4">
+  <div class="chead">
+    <span class="rank">#4</span>
+    <a class="who" href="https://bsky.app/profile/cfidd.bsky.social/post/3mle2p6fr6s23" target="_blank" rel="noopener">@cfidd.bsky.social</a>
+    <span class='badge'>quotes #3</span><span class='gap'>+25m later</span>
+  </div>
+  <p class="ctext">The three dissenting justices have the goods:
+&quot;...today the majority has broadened the meaning of the word &#x27;election,&#x27; as used in the Virginia Constitution, to include the early voting period.  This is in direct conflict with how both Virginia and federal law define an election.&quot;</p>
+  <div class="cfoot">
+    <span class="likes">1,592 likes</span>
+    <span class="sub">403 reposts · 19 replies
+      · 24 quotes</span>
+  </div>
+  <div class="minibar" aria-hidden="true"><i style="width:81.1%"></i></div>
+</li>
+<li class="card" data-tower="tallest" data-i="3">
+  <div class="chead">
+    <span class="rank">#3</span>
+    <a class="who" href="https://bsky.app/profile/cfidd.bsky.social/post/3mldzckktss2y" target="_blank" rel="noopener">@cfidd.bsky.social</a>
+    <span class='badge'>quotes #2</span><span class='gap'>+4m later</span>
+  </div>
+  <p class="ctext">State statutes permitting early voting are dependent on the specific definition of &quot;election.&quot; Four Virginia Supreme Court justices absolutely decided to engage in partisan hackery in a way I&#x27;ve never seen before in the Commonwealth.</p>
+  <div class="cfoot">
+    <span class="likes">527 likes</span>
+    <span class="sub">118 reposts · 8 replies
+      · 9 quotes</span>
+  </div>
+  <div class="minibar" aria-hidden="true"><i style="width:26.8%"></i></div>
+</li>
+<li class="card" data-tower="tallest" data-i="2">
+  <div class="chead">
+    <span class="rank">#2</span>
+    <a class="who" href="https://bsky.app/profile/cfidd.bsky.social/post/3mldz45bxpk23" target="_blank" rel="noopener">@cfidd.bsky.social</a>
+    <span class='badge'>quotes #1</span><span class='gap'>+28m later</span>
+  </div>
+  <p class="ctext">Four VA Supreme Court justices decided to ignore the definition of election in constitution &amp; code.
+Article IV, Sec. 3: “the Tuesday succeeding the first Monday in November.”
+§ 24.2-101: &quot;&#x27;General election&#x27; means an election held in the Commonwealth on the Tuesday after the first Monday in November&quot;</p>
+  <div class="cfoot">
+    <span class="likes">211 likes</span>
+    <span class="sub">63 reposts · 3 replies
+      · 9 quotes</span>
+  </div>
+  <div class="minibar" aria-hidden="true"><i style="width:10.7%"></i></div>
+</li>
+<li class="card" data-tower="tallest" data-i="1">
+  <div class="chead">
+    <span class="rank">#1</span>
+    <a class="who" href="https://bsky.app/profile/cfidd.bsky.social/post/3mldxjf4bj223" target="_blank" rel="noopener">@cfidd.bsky.social</a>
+    <span class='badge origin'>the original</span>
+  </div>
+  <p class="ctext">THIS VIRGINIA RULING IS BULLSHIT
+....and I explain exactly why here 
+statehouseaction.substack.com/p/may-dazed</p>
+  <div class="cfoot">
+    <span class="likes">100 likes</span>
+    <span class="sub">28 reposts · 2 replies
+      · 5 quotes</span>
+  </div>
+  <div class="minibar" aria-hidden="true"><i style="width:5.1%"></i></div>
+</li></ol>
+  </figure>
+  <figcaption class="cap">Band width is linear in like count; the widest band is
+    the outermost quote. Reading down the funnel is reading <em>inward</em> —
+    each post is nested inside the one above it, and the bottom band is a real
+    original post, not another quote.</figcaption>
+  <details class="tableview"><summary>Table view</summary>
+<div class="scroll"><table><thead><tr><th class="num">#</th><th>author</th>
+<th class="num">likes</th><th class="num">reposts</th><th class="num">replies</th>
+<th class="num">quotes</th><th>posted (UTC)</th><th></th></tr></thead>
+<tbody><tr><td class='num'>1</td><td>@cfidd.bsky.social</td><td class='num'>100</td><td class='num'>28</td><td class='num'>2</td><td class='num'>5</td><td>2026-05-08 14:39</td><td><a href="https://bsky.app/profile/cfidd.bsky.social/post/3mldxjf4bj223" target="_blank" rel="noopener">open</a></td></tr><tr><td class='num'>2</td><td>@cfidd.bsky.social</td><td class='num'>211</td><td class='num'>63</td><td class='num'>3</td><td class='num'>9</td><td>2026-05-08 15:08</td><td><a href="https://bsky.app/profile/cfidd.bsky.social/post/3mldz45bxpk23" target="_blank" rel="noopener">open</a></td></tr><tr><td class='num'>3</td><td>@cfidd.bsky.social</td><td class='num'>527</td><td class='num'>118</td><td class='num'>8</td><td class='num'>9</td><td>2026-05-08 15:11</td><td><a href="https://bsky.app/profile/cfidd.bsky.social/post/3mldzckktss2y" target="_blank" rel="noopener">open</a></td></tr><tr><td class='num'>4</td><td>@cfidd.bsky.social</td><td class='num'>1,592</td><td class='num'>403</td><td class='num'>19</td><td class='num'>24</td><td>2026-05-08 15:36</td><td><a href="https://bsky.app/profile/cfidd.bsky.social/post/3mle2p6fr6s23" target="_blank" rel="noopener">open</a></td></tr><tr><td class='num'>5</td><td>@danteatkins.bsky.social</td><td class='num'>1,963</td><td class='num'>649</td><td class='num'>23</td><td class='num'>11</td><td>2026-05-08 18:06</td><td><a href="https://bsky.app/profile/danteatkins.bsky.social/post/3mled2gi3hc2r" target="_blank" rel="noopener">open</a></td></tr></tbody></table></div></details>
+</section>
+
+
+<style>#heaviest{--step-0:#86b6ef;--step-1:#256abf;--step-2:#0d366b}@media (prefers-color-scheme:dark){:root:where(:not([data-theme="light"])) #heaviest{--step-0:#184f95;--step-1:#5598e7;--step-2:#cde2fb}}:root[data-theme="dark"] #heaviest{--step-0:#184f95;--step-1:#5598e7;--step-2:#cde2fb}</style>
+<section class="tower-sec" id="heaviest">
+  <div class="kicker">the heaviest tower</div>
+  <h2>29,369 likes, and only 2 layers</h2>
+  <p class="lede2">Depth and reach pull against each other. The tower carrying the most likes is only 2 posts tall — 29,369 likes between them — because at this altitude the post you would have to beat is already enormous. Every extra layer has to clear a bar the previous layer just raised.</p>
+  <div class="stats"><div class="stat"><div class="v">2</div><div class="l">posts deep</div></div><div class="stat"><div class="v">29,369</div><div class="l">likes across the tower</div></div><div class="stat"><div class="v">2</div><div class="l">distinct authors</div></div><div class="stat"><div class="v">3m</div><div class="l">original to outermost</div></div></div>
+  <figure class="tower">
+    <svg class="funnel" width="300" height="262" viewBox="0 0 300 262" role="img" aria-label="Funnel of like counts, 2 posts, 21,330 likes at the outermost quote down to 8,039 at the original post."><polygon class="band" points="74.0,0.0 300.0,0.0 229.6,130.0 144.4,130.0" fill="var(--step-2)" data-tower="heaviest" data-i="2" tabindex="0"><title>#2 (the peak) — 21,330 likes</title></polygon><text class="blabel" x="62" y="65.0" text-anchor="end" dominant-baseline="central">21,330</text><polygon class="band" points="144.4,132.0 229.6,132.0 229.6,262.0 144.4,262.0" fill="var(--step-0)" data-tower="heaviest" data-i="1" tabindex="0"><title>#1 (the original) — 8,039 likes</title></polygon><text class="blabel" x="62" y="197.0" text-anchor="end" dominant-baseline="central">8,039</text></svg>
+    <ol class="cards" style="--card-h:130px;--row-gap:2px">
+<li class="card" data-tower="heaviest" data-i="2">
+  <div class="chead">
+    <span class="rank">#2</span>
+    <a class="who" href="https://bsky.app/profile/sean-hecker.bsky.social/post/3mmhmmtxznk2l" target="_blank" rel="noopener">@sean-hecker.bsky.social</a>
+    <span class='badge'>quotes #1</span><span class='gap'>+3m later</span>
+  </div>
+  <p class="ctext">We are going to savor this one. Our client, Kilmar Abrego Garcia, is freed of these outrageous, vindictive charges.  It’s a good day.</p>
+  <div class="cfoot">
+    <span class="likes">21,330 likes</span>
+    <span class="sub">3,886 reposts · 578 replies
+      · 181 quotes</span>
+  </div>
+  <div class="minibar" aria-hidden="true"><i style="width:100.0%"></i></div>
+</li>
+<li class="card" data-tower="heaviest" data-i="1">
+  <div class="chead">
+    <span class="rank">#1</span>
+    <a class="who" href="https://bsky.app/profile/lizdye.bsky.social/post/3mmhmgvs3nk2z" target="_blank" rel="noopener">@lizdye.bsky.social</a>
+    <span class='badge origin'>the original</span>
+  </div>
+  <p class="ctext">BREAKING: Judge Waverly Crenshaw dismisses indictment of Kilmar Abrego Garcia based on selective and vindictive prosecution.
+
+storage.courtlistener.com/recap/gov.us...</p>
+  <div class="cfoot">
+    <span class="likes">8,039 likes</span>
+    <span class="sub">1,650 reposts · 142 replies
+      · 276 quotes</span>
+  </div>
+  <div class="minibar" aria-hidden="true"><i style="width:37.7%"></i></div>
+</li></ol>
+  </figure>
+  <figcaption class="cap">Band width is linear in like count; the widest band is
+    the outermost quote. Reading down the funnel is reading <em>inward</em> —
+    each post is nested inside the one above it, and the bottom band is a real
+    original post, not another quote.</figcaption>
+  <details class="tableview"><summary>Table view</summary>
+<div class="scroll"><table><thead><tr><th class="num">#</th><th>author</th>
+<th class="num">likes</th><th class="num">reposts</th><th class="num">replies</th>
+<th class="num">quotes</th><th>posted (UTC)</th><th></th></tr></thead>
+<tbody><tr><td class='num'>1</td><td>@lizdye.bsky.social</td><td class='num'>8,039</td><td class='num'>1,650</td><td class='num'>142</td><td class='num'>276</td><td>2026-05-22 18:57</td><td><a href="https://bsky.app/profile/lizdye.bsky.social/post/3mmhmgvs3nk2z" target="_blank" rel="noopener">open</a></td></tr><tr><td class='num'>2</td><td>@sean-hecker.bsky.social</td><td class='num'>21,330</td><td class='num'>3,886</td><td class='num'>578</td><td class='num'>181</td><td>2026-05-22 19:00</td><td><a href="https://bsky.app/profile/sean-hecker.bsky.social/post/3mmhmmtxznk2l" target="_blank" rel="noopener">open</a></td></tr></tbody></table></div></details>
+</section>
+
+
+<section class="tower-sec" id="deepest">
+  <div class="kicker">ignoring likes entirely</div>
+  <h2>The deepest quote stack on the site is 2,411 posts</h2>
+  <p class="lede2">Drop the like rule and just ask how deep quote-of-a-quote
+    goes. The answer is not a viral cascade at all — it is
+    <strong>two people writing a story to each other</strong>. Every post quotes
+    the one before it, strictly alternating between the two accounts on all 2,410 handoffs, for
+    52d 17h straight. Engagement is beside the point: the most
+    liked post in the entire chain got <strong>8 likes</strong>, and
+    1,202 of the 2,411 got none at all.
+    They are using quote posts as a threading mechanism, and it builds by far
+    the deepest structure in the snapshot.</p>
+  <div class="stats"><div class="stat"><div class="v">2,411</div><div class="l">posts deep</div></div><div class="stat"><div class="v">2</div><div class="l">authors, taking turns</div></div><div class="stat"><div class="v">1,228</div><div class="l">likes in the whole chain</div></div><div class="stat"><div class="v">52d 17h</div><div class="l">first to last</div></div></div>
+  <p class="lede2 who">@ostrumnihilism.bsky.social (1,206), @dateg0newrong.bsky.social (1,205)</p>
+  <figure class="tower stackfig"><ol class="cards loose" style="--card-h:130px;--row-gap:2px">
+<li class="card" data-tower="deepest" data-i="2411">
+  <div class="chead">
+    <span class="rank">#2411</span>
+    <a class="who" href="https://bsky.app/profile/ostrumnihilism.bsky.social/post/3mrvbvhfvms2v" target="_blank" rel="noopener">@ostrumnihilism.bsky.social</a>
+    <span class='badge'>quotes #2410</span><span class='gap'>+2d 1h later</span>
+  </div>
+  <p class="ctext">My notifs are wack.
+
+&quot; Yes. My kid. &quot;
+
+MARK &quot;CHERRY&quot; PLIER.</p>
+  <div class="cfoot">
+    <span class="likes">0 likes</span>
+    <span class="sub">0 reposts · 0 replies
+      · 0 quotes</span>
+  </div>
+  <div class="minibar" aria-hidden="true"><i style="width:0.0%"></i></div>
+</li>
+<li class="card" data-tower="deepest" data-i="2410">
+  <div class="chead">
+    <span class="rank">#2410</span>
+    <a class="who" href="https://bsky.app/profile/dateg0newrong.bsky.social/post/3mrq4zjnzhs2z" target="_blank" rel="noopener">@dateg0newrong.bsky.social</a>
+    <span class='badge'>quotes #2409</span><span class='gap'>+15m later</span>
+  </div>
+  <p class="ctext">Aw man . . .
+
+         ❝Ah-- right! Your kid !❞
+
+Mark, don&#x27;t say that out loud ??</p>
+  <div class="cfoot">
+    <span class="likes">0 likes</span>
+    <span class="sub">0 reposts · 0 replies
+      · 1 quotes</span>
+  </div>
+  <div class="minibar" aria-hidden="true"><i style="width:0.0%"></i></div>
+</li>
+<li class="card" data-tower="deepest" data-i="2409">
+  <div class="chead">
+    <span class="rank">#2409</span>
+    <a class="who" href="https://bsky.app/profile/ostrumnihilism.bsky.social/post/3mrq47evyhk23" target="_blank" rel="noopener">@ostrumnihilism.bsky.social</a>
+    <span class='badge'>quotes #2408</span><span class='gap'>+3m later</span>
+  </div>
+  <p class="ctext">I&#x27;m stealing your food now.
+
+&quot; Anyways. . . We should head home. &quot;
+
+BE NICE TO HIM.</p>
+  <div class="cfoot">
+    <span class="likes">1 likes</span>
+    <span class="sub">0 reposts · 0 replies
+      · 1 quotes</span>
+  </div>
+  <div class="minibar" aria-hidden="true"><i style="width:12.5%"></i></div>
+</li><li class="card gapmark"><span>⋮</span><span>2,405 more posts in the chain, not shown</span><span>⋮</span></li>
+<li class="card" data-tower="deepest" data-i="3">
+  <div class="chead">
+    <span class="rank">#3</span>
+    <a class="who" href="https://bsky.app/profile/ostrumnihilism.bsky.social/post/3mnqozb5d6c26" target="_blank" rel="noopener">@ostrumnihilism.bsky.social</a>
+    <span class='badge'>quotes #2</span><span class='gap'>+2m later</span>
+  </div>
+  <p class="ctext">&quot; All of you should move to the side if you know what&#x27;s best for you. 
+
+Except for YOU. &quot;
+
+She&#x27;s pointing directly at the Warden. Her free hand twirled the hammer around before slamming it against the floor with a heavy thud.</p>
+  <div class="cfoot">
+    <span class="likes">1 likes</span>
+    <span class="sub">0 reposts · 0 replies
+      · 1 quotes</span>
+  </div>
+  <div class="minibar" aria-hidden="true"><i style="width:12.5%"></i></div>
+</li>
+<li class="card" data-tower="deepest" data-i="2">
+  <div class="chead">
+    <span class="rank">#2</span>
+    <a class="who" href="https://bsky.app/profile/dateg0newrong.bsky.social/post/3mnqovkicc22b" target="_blank" rel="noopener">@dateg0newrong.bsky.social</a>
+    <span class='badge'>quotes #1</span><span class='gap'>+3m later</span>
+  </div>
+  <p class="ctext">Murder-Slaughter slowly turns around, finally noticing her. He yelps, backing up into the rowdy, fighting crowd of prisoners .
+
+         He&#x27;s trying to make he can&#x27;t be caught by her in the crowd .</p>
+  <div class="cfoot">
+    <span class="likes">0 likes</span>
+    <span class="sub">0 reposts · 0 replies
+      · 1 quotes</span>
+  </div>
+  <div class="minibar" aria-hidden="true"><i style="width:0.0%"></i></div>
+</li>
+<li class="card" data-tower="deepest" data-i="1">
+  <div class="chead">
+    <span class="rank">#1</span>
+    <a class="who" href="https://bsky.app/profile/ostrumnihilism.bsky.social/post/3mnqoqv4n3226" target="_blank" rel="noopener">@ostrumnihilism.bsky.social</a>
+    <span class='badge origin'>the original</span>
+  </div>
+  <p class="ctext">She&#x27;s going to make a fight break out if he doesn&#x27;t give her back her ring.
+
+She&#x27;s standing in the doorframe that leads to the cafeteria. Menacingly.</p>
+  <div class="cfoot">
+    <span class="likes">1 likes</span>
+    <span class="sub">0 reposts · 0 replies
+      · 1 quotes</span>
+  </div>
+  <div class="minibar" aria-hidden="true"><i style="width:12.5%"></i></div>
+</li></ol></figure>
+  <figcaption class="cap">The two ends of the chain; the middle is elided. Bars
+    are like counts against the whole chain's maximum (8). Unlike the
+    towers above this chain is <em>not</em> monotone in likes — it is simply the
+    deepest.
+  </figcaption>
+  <details class="tableview"><summary>Table view</summary>
+<div class="scroll"><table><thead><tr><th class="num">#</th><th>author</th>
+<th class="num">likes</th><th class="num">reposts</th><th class="num">replies</th>
+<th class="num">quotes</th><th>posted (UTC)</th><th></th></tr></thead>
+<tbody><tr><td class='num'>1</td><td>@ostrumnihilism.bsky.social</td><td class='num'>1</td><td class='num'>0</td><td class='num'>0</td><td class='num'>1</td><td>2026-06-08 02:58</td><td><a href="https://bsky.app/profile/ostrumnihilism.bsky.social/post/3mnqoqv4n3226" target="_blank" rel="noopener">open</a></td></tr><tr><td class='num'>2</td><td>@dateg0newrong.bsky.social</td><td class='num'>0</td><td class='num'>0</td><td class='num'>0</td><td class='num'>1</td><td>2026-06-08 03:00</td><td><a href="https://bsky.app/profile/dateg0newrong.bsky.social/post/3mnqovkicc22b" target="_blank" rel="noopener">open</a></td></tr><tr><td class='num'>3</td><td>@ostrumnihilism.bsky.social</td><td class='num'>1</td><td class='num'>0</td><td class='num'>0</td><td class='num'>1</td><td>2026-06-08 03:02</td><td><a href="https://bsky.app/profile/ostrumnihilism.bsky.social/post/3mnqozb5d6c26" target="_blank" rel="noopener">open</a></td></tr><tr><td class='num'>⋮</td><td colspan='7'>2,405 more posts elided</td></tr><tr><td class='num'>2409</td><td>@ostrumnihilism.bsky.social</td><td class='num'>1</td><td class='num'>0</td><td class='num'>0</td><td class='num'>1</td><td>2026-07-28 19:06</td><td><a href="https://bsky.app/profile/ostrumnihilism.bsky.social/post/3mrq47evyhk23" target="_blank" rel="noopener">open</a></td></tr><tr><td class='num'>2410</td><td>@dateg0newrong.bsky.social</td><td class='num'>0</td><td class='num'>0</td><td class='num'>0</td><td class='num'>1</td><td>2026-07-28 19:21</td><td><a href="https://bsky.app/profile/dateg0newrong.bsky.social/post/3mrq4zjnzhs2z" target="_blank" rel="noopener">open</a></td></tr><tr><td class='num'>2411</td><td>@ostrumnihilism.bsky.social</td><td class='num'>0</td><td class='num'>0</td><td class='num'>0</td><td class='num'>0</td><td>2026-07-30 20:32</td><td><a href="https://bsky.app/profile/ostrumnihilism.bsky.social/post/3mrvbvhfvms2v" target="_blank" rel="noopener">open</a></td></tr></tbody></table></div></details>
+</section>
+
+<section class="tower-sec">
+  <div class="kicker">the tradeoff</div>
+  <h2>You can go deep, or you can go big</h2>
+  <p class="lede2">The best a tower can do at each height. Roughly every extra
+    layer halves the total likes a tower can carry: the ceiling falls from
+    29,369 at 2 posts to
+    4,393 at 5. The ratchet
+    that makes a tower interesting is the same one that starves it.</p>
+  <div class="scroll"><table class="ladder"><thead><tr>
+<th class="num">height</th><th class="num">authors</th>
+<th>likes, original → outermost</th><th>top post</th>
+<th>total likes</th><th class="num">total</th>
+</tr></thead><tbody><tr><td class='num'>2</td><td class='num'>2</td><td class='chain'>8,039 → 21,330</td><td class=''><a href='https://bsky.app/profile/sean-hecker.bsky.social/post/3mmhmmtxznk2l' target='_blank' rel='noopener'>@sean-hecker.bsky.social</a></td><td class='barcell'><i style='width:100.0%'></i></td><td class='num strong'>29,369</td></tr><tr><td class='num'>3</td><td class='num'>2</td><td class='chain'>231 → 4,475 → 17,743</td><td class=''><a href='https://bsky.app/profile/bencollins.bsky.social/post/3mmf2y5dodk2g' target='_blank' rel='noopener'>@bencollins.bsky.social</a></td><td class='barcell'><i style='width:76.4%'></i></td><td class='num strong'>22,449</td></tr><tr><td class='num'>4</td><td class='num'>3</td><td class='chain'>350 → 1,331 → 3,137 → 6,536</td><td class=''><a href='https://bsky.app/profile/jamellebouie.net/post/3mmunfeb3dc26' target='_blank' rel='noopener'>@jamellebouie.net</a></td><td class='barcell'><i style='width:38.7%'></i></td><td class='num strong'>11,354</td></tr><tr><td class='num'>5</td><td class='num'>2</td><td class='chain'>100 → 211 → 527 → 1,592 → 1,963</td><td class=''><a href='https://bsky.app/profile/danteatkins.bsky.social/post/3mled2gi3hc2r' target='_blank' rel='noopener'>@danteatkins.bsky.social</a></td><td class='barcell'><i style='width:15.0%'></i></td><td class='num strong'>4,393</td></tr></tbody></table></div>
+</section>
+
+<section class="tower-sec">
+  <div class="kicker">how rare is this</div>
+  <h2>Almost every tower is two posts</h2>
+  <p class="lede2">Counting each post by the tallest root-anchored tower ending
+    at it. Two layers is the overwhelming default.</p>
+  <div class="scroll"><table class="ladder"><thead><tr><th class="num">height</th>
+<th>towers this tall <span class="mut">(log-scaled)</span></th>
+<th class="num">count</th></tr></thead><tbody><tr><td class='num'>2</td><td class='barcell'><i style='width:100.0%'></i></td><td class='num strong'>728,910</td></tr><tr><td class='num'>3</td><td class='barcell'><i style='width:62.8%'></i></td><td class='num strong'>4,837</td></tr><tr><td class='num'>4</td><td class='barcell'><i style='width:35.0%'></i></td><td class='num strong'>111</td></tr><tr><td class='num'>5</td><td class='barcell'><i style='width:14.4%'></i></td><td class='num strong'>6</td></tr></tbody></table></div>
+</section>
+
+<section class="tower-sec">
+  <div class="kicker">method</div>
+  <h2>How this was computed</h2>
+  <p class="note">Every row of <code>posts</code> with a non-null
+    <code>quote_uri_id</code> becomes an edge <em>child → the post it quotes</em>,
+    joined to <code>post_aggs</code> for the like count on both ends:
+    17,511,260 edges over 24,343,275 posts. Keep only the
+    edges where the quoting post has strictly more likes
+    (1,969,103 of them). Because likes then strictly increase
+    along every surviving edge the graph is acyclic, and sorting edges by the
+    quoting post's like count is a topological order — so one linear pass gives
+    both the longest path and the largest-sum path at each height. A chain may
+    only <em>start</em> at a post whose own <code>quote_uri_id</code> is NULL and
+    whose <code>source</code> is <code>record</code>: a genuine original we hold
+    the body for. The deepest-stack section drops the like rule and walks the
+    raw quote graph, which is a forest — each post quotes at most one post — so
+    depth is a memoised pointer walk.</p>
+  <p class="note"><strong>Caveats.</strong> Like counts are the snapshot's, over
+    a 90-day activity window — a like cast outside it is not
+    counted, so a tower spanning the window edge can be understated.
+    <code>target_only</code> posts are never treated as roots: we saw them only
+    as somebody else's quote target, so a NULL <code>quote_uri_id</code> there
+    means "unobserved", not "not a quote". The snapshot stores structure, not
+    content, so post text and handles were hydrated live from the public Bluesky
+    appview at render time and may have moved since; like counts shown are the
+    snapshot's, not live. Ties form no edge, so equal like counts never extend a
+    tower.</p>
+</section>
+
+<div class="foot">
+  Tallest: <a href="https://bsky.app/profile/danteatkins.bsky.social/post/3mled2gi3hc2r" target="_blank" rel="noopener">
+  @danteatkins.bsky.social</a> ·
+  Heaviest: <a href="https://bsky.app/profile/sean-hecker.bsky.social/post/3mmhmmtxznk2l" target="_blank" rel="noopener">
+  @sean-hecker.bsky.social</a><br>
+  Built 2026-08-07 01:16 UTC from snapshot 2026-07-31.
+</div>
+</div>
+<script>
+// Hover layer: a band and its card highlight together, in both directions.
+for (const el of document.querySelectorAll('.band,.card')) {
+  if (!el.dataset.tower) continue;
+  const mates = () => document.querySelectorAll(
+      `[data-tower="${el.dataset.tower}"][data-i="${el.dataset.i}"]`);
+  const set = on => mates().forEach(m => m.classList.toggle('on', on));
+  el.addEventListener('mouseenter', () => set(true));
+  el.addEventListener('mouseleave', () => set(false));
+  el.addEventListener('focus', () => set(true));
+  el.addEventListener('blur', () => set(false));
+}
+</script></body></html>
